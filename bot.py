@@ -22,7 +22,7 @@ OPENROUTER_KEY   = os.environ.get("OPENROUTER_KEY", "")
 
 # Шаг 1
 STEP1_RSS_URLS   = [u.strip() for u in os.environ.get("STEP1_RSS_URLS","").split(",") if u.strip()]
-STEP1_KEYWORDS   = [k.strip().lower() for k in os.environ.get("STEP1_KEYWORDS","nico paz,nicopaz").split(",") if k.strip()]
+STEP1_KEYWORDS   = [k.strip().lower() for k in os.environ.get("STEP1_KEYWORDS","kenanyildiz,kenan yildiz").split(",") if k.strip()]
 
 # Шаг 2
 INSTAGRAM_USER   = os.environ.get("INSTAGRAM_USER","").strip().lstrip("@")
