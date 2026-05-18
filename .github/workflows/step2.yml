@@ -20,7 +20,7 @@ jobs:
           BOT_TOKEN:        ${{ secrets.BOT_TOKEN }}
           CHANNEL_ID:       ${{ secrets.CHANNEL_ID }}
           DEEPL_KEY:        ${{ secrets.DEEPL_KEY }}
-          INSTAGRAM_USER:   ${{ secrets.INSTAGRAM_USER }}
+          RSSAPP_URL: ${{ secrets.RSSAPP_URL }}
         run: python bot.py --step 2
       - uses: actions/cache/save@v4
         if: always()
