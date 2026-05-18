@@ -1,0 +1,31 @@
+name: Step 3 - Twitter Accounts
+on:
+  schedule:
+    # Europe/Samara is UTC+4: 13:00, 16:00, 19:00, 22:00, 01:00 Samara.
+    - cron: '0 9,12,15,18,21 * * *'
+  workflow_dispatch:
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: pip install -r requirements.txt
+      - uses: actions/cache@v4
+        with:
+          path: published_ids.json
+          key: published-ids-${{ github.run_number }}
+          restore-keys: published-ids-
+      - env:
+          BOT_TOKEN:      ${{ secrets.BOT_TOKEN }}
+          CHANNEL_ID:     ${{ secrets.CHANNEL_ID }}
+          DEEPL_KEY:      ${{ secrets.DEEPL_KEY }}
+          OPENROUTER_KEY: ${{ secrets.OPENROUTER_KEY }}
+          STEP3_ACCOUNTS: ${{ secrets.STEP3_ACCOUNTS }}
+        run: python bot.py --step 3
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: published_ids.json
+          key: published-ids-${{ github.run_number }}
