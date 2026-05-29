@@ -3128,7 +3128,9 @@ def scweet_repost_reference_reason(tw: dict, raw: str, post_id: str) -> str:
         return f"marker:{marker}"
     if REPOST_TEXT_RE.search(raw or ""):
         return "text-marker"
-    referenced_status_id = external_status_reference(tw, post_id)
+    # Scweet may keep unrelated historical/status URLs inside the raw GraphQL payload.
+    # Treat only links visible in the tweet text as "this post refers to another post".
+    referenced_status_id = external_status_reference(raw, post_id)
     if referenced_status_id:
         return f"status-reference:{referenced_status_id}"
     return ""
