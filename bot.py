@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import time
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -755,13 +756,36 @@ def normalize_source_brackets(text: str) -> str:
     return re.sub(r"\[\s*([^\]]+?)\s*\]", fix, text or "")
 
 
+def strip_noise_only_lines(text: str) -> str:
+    lines = []
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if line and re.fullmatch(r"[.\"'“”«»`´·•…]+", line):
+            continue
+        lines.append(raw_line)
+    cleaned = "\n".join(lines)
+    cleaned = re.sub(r"(?:\n\s*){3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def strip_unwanted_source_tags(text: str) -> str:
+    text = re.sub(r"<\s*br\s*/?\s*>", "\n", text or "", flags=re.I)
+    text = re.sub(r"</\s*(?:p|div|li|tr)\s*>", "\n", text, flags=re.I)
+    text = re.sub(r"<\s*(?:p|div|li|tr|td|span|strong|em|i|u|ul|ol)\b[^>]*>", "", text, flags=re.I)
+    text = re.sub(r"<(?!/?(?:b|blockquote)\s*>)[^>]+>", "", text)
+    return text
+
+
 def clean_text(text: str) -> str:
+    text = strip_unwanted_source_tags(text or "")
     text = re.sub(r"https?://nitter\.[^\s]+", "", text)
     text = re.sub(r"https?://t\.co/[^\s]+", "", text)
     text = re.sub(r"https?://twitter\.[^\s]+", "", text)
+    text = re.sub(r"https?://x\.[^\s]+", "", text)
     text = re.sub(r"https?://instagram\.[^\s]+", "", text)
     text = re.sub(r"\n[^\n]+\(@[^)]+\)\s*$", "", text, flags=re.MULTILINE)
     text = text.replace("@", "-")
+    text = strip_noise_only_lines(text)
     text = strip_decorative_pipes(text)
     paras = text.split("\n\n")
     seen, unique = set(), []
@@ -1020,6 +1044,87 @@ def is_football_club_name(text: str) -> bool:
     return normalize_club_name(text) in FOOTBALL_CLUB_KEYS
 
 
+def text_words(text: str) -> list[str]:
+    return re.findall(r"[A-Za-zА-Яа-яЁёÀ-ÿ][\wА-Яа-яЁёÀ-ÿ'-]*", text or "", flags=re.UNICODE)
+
+
+def leading_football_club_words(text: str, max_words: int = 5) -> int:
+    words = text_words(text)
+    for count in range(min(max_words, len(words)), 0, -1):
+        if is_football_club_name(" ".join(words[:count])):
+            return count
+    return 0
+
+
+def starts_with_football_club_name(text: str) -> bool:
+    return leading_football_club_words(text) > 0
+
+
+def lowercase_continuation_start(text: str) -> str:
+    if not text:
+        return text
+    if text.lstrip().startswith(("#", "@", "http://", "https://", "<", "«", "\"", "“")):
+        return text
+
+    def replace(match: re.Match) -> str:
+        prefix, word = match.group(1), match.group(2)
+        if word.upper() in CAPS_WORD_EXCEPTIONS or word.isupper():
+            return match.group(0)
+        return prefix + word[:1].lower() + word[1:]
+
+    return re.sub(
+        r"^(\s*[^\wА-Яа-яЁёA-Za-zÀ-ÿ#@<«\"“]*)([А-ЯЁA-Z][а-яёa-z][\wА-Яа-яЁёÀ-ÿ'-]*)",
+        replace,
+        text,
+        count=1,
+        flags=re.UNICODE,
+    )
+
+
+def lowercase_word_after_prefix_words(text: str, prefix_word_count: int) -> str:
+    matches = list(
+        re.finditer(
+            r"[A-Za-zА-Яа-яЁёÀ-ÿ][\wА-Яа-яЁёÀ-ÿ'-]*",
+            text or "",
+            flags=re.UNICODE,
+        )
+    )
+    if len(matches) <= prefix_word_count:
+        return text
+
+    match = matches[prefix_word_count]
+    word = match.group(0)
+    if word.upper() in CAPS_WORD_EXCEPTIONS or word.isupper():
+        return text
+    lowered = word[:1].lower() + word[1:]
+    return text[:match.start()] + lowered + text[match.end():]
+
+
+def merge_football_club_line(line: str, nxt: str) -> str | None:
+    if not line or not nxt:
+        return None
+    if re.search(r"[.!?…:»\"]\s*$", line):
+        return None
+    if line.startswith(("#", "@")) or nxt.startswith(("#", "@")):
+        return None
+    if looks_like_speaker_heading(split_colon_heading(line)[0] or line):
+        return None
+
+    current_words = text_words(line)
+    if not current_words:
+        return None
+
+    joined = f"{line} {nxt}".strip()
+    joined_club_words = leading_football_club_words(joined)
+    if joined_club_words > len(current_words):
+        return lowercase_word_after_prefix_words(joined, joined_club_words)
+
+    if is_football_club_name(line):
+        return f"{line} {lowercase_continuation_start(nxt)}".strip()
+
+    return None
+
+
 def split_quoted_segments(line: str) -> list:
     segments = []
     buf = []
@@ -1094,6 +1199,12 @@ def join_orphan_lines(text: str) -> str:
                 break
             if nxt.startswith("❓") or line.startswith("❓"):
                 break
+
+            club_merged = merge_football_club_line(line, nxt)
+            if club_merged:
+                line = club_merged
+                i += 1
+                continue
 
             last_word = re.findall(
                 r"[\wА-Яа-яЁёÀ-ÿ'-]+",
@@ -1201,12 +1312,17 @@ def ensure_hashtag_spacing(text: str) -> str:
 def preprocess_post_text(text: str) -> str:
     """Единая нормализация plain-текста до HTML и AI-верстки."""
     text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = strip_unwanted_source_tags(text)
+    text = strip_intro_labels(text)
+    text = strip_noise_only_lines(text)
     text = strip_decorative_pipes(text)
     text = strip_follow_us_tail(text)
     text = normalize_source_brackets(text)
     text = join_orphan_lines(text)
     text = merge_country_player_list_lines(text)
     text = normalize_paragraph_breaks(text)
+    text = strip_intro_labels(text)
+    text = strip_noise_only_lines(text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
@@ -1899,6 +2015,7 @@ def telegram_html_tags_balanced(text: str) -> bool:
 def sanitize_telegram_layout_html(text: str) -> str:
     """Keep only Telegram tags that the layout AI is allowed to return."""
     text = html.unescape(str(text or ""))
+    text = strip_unwanted_source_tags(text)
     allowed_tag = re.compile(r"<\s*(/?)\s*(b|blockquote)\s*>", re.I)
     output = []
     pos = 0
@@ -1912,11 +2029,12 @@ def sanitize_telegram_layout_html(text: str) -> str:
     output.append(html.escape(text[pos:], quote=False))
     cleaned = "".join(output)
     cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = strip_noise_only_lines(cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
 
 
-INTRO_LABEL_RE = r"(?:последние\s+новости|последняя\s+новость|главная\s+новость|новости|новость|официально|срочно|эксклюзив|breaking(?:\s+news)?|official|latest\s+news)"
+INTRO_LABEL_RE = r"(?:последние\s+новости|последняя\s+новость|главная\s+новость|новости|новость|официально|обновлени[ея]|апдейт|видео|срочно|эксклюзив|breaking(?:\s+news)?|just\s+in|official|latest\s+news|update|video)"
 INTRO_LABEL_PREFIX_RE = r"^[ \t]*(?:[^\w<#@\n]+[ \t]*)*"
 CAPS_WORD_RE = re.compile(r"(?<![#/@\w-])([А-ЯЁ]{1,}|[A-Z]{3,})(?![\w-])", re.UNICODE)
 HTML_LAYOUT_TAG_RE = re.compile(r"(</?(?:b|blockquote)>)", re.I)
@@ -1927,7 +2045,7 @@ CAPS_WORD_EXCEPTIONS = {
 
 
 def strip_intro_labels(text: str) -> str:
-    text = str(text or "")
+    text = unicodedata.normalize("NFKC", str(text or ""))
 
     intro_prefix_re = re.compile(
         r"^(?P<indent>[ \t]*)(?P<open><b>\s*)?"
@@ -1943,14 +2061,19 @@ def strip_intro_labels(text: str) -> str:
             return line
         marker = (match.group("marker") or "").strip()
         rest = line[match.end():]
+        linebreak = "\n" if rest.endswith("\n") else ""
+        if linebreak:
+            rest = rest[:-1]
+        if not rest.strip():
+            return linebreak
         if not marker:
-            return (match.group("indent") or "") + rest.lstrip(" \t")
+            return (match.group("indent") or "") + rest.lstrip(" \t") + linebreak
         if match.group("open") or match.group("close"):
             prefix = f"{match.group('indent') or ''}<b>{marker}</b>"
         else:
             prefix = f"{match.group('indent') or ''}{marker}"
         separator = "" if not rest or rest[0] in " \t\r\n" else " "
-        return prefix + separator + rest.lstrip(" \t")
+        return prefix + separator + rest.lstrip(" \t") + linebreak
 
     text = "".join(clean_line(line) for line in text.splitlines(keepends=True))
     text = re.sub(r"<b>\s*</b>\s*", "", text, flags=re.I)
@@ -1978,13 +2101,15 @@ def normalize_sentence_capitalization(text: str) -> str:
 
 
 def normalize_posting_text(text: str) -> str:
+    text = strip_unwanted_source_tags(text)
+    text = strip_noise_only_lines(text)
     text = strip_intro_labels(text)
     parts = HTML_LAYOUT_TAG_RE.split(text)
     normalized = [
         part if HTML_LAYOUT_TAG_RE.fullmatch(part or "") else normalize_sentence_capitalization(part)
         for part in parts
     ]
-    return strip_intro_labels("".join(normalized))
+    return strip_noise_only_lines(strip_intro_labels("".join(normalized)))
 
 
 def plain_layout_text(text: str) -> str:
@@ -2909,6 +3034,106 @@ def extract_scweet_media_items(tw: dict) -> list:
     return media_items[:10]
 
 
+REPOST_FLAG_KEYS = {
+    "is_retweet",
+    "isretweet",
+    "retweeted",
+    "retweeted_status",
+    "retweetedstatus",
+    "retweeted_status_id",
+    "retweetedstatusid",
+    "retweet_id",
+    "retweetid",
+    "retweetedtweet",
+    "retweeted_tweet",
+    "repost",
+    "is_repost",
+    "isrepost",
+    "is_quote_status",
+    "isquotestatus",
+    "is_quote",
+    "isquote",
+    "quoted_status",
+    "quotedstatus",
+    "quoted_status_id",
+    "quotedstatusid",
+    "quoted_tweet",
+    "quotedtweet",
+    "quote_tweet",
+    "quotetweet",
+    "quote_status",
+    "quotestatus",
+    "in_reply_to_status_id",
+    "inreplytostatusid",
+    "in_reply_to_status_id_str",
+    "inreplytostatusidstr",
+    "in_reply_to_tweet_id",
+    "inreplytotweetid",
+    "referenced_tweets",
+    "referencedtweets",
+}
+
+REPOST_TEXT_RE = re.compile(
+    r"^\s*(?:RT|QT)\s+@|^\s*(?:ретвит|репост|цитата)\b|"
+    r"^\s*(?:retweeted|reposted|quoted)\b|"
+    r"\b(?:retweeted|reposted)\s+by\b|\bquoted\s+tweet\b|"
+    r"\b(?:ретвитнул|ретвитнула|репостнул|репостнула)\b",
+    flags=re.I,
+)
+
+
+def truthy_repost_value(value) -> bool:
+    if value is None or value is False:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "0", "false", "none", "null", "no"}
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return bool(value)
+
+
+def nested_repost_marker(value, depth: int = 0) -> str:
+    if depth > 5:
+        return ""
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            normalized_key = re.sub(r"[^a-z0-9_]", "_", str(key).strip().lower())
+            if normalized_key in REPOST_FLAG_KEYS and truthy_repost_value(nested):
+                return str(key)
+            reason = nested_repost_marker(nested, depth + 1)
+            if reason:
+                return reason
+    elif isinstance(value, list):
+        for nested in value:
+            reason = nested_repost_marker(nested, depth + 1)
+            if reason:
+                return reason
+    return ""
+
+
+def external_status_reference(value, own_post_id: str = "") -> str:
+    values = []
+    collect_string_values(value, values)
+    own_ids = {own_post_id} if own_post_id else set()
+    for candidate in values:
+        for status_id in twitter_status_ids_from_text(candidate):
+            if status_id and status_id not in own_ids:
+                return status_id
+    return ""
+
+
+def scweet_repost_reference_reason(tw: dict, raw: str, post_id: str) -> str:
+    marker = nested_repost_marker(tw)
+    if marker:
+        return f"marker:{marker}"
+    if REPOST_TEXT_RE.search(raw or ""):
+        return "text-marker"
+    referenced_status_id = external_status_reference(tw, post_id)
+    if referenced_status_id:
+        return f"status-reference:{referenced_status_id}"
+    return ""
+
+
 def fetch_scweet_tweets(
     keywords: list,
     from_accounts: list | None = None,
@@ -2955,8 +3180,10 @@ def fetch_scweet_tweets(
     if not keyword_query and not account_filters:
         return []
 
-    # Only media posts. Accounts and retweet filtering go through Scweet v5 params.
-    search_query = " ".join(part for part in (keyword_query, "filter:media") if part).strip()
+    # Only original media posts. A local guard below also rejects quote/repost payloads.
+    search_query = " ".join(
+        part for part in (keyword_query, "filter:media", "-filter:retweets", "-filter:replies") if part
+    ).strip()
 
     now = datetime.now(timezone.utc)
     since = (now - timedelta(hours=48)).strftime("%Y-%m-%d")
@@ -2980,7 +3207,7 @@ def fetch_scweet_tweets(
         fallback_parts = [keyword_query]
         if account_filters:
             fallback_parts.append(f"({' OR '.join(f'from:{a}' for a in account_filters)})")
-        fallback_parts.extend(["filter:media", "-filter:retweets"])
+        fallback_parts.extend(["filter:media", "-filter:retweets", "-filter:replies"])
         fallback_query = " ".join(part for part in fallback_parts if part).strip()
         print(f"  Scweet structured params недоступны ({e}) — fallback query: {fallback_query[:120]}")
         try:
@@ -3027,6 +3254,10 @@ def fetch_scweet_tweets(
         )
         raw = str(tw.get("text") or tw.get("full_text") or tw.get("Text") or "").strip()
         pub_date = str(tw.get("timestamp") or tw.get("created_at") or tw.get("postdate") or tw.get("Timestamp") or "")
+        repost_reason = scweet_repost_reference_reason(tw, raw, post_id)
+        if repost_reason:
+            print(f"  Scweet: репост/ссылка на другой пост — пропуск ({repost_reason})")
+            continue
         media_items = extract_scweet_media_items(tw)
 
         if not media_items:
