@@ -65,6 +65,24 @@ MAX_USER_ID = os.environ.get("MAX_USER_ID", "").strip()
 def normalize_instagram_hashtag(value: str) -> str:
     return re.sub(r"\s+", "", str(value or "").strip().lstrip("#"))
 
+
+def normalize_twitter_account(value: str) -> str:
+    account = str(value or "").strip()
+    if not account:
+        return ""
+
+    account = re.sub(r"^from:", "", account, flags=re.I).strip()
+    account = account.split("?")[0].strip().strip("/")
+    account = re.sub(
+        r"^(?:https?://)?(?:www\.)?(?:x\.com|twitter\.com|nitter\.[^/]+)/",
+        "",
+        account,
+        flags=re.I,
+    )
+    account = account.strip().lstrip("@").split("/")[0].split()[0].strip()
+    match = re.search(r"[A-Za-z0-9_]{1,15}", account)
+    return match.group(0) if match else ""
+
 # Шаг 1 (Scweet)
 STEP1_KEYWORDS = [
     k.strip().lower()
@@ -73,12 +91,18 @@ STEP1_KEYWORDS = [
 ]
 # Если задан — ищем только в постах этих аккаунтов; если пустой — глобальный поиск
 STEP1_ACCOUNTS = [
-    a.strip().lstrip("@")
-    for a in os.environ.get("STEP1_ACCOUNTS", "").split(",")
-    if a.strip()
+    account
+    for account in (
+        normalize_twitter_account(a)
+        for a in os.environ.get("STEP1_ACCOUNTS", "").split(",")
+    )
+    if account
 ]
 SCWEET_AUTH_TOKEN = os.environ.get("SCWEET_AUTH_TOKEN", "").strip()
 SCWEET_PROXY = os.environ.get("SCWEET_PROXY", "").strip()  # http://user:pass@host:port
+SCWEET_MANIFEST_SCRAPE_ON_INIT = os.environ.get("SCWEET_MANIFEST_SCRAPE_ON_INIT", "1").strip().lower() not in {
+    "0", "false", "no", "off"
+}
 STEP1_LIMIT = int((os.environ.get("STEP1_LIMIT") or "50").strip())
 STEP3_LIMIT = int((os.environ.get("STEP3_LIMIT") or "20").strip())
 
@@ -109,9 +133,12 @@ INSTAGRAM_PREFIX = " "
 
 # Шаг 3
 STEP3_ACCOUNTS = [
-    a.strip().lstrip("@")
-    for a in os.environ.get("STEP3_ACCOUNTS", "").split(",")
-    if a.strip()
+    account
+    for account in (
+        normalize_twitter_account(a)
+        for a in os.environ.get("STEP3_ACCOUNTS", "").split(",")
+    )
+    if account
 ]
 
 # Шаг 4
@@ -2734,6 +2761,154 @@ def nitter_rss_url(account: str) -> str:
 # ШАГИ
 # ════════════════════════════════════════════════════════════
 
+def build_scweet_keyword_query(keywords: list) -> str:
+    parts = []
+    for keyword in keywords or []:
+        keyword = str(keyword or "").strip()
+        if not keyword:
+            continue
+        keyword = keyword.replace('"', '\\"')
+        if re.search(r"\s", keyword):
+            parts.append(f'"{keyword}"')
+        else:
+            parts.append(keyword)
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+    return f"({' OR '.join(parts)})"
+
+
+def normalize_scweet_tweet_url(url: str, post_id: str = "") -> str:
+    url = str(url or "").strip()
+    if url.startswith("/"):
+        url = f"https://x.com{url}"
+    if not url and post_id:
+        url = f"https://x.com/i/web/status/{post_id}"
+    return url
+
+
+def twitter_author_from_url(url: str) -> str:
+    try:
+        path_parts = [part for part in urlparse(url).path.split("/") if part]
+    except Exception:
+        return ""
+    if not path_parts or path_parts[0].lower() in {"i", "intent", "search"}:
+        return ""
+    return normalize_twitter_account(path_parts[0])
+
+
+def scweet_result_items(tweets) -> list:
+    if not tweets:
+        return []
+    if isinstance(tweets, dict):
+        values = list(tweets.values())
+        if values and all(isinstance(value, dict) for value in values):
+            return values
+        return [tweets]
+    return list(tweets)
+
+
+def is_probable_twitter_media_url(url: str) -> bool:
+    lowered = str(url or "").lower()
+    return (
+        "twimg.com" in lowered
+        or "video.twimg.com" in lowered
+        or re.search(r"\.(?:jpg|jpeg|png|webp|gif|mp4|mov|m4v|webm)(?:[?#]|$)", lowered) is not None
+    )
+
+
+def flatten_scweet_media_urls(value) -> list[str]:
+    urls = []
+    if not value:
+        return urls
+
+    if isinstance(value, str):
+        url = html.unescape(value).strip().strip("'\"")
+        if url.startswith("//"):
+            url = f"https:{url}"
+        if re.match(r"^https?://", url, flags=re.I) and is_probable_twitter_media_url(url):
+            urls.append(url)
+        return urls
+
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            urls.extend(flatten_scweet_media_urls(item))
+        return urls
+
+    if isinstance(value, dict):
+        variants = value.get("variants")
+        if isinstance(variants, list):
+            video_variants = [
+                variant
+                for variant in variants
+                if isinstance(variant, dict)
+                and (
+                    "video" in str(variant.get("content_type") or "").lower()
+                    or is_twitter_video_url(str(variant.get("url") or ""))
+                )
+            ]
+            if video_variants:
+                best = max(video_variants, key=lambda item: int(item.get("bitrate") or 0))
+                urls.extend(flatten_scweet_media_urls(best.get("url")))
+
+        for item in value.values():
+            urls.extend(flatten_scweet_media_urls(item))
+    return urls
+
+
+def extract_scweet_media_items(tw: dict) -> list:
+    video_candidates = []
+    image_candidates = []
+
+    def add_candidates(value, fallback_type: str):
+        for url in flatten_scweet_media_urls(value):
+            media_type = "video" if is_twitter_video_url(url) else fallback_type
+            target = video_candidates if media_type == "video" else image_candidates
+            if url not in target:
+                target.append(url)
+
+    video_keys = (
+        "video_url",
+        "videoUrl",
+        "video_urls",
+        "videoUrls",
+        "video_links",
+        "videoLinks",
+        "videos",
+    )
+    image_keys = (
+        "image_links",
+        "imageLinks",
+        "image_urls",
+        "imageUrls",
+        "images",
+        "photos",
+        "photo_urls",
+        "photoUrls",
+    )
+
+    for key in video_keys:
+        add_candidates(tw.get(key), "video")
+    media_block = tw.get("media")
+    add_candidates(media_block, "photo")
+    for key in image_keys:
+        add_candidates(tw.get(key), "photo")
+
+    # Scweet v5 keeps the original GraphQL payload in raw; videos often live there.
+    add_candidates(tw.get("raw"), "photo")
+
+    media_items = []
+    if video_candidates:
+        for url in video_candidates:
+            add_media_item(media_items, url, "video")
+        return media_items[:10]
+
+    for url in image_candidates:
+        add_media_item(media_items, url, "photo")
+    return media_items[:10]
+
+
 def fetch_scweet_tweets(
     keywords: list,
     from_accounts: list | None = None,
@@ -2758,65 +2933,101 @@ def fetch_scweet_tweets(
         kwargs = {"auth_token": SCWEET_AUTH_TOKEN}
         if SCWEET_PROXY:
             kwargs["proxy"] = SCWEET_PROXY
-        s = ScweetClient(**kwargs)
+        if SCWEET_MANIFEST_SCRAPE_ON_INIT:
+            kwargs["manifest_scrape_on_init"] = True
+        try:
+            s = ScweetClient(**kwargs)
+        except TypeError as e:
+            if "manifest_scrape_on_init" not in str(e):
+                raise
+            kwargs.pop("manifest_scrape_on_init", None)
+            s = ScweetClient(**kwargs)
     except Exception as e:
         print(f"  Scweet init error: {e}")
         return []
 
-    # Формируем поисковый запрос
-    query_parts = []
-    if keywords:
-        query_parts.append(" OR ".join(f'"{kw}"' if " " in kw else kw for kw in keywords))
-    if from_accounts:
-        accounts_part = " OR ".join(f"from:{a}" for a in from_accounts)
-        query_parts.append(f"({accounts_part})")
-
-    search_query = " ".join(query_parts)
-    if not search_query:
+    account_filters = [
+        account
+        for account in (normalize_twitter_account(a) for a in (from_accounts or []))
+        if account
+    ]
+    keyword_query = build_scweet_keyword_query(keywords)
+    if not keyword_query and not account_filters:
         return []
 
-    # Только посты с медиа
-    search_query += " filter:media -filter:retweets"
+    # Only media posts. Accounts and retweet filtering go through Scweet v5 params.
+    search_query = " ".join(part for part in (keyword_query, "filter:media") if part).strip()
 
-    since = (datetime.now(timezone.utc) - timedelta(hours=48)).strftime("%Y-%m-%d")
+    now = datetime.now(timezone.utc)
+    since = (now - timedelta(hours=48)).strftime("%Y-%m-%d")
+    until = (now + timedelta(days=1)).strftime("%Y-%m-%d")
     print(f"  Scweet query: {search_query[:120]}")
+    if account_filters:
+        print(f"  Scweet from_users: {len(account_filters)} account(s)")
 
     try:
         tweets = s.search(
             search_query,
             since=since,
+            until=until,
             display_type="Latest",
             limit=limit,
+            from_users=account_filters or None,
+            tweet_type="exclude_retweets",
             save=False,
         )
+    except TypeError as e:
+        fallback_parts = [keyword_query]
+        if account_filters:
+            fallback_parts.append(f"({' OR '.join(f'from:{a}' for a in account_filters)})")
+        fallback_parts.extend(["filter:media", "-filter:retweets"])
+        fallback_query = " ".join(part for part in fallback_parts if part).strip()
+        print(f"  Scweet structured params недоступны ({e}) — fallback query: {fallback_query[:120]}")
+        try:
+            tweets = s.search(
+                fallback_query,
+                since=since,
+                until=until,
+                display_type="Latest",
+                limit=limit,
+                save=False,
+            )
+        except Exception as fallback_error:
+            print(f"  Scweet search error: {fallback_error}")
+            return []
     except Exception as e:
         print(f"  Scweet search error: {e}")
         return []
 
     results = []
-    for tw in (tweets or []):
+    items = scweet_result_items(tweets)
+    for tw in items:
         # Scweet возвращает dict или list в зависимости от версии
         if isinstance(tw, list):
             tw = tw[0] if tw else {}
+        if not isinstance(tw, dict):
+            continue
 
-        post_id = str(tw.get("tweet_id") or tw.get("id") or "")
-        post_url = tw.get("tweet_url") or (f"https://x.com/i/web/status/{post_id}" if post_id else "")
-        raw = str(tw.get("text") or tw.get("full_text") or "").strip()
-        pub_date = str(tw.get("timestamp") or tw.get("created_at") or "")
+        post_id = str(tw.get("tweet_id") or tw.get("tweetId") or tw.get("id") or "").strip()
+        post_url = normalize_scweet_tweet_url(tw.get("tweet_url") or tw.get("Tweet URL"), post_id)
+        if not post_id:
+            ids = twitter_status_ids_from_text(post_url)
+            post_id = next(iter(ids), "") if ids else ""
 
-        # Медиа: видео приоритетнее фото
-        media_items = []
-        # Видео
-        video_url = tw.get("video_url") or tw.get("videoUrl") or ""
-        if video_url:
-            media_items.append({"url": str(video_url), "type": "video"})
-        # Фото
-        images = tw.get("image_links") or tw.get("images") or []
-        if isinstance(images, str):
-            images = [images]
-        for img in images:
-            if img and not media_items:  # добавляем фото только если нет видео
-                media_items.append({"url": str(img), "type": "photo"})
+        user = tw.get("user") if isinstance(tw.get("user"), dict) else {}
+        author = (
+            normalize_twitter_account(
+                user.get("screen_name")
+                or user.get("username")
+                or tw.get("user_screen_name")
+                or tw.get("handle")
+                or twitter_author_from_url(post_url)
+            )
+            or "twitter"
+        )
+        raw = str(tw.get("text") or tw.get("full_text") or tw.get("Text") or "").strip()
+        pub_date = str(tw.get("timestamp") or tw.get("created_at") or tw.get("postdate") or tw.get("Timestamp") or "")
+        media_items = extract_scweet_media_items(tw)
 
         if not media_items:
             continue  # без медиа не берём
@@ -2824,12 +3035,13 @@ def fetch_scweet_tweets(
         results.append({
             "post_id": post_id,
             "post_url": post_url,
+            "author": author,
             "raw": raw,
             "pub_date": pub_date,
             "media_items": media_items,
         })
 
-    print(f"  Scweet: получено {len(tweets or [])} твитов, с медиа: {len(results)}")
+    print(f"  Scweet: получено {len(items)} твитов, с медиа: {len(results)}")
     return results
 
 
@@ -2985,8 +3197,7 @@ def step3_twitter_accounts(published: set) -> set:
         raw         = clean_text(tw["raw"])
         media_items = tw["media_items"]
 
-        # Определяем источник из URL поста
-        source = post_url.split("/")[3] if "/" in post_url else "twitter"
+        source = tw.get("author") or twitter_author_from_url(post_url) or "twitter"
 
         dup = find_duplicate(published, post_id=post_id, url=post_url)
         if dup:
