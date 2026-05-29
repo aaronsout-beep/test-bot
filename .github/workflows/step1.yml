@@ -1,0 +1,79 @@
+name: Step 1 - Twitter Keywords
+
+on:
+  schedule:
+    # Europe/Samara is UTC+4: 11:00, 14:00, 17:00, 20:00, 23:00 Samara.
+    - cron: '33 7,10,13,16,19 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: step1-published-state
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install -r requirements.txt
+
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            published_ids.json
+            source_news_cache.json
+          key: shared-state-${{ github.run_id }}
+          restore-keys: |
+            shared-state-
+
+      - name: Show state
+        run: |
+          if [ -f published_ids.json ]; then
+            echo "✅ published_ids.json: $(wc -l < published_ids.json) строк"
+          else
+            echo "⚠️  published_ids.json не найден (первый запуск)"
+          fi
+
+      - name: Run bot
+        env:
+          BOT_TOKEN:          ${{ secrets.BOT_TOKEN }}
+          CHANNEL_ID:         ${{ secrets.CHANNEL_ID }}
+          DEEPL_KEY:          ${{ secrets.DEEPL_KEY }}
+          OPENROUTER_KEY:     ${{ secrets.OPENROUTER_KEY }}
+          OPENROUTER_MODEL:   ${{ secrets.OPENROUTER_MODEL }}
+          GEMINI_API_KEY:     ${{ secrets.GEMINI_API_KEY }}
+          FORMAT_RAG_ENABLED: "1"
+          STEP1_KEYWORDS:     ${{ secrets.STEP1_KEYWORDS }}
+          STEP1_ACCOUNTS:     ${{ secrets.STEP1_ACCOUNTS }}
+          SCWEET_AUTH_TOKEN:  ${{ secrets.SCWEET_AUTH_TOKEN }}
+          SCWEET_PROXY:       ${{ secrets.SCWEET_PROXY }}
+          STEP1_LIMIT:        ${{ vars.STEP1_LIMIT || '50' }}
+          VK_ACCESS_TOKEN:    ${{ secrets.VK_ACCESS_TOKEN }}
+          VK_OWNER_ID:        ${{ secrets.VK_OWNER_ID }}
+          VK_API_VERSION:     ${{ secrets.VK_API_VERSION }}
+          VK_FROM_GROUP:      ${{ secrets.VK_FROM_GROUP }}
+          MAX_TOKEN:          ${{ secrets.MAX_TOKEN }}
+          MAX_CHAT_ID:        ${{ secrets.MAX_CHAT_ID }}
+          MAX_USER_ID:        ${{ secrets.MAX_USER_ID }}
+        run: python bot.py --step 1
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            published_ids.json
+            source_news_cache.json
+          key: shared-state-${{ github.run_id }}
