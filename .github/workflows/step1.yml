@@ -3,6 +3,7 @@ name: Step 1 - Twitter Keywords
 on:
   schedule:
     # Europe/Samara is UTC+4: 11:00, 14:00, 17:00, 20:00, 23:00 Samara.
+    - cron: '33 7,10,13,16,19 * * *'
   workflow_dispatch:
 
 permissions:
