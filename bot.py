@@ -170,7 +170,7 @@ NITTER_MIRRORS = [
     "https://nitter.poast.org",
 ]
  
-SIGNATURE = '\n\n#LamineYamal | <a href="https://max.ru/join/_4wOSEJG3rg3tNHknHybjckisAha49seSDf2mRbH3jY">Max</a>'
+SIGNATURE = '\n\n#NicoPaz | <a href="https://t.me/+YRPVzgbXbA1kODEy">Follow us</a>'
 CROSSPOST_SIGNATURE = "\n\n#NicoPaz"
 CAPTION_LIMIT = 1024
 MSG_LIMIT = 4096
@@ -2977,8 +2977,15 @@ def flatten_scweet_media_urls(value) -> list[str]:
                 best = max(video_variants, key=lambda item: int(item.get("bitrate") or 0))
                 urls.extend(flatten_scweet_media_urls(best.get("url")))
 
-        for item in value.values():
-            urls.extend(flatten_scweet_media_urls(item))
+        # Рекурсим только по известным медиа-полям, не по всему dict —
+        # иначе захватываем медиа из цитат, карточек, аватарок
+        SAFE_RECURSIVE_KEYS = {
+            "media", "photos", "videos", "attachments",
+            "extended_entities", "entities",
+        }
+        for k, item in value.items():
+            if str(k).lower() in SAFE_RECURSIVE_KEYS:
+                urls.extend(flatten_scweet_media_urls(item))
     return urls
 
 
@@ -3020,17 +3027,30 @@ def extract_scweet_media_items(tw: dict) -> list:
     for key in image_keys:
         add_candidates(tw.get(key), "photo")
 
-    # Scweet v5 keeps the original GraphQL payload in raw; videos often live there.
-    add_candidates(tw.get("raw"), "photo")
+    # НЕ берём tw.get("raw") — там может быть GraphQL-мусор:
+    # медиа из цитат, карточек, аватарки и т.д.
+
+    # Дедупликация по базовому имени файла (убирает ?name=... варианты одного изображения)
+    def base_media_key(url: str) -> str:
+        path = url.split("?")[0].rstrip("/")
+        return path.split("/")[-1].lower()
+
+    seen_bases: set = set()
 
     media_items = []
     if video_candidates:
         for url in video_candidates:
-            add_media_item(media_items, url, "video")
+            key = base_media_key(url)
+            if key not in seen_bases:
+                seen_bases.add(key)
+                add_media_item(media_items, url, "video")
         return media_items[:10]
 
     for url in image_candidates:
-        add_media_item(media_items, url, "photo")
+        key = base_media_key(url)
+        if key not in seen_bases:
+            seen_bases.add(key)
+            add_media_item(media_items, url, "photo")
     return media_items[:10]
 
 
@@ -3303,11 +3323,6 @@ def step1_twitter_keywords(published: set) -> set:
         raw         = clean_text(tw["raw"])
         media_items = tw["media_items"]
 
-        dup = find_duplicate(published, post_id=post_id, url=post_url)
-        if dup:
-            print(f"  Дубль ({dup[:80]}) — пропуск")
-            continue
-
         if is_too_old(pub_date):
             print(f"  Старый пост ({pub_date[:16]}) — пропуск")
             continue
@@ -3315,6 +3330,7 @@ def step1_twitter_keywords(published: set) -> set:
         if not raw:
             continue
 
+        # Единая полная проверка дублей — сразу с текстом и медиа
         dup = find_duplicate(published, post_id=post_id, url=post_url, text=raw, media_items=media_items)
         if dup:
             print(f"  Дубль ({dup[:80]}) — пропуск")
@@ -3432,11 +3448,6 @@ def step3_twitter_accounts(published: set) -> set:
 
         source = tw.get("author") or twitter_author_from_url(post_url) or "twitter"
 
-        dup = find_duplicate(published, post_id=post_id, url=post_url)
-        if dup:
-            print(f"  Дубль ({dup[:80]}) — пропуск")
-            continue
-
         if is_too_old(pub_date):
             print(f"  Старый ({pub_date[:16]}) — пропуск")
             continue
@@ -3444,6 +3455,7 @@ def step3_twitter_accounts(published: set) -> set:
         if not raw:
             continue
 
+        # Единая полная проверка дублей — сразу с текстом и медиа
         dup = find_duplicate(published, post_id=post_id, url=post_url, text=raw, media_items=media_items)
         if dup:
             print(f"  Дубль ({dup[:80]}) — пропуск")
