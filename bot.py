@@ -2944,6 +2944,9 @@ def is_probable_twitter_media_url(url: str) -> bool:
 
 
 def flatten_scweet_media_urls(value) -> list[str]:
+    """Извлечь медиа-URL из произвольного значения Scweet.
+    Рекурсирует только по безопасным медиа-ключам — не идёт в quoted_status, card, user.
+    """
     urls = []
     if not value:
         return urls
@@ -2965,93 +2968,90 @@ def flatten_scweet_media_urls(value) -> list[str]:
         variants = value.get("variants")
         if isinstance(variants, list):
             video_variants = [
-                variant
-                for variant in variants
-                if isinstance(variant, dict)
-                and (
-                    "video" in str(variant.get("content_type") or "").lower()
-                    or is_twitter_video_url(str(variant.get("url") or ""))
+                v for v in variants
+                if isinstance(v, dict) and (
+                    "video" in str(v.get("content_type") or "").lower()
+                    or is_twitter_video_url(str(v.get("url") or ""))
                 )
             ]
             if video_variants:
-                best = max(video_variants, key=lambda item: int(item.get("bitrate") or 0))
+                best = max(video_variants, key=lambda v: int(v.get("bitrate") or 0))
                 urls.extend(flatten_scweet_media_urls(best.get("url")))
+                return urls
 
-        # Рекурсим только по известным медиа-полям, не по всему dict —
-        # иначе захватываем медиа из цитат, карточек, аватарок
-        SAFE_RECURSIVE_KEYS = {
-            "media", "photos", "videos", "attachments",
-            "extended_entities", "entities",
-        }
-        for k, item in value.items():
-            if str(k).lower() in SAFE_RECURSIVE_KEYS:
-                urls.extend(flatten_scweet_media_urls(item))
+        # Рекурсируем ТОЛЬКО по безопасным медиа-ключам.
+        # НЕ идём по всем value.values() — там quoted_status, card, user и т.д.
+        MEDIA_KEYS = {"extended_entities", "entities", "media", "photos", "videos", "attachments"}
+        for k, v in value.items():
+            if str(k).lower() in MEDIA_KEYS:
+                urls.extend(flatten_scweet_media_urls(v))
     return urls
 
 
 def extract_scweet_media_items(tw: dict) -> list:
-    video_candidates = []
-    image_candidates = []
+    """Извлечь медиа из твита Scweet 5.3.
 
-    def add_candidates(value, fallback_type: str):
-        for url in flatten_scweet_media_urls(value):
-            media_type = "video" if is_twitter_video_url(url) else fallback_type
-            target = video_candidates if media_type == "video" else image_candidates
-            if url not in target:
-                target.append(url)
+    Scweet 5.3 (TweetRecord.model_dump()):
+      tw["media"]["image_links"] = ["url1", ...]   — фото
+      tw["raw"]["legacy"]["extended_entities"]      — видео
 
-    video_keys = (
-        "video_url",
-        "videoUrl",
-        "video_urls",
-        "videoUrls",
-        "video_links",
-        "videoLinks",
-        "videos",
-    )
-    image_keys = (
-        "image_links",
-        "imageLinks",
-        "image_urls",
-        "imageUrls",
-        "images",
-        "photos",
-        "photo_urls",
-        "photoUrls",
-    )
+    Приоритет: видео > фото. Дедупликация по имени файла без query-параметров.
+    """
+    def base_key(url: str) -> str:
+        return url.split("?")[0].rstrip("/").split("/")[-1].lower()
 
-    for key in video_keys:
-        add_candidates(tw.get(key), "video")
-    media_block = tw.get("media")
-    add_candidates(media_block, "photo")
-    for key in image_keys:
-        add_candidates(tw.get(key), "photo")
+    seen: set = set()
+    media_items: list = []
 
-    # НЕ берём tw.get("raw") — там может быть GraphQL-мусор:
-    # медиа из цитат, карточек, аватарки и т.д.
+    def add(url: str, media_type: str):
+        if not url:
+            return
+        k = base_key(url)
+        if k in seen:
+            return
+        seen.add(k)
+        add_media_item(media_items, url, media_type)
 
-    # Дедупликация по базовому имени файла (убирает ?name=... варианты одного изображения)
-    def base_media_key(url: str) -> str:
-        path = url.split("?")[0].rstrip("/")
-        return path.split("/")[-1].lower()
+    # ── 1. Видео из raw GraphQL (extended_entities) ──
+    raw = tw.get("raw") or {}
+    if isinstance(raw, dict):
+        legacy = raw.get("legacy") or {}
+        ext = legacy.get("extended_entities") or {}
+        for media_obj in (ext.get("media") or []):
+            if not isinstance(media_obj, dict):
+                continue
+            mtype = str(media_obj.get("type") or "").lower()
+            if mtype in ("video", "animated_gif"):
+                variants = (media_obj.get("video_info") or {}).get("variants") or []
+                video_variants = [
+                    v for v in variants
+                    if isinstance(v, dict) and (
+                        "video" in str(v.get("content_type") or "").lower()
+                        or is_twitter_video_url(str(v.get("url") or ""))
+                    )
+                ]
+                if video_variants:
+                    best = max(video_variants, key=lambda v: int(v.get("bitrate") or 0))
+                    add(str(best.get("url") or ""), "video")
 
-    seen_bases: set = set()
-
-    media_items = []
-    if video_candidates:
-        for url in video_candidates:
-            key = base_media_key(url)
-            if key not in seen_bases:
-                seen_bases.add(key)
-                add_media_item(media_items, url, "video")
+    # Если нашли видео — фото не добавляем
+    if media_items:
         return media_items[:10]
 
-    for url in image_candidates:
-        key = base_media_key(url)
-        if key not in seen_bases:
-            seen_bases.add(key)
-            add_media_item(media_items, url, "photo")
+    # ── 2. Фото из tw["media"]["image_links"] (Scweet 5.3 TweetMedia) ──
+    media_block = tw.get("media")
+    if isinstance(media_block, dict):
+        for url in (media_block.get("image_links") or []):
+            add(str(url), "photo")
+
+    # ── 3. Запасной вариант: прямые ключи на верхнем уровне ──
+    if not media_items:
+        for key in ("image_links", "imageLinks", "image_urls", "imageUrls", "images", "photos"):
+            for url in flatten_scweet_media_urls(tw.get(key)):
+                add(url, "photo")
+
     return media_items[:10]
+
 
 
 REPOST_FLAG_KEYS = {
@@ -3323,6 +3323,11 @@ def step1_twitter_keywords(published: set) -> set:
         raw         = clean_text(tw["raw"])
         media_items = tw["media_items"]
 
+        dup = find_duplicate(published, post_id=post_id, url=post_url)
+        if dup:
+            print(f"  Дубль ({dup[:80]}) — пропуск")
+            continue
+
         if is_too_old(pub_date):
             print(f"  Старый пост ({pub_date[:16]}) — пропуск")
             continue
@@ -3330,7 +3335,6 @@ def step1_twitter_keywords(published: set) -> set:
         if not raw:
             continue
 
-        # Единая полная проверка дублей — сразу с текстом и медиа
         dup = find_duplicate(published, post_id=post_id, url=post_url, text=raw, media_items=media_items)
         if dup:
             print(f"  Дубль ({dup[:80]}) — пропуск")
@@ -3448,6 +3452,11 @@ def step3_twitter_accounts(published: set) -> set:
 
         source = tw.get("author") or twitter_author_from_url(post_url) or "twitter"
 
+        dup = find_duplicate(published, post_id=post_id, url=post_url)
+        if dup:
+            print(f"  Дубль ({dup[:80]}) — пропуск")
+            continue
+
         if is_too_old(pub_date):
             print(f"  Старый ({pub_date[:16]}) — пропуск")
             continue
@@ -3455,7 +3464,6 @@ def step3_twitter_accounts(published: set) -> set:
         if not raw:
             continue
 
-        # Единая полная проверка дублей — сразу с текстом и медиа
         dup = find_duplicate(published, post_id=post_id, url=post_url, text=raw, media_items=media_items)
         if dup:
             print(f"  Дубль ({dup[:80]}) — пропуск")
