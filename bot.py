@@ -1090,6 +1090,24 @@ def starts_with_football_club_name(text: str) -> bool:
     return leading_football_club_words(text) > 0
 
 
+def trailing_football_club_words(text: str, max_words: int = 5) -> int:
+    """Возвращает число слов в конце строки, образующих название клуба.
+
+    Например, для «Бернарду Силва является реальным вариантом для Барселоны»
+    хвост — это не клуб, а для «Источники в Барселоне» хвост «Барселоне»
+    распознаётся как словоформа Барселоны (Барселона ∈ FOOTBALL_CLUB_KEYS).
+    """
+    words = text_words(text)
+    for count in range(min(max_words, len(words)), 0, -1):
+        if is_football_club_name(" ".join(words[-count:])):
+            return count
+    return 0
+
+
+def ends_with_football_club_name(text: str) -> bool:
+    return trailing_football_club_words(text) > 0
+
+
 def lowercase_continuation_start(text: str) -> str:
     if not text:
         return text
@@ -1133,10 +1151,34 @@ def lowercase_word_after_prefix_words(text: str, prefix_word_count: int) -> str:
 def merge_football_club_line(line: str, nxt: str) -> str | None:
     if not line or not nxt:
         return None
-    if re.search(r"[.!?…:»\"]\s*$", line):
+    if re.search(r"[.!?…]\s*[»\"]?\s*$", line):
         return None
     if line.startswith(("#", "@")) or nxt.startswith(("#", "@")):
         return None
+
+    # Предлоги, с которых может начинаться продолжение оборванного предложения,
+    # если за предлогом идёт название клуба.
+    _CLUB_PREPOSITIONS = {
+        "в", "для", "из", "к", "на", "о", "об", "от", "перед", "по",
+        "при", "про", "с", "у", "за", "до", "из-за", "из-под",
+    }
+
+    nxt_words = text_words(nxt)
+
+    # Правило A: следующая строка начинается с «предлог + название клуба».
+    # Пример: «Бернарду Силва является «Реальным вариантом»\nДля Барселоны, и...»
+    # Это правило проверяем ДО guard looks_like_speaker_heading, потому что
+    # «Бернарду Силва является «Реальным вариантом»» может ложно
+    # распознаться как заголовок говорящего.
+    if nxt_words:
+        first_word_lower = nxt_words[0].casefold()
+        rest_nxt = nxt.lstrip()
+        after_first = re.sub(
+            r"^\s*" + re.escape(nxt_words[0]) + r"\s*", "", rest_nxt, count=1, flags=re.I
+        )
+        if first_word_lower in _CLUB_PREPOSITIONS and starts_with_football_club_name(after_first):
+            return f"{line} {lowercase_continuation_start(nxt)}".strip()
+
     if looks_like_speaker_heading(split_colon_heading(line)[0] or line):
         return None
 
@@ -1151,6 +1193,21 @@ def merge_football_club_line(line: str, nxt: str) -> str | None:
 
     if is_football_club_name(line):
         return f"{line} {lowercase_continuation_start(nxt)}".strip()
+
+    # Правило B: line заканчивается названием клуба или его словоформой, а
+    # следующая строка не является самостоятельным абзацем.
+    # Пример: «Источники в Барселоне\nСообщают, что...»
+    #         «...в Манчестер Сити\nНа 50 %, чтобы...»
+    # DeepL нередко переводит начало оборванной строки с заглавной буквы,
+    # поэтому проверяем не регистр, а признаки нового абзаца.
+    if ends_with_football_club_name(line):
+        nxt_stripped = nxt.lstrip()
+        is_new_paragraph = bool(
+            re.match(r"^[#@]", nxt_stripped)
+            or re.match(r"^[🚨❗❓🎙🗣📌🔴🟡⚽🏆]", nxt_stripped)
+        )
+        if not is_new_paragraph:
+            return f"{line} {lowercase_continuation_start(nxt)}".strip()
 
     return None
 
