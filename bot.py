@@ -1842,19 +1842,19 @@ def instagram_account_to_username(value: str) -> str:
 
 
 def _ig_session():
-    """Возвращает готовую IG-сессию или None если куки не заданы / недействительны."""
+    """Возвращает готовую IG-сессию или None если куки не заданы.
+
+    Проверка валидности сессии не выполняется здесь намеренно:
+    Instagram отклоняет preflight-запросы по useragent mismatch даже при живых куках.
+    Реальные ошибки сессии (401/403) обрабатываются в _get_json/_post_json.
+    """
     if not IG_COOKIES_JSON:
         print("  IG_COOKIES_JSON не задан — пропускаем Instagram")
         return None
     if _ig is None:
         print("  instagram_scraper.py не найден — пропускаем Instagram")
         return None
-    session = _ig.build_session(IG_COOKIES_JSON)
-    if not _ig.session_is_valid(session):
-        print("  IG: сессия недействительна — обновите IG_COOKIES_JSON в GitHub Secrets")
-        alert("IG сессия недействительна. Обновите IG_COOKIES_JSON в GitHub Secrets.")
-        return None
-    return session
+    return _ig.build_session(IG_COOKIES_JSON)
 
 
 def fetch_instagram_posts() -> list:
@@ -1879,6 +1879,7 @@ def fetch_instagram_posts() -> list:
             max_posts=IG_RESULTS_LIMIT,
             only_newer_than=only_newer_than,
             skip_pinned=IG_SKIP_PINNED,
+            on_auth_error=lambda code: alert(f"IG сессия недействительна ({code}). Обновите IG_COOKIES_JSON в GitHub Secrets."),
         )
         print(f"    получено: {len(posts)} постов")
         all_posts.extend(posts)
@@ -3676,6 +3677,7 @@ def fetch_hashtag_posts(hashtag: str) -> list:
             session,
             max_posts=IG_HASHTAG_RESULTS_LIMIT,
             only_newer_than=only_newer_than,
+            on_auth_error=lambda code: alert(f"IG сессия недействительна ({code}). Обновите IG_COOKIES_JSON в GitHub Secrets."),
         )
         return posts
     except Exception as e:

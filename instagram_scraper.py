@@ -106,19 +106,18 @@ def build_session(cookies_json: str) -> requests.Session:
 
 
 def session_is_valid(session: requests.Session) -> bool:
-    """Быстрая проверка: валидна ли сессия (не истёк ли sessionid).
+    """Пассивная проверка сессии — не используется в основном потоке.
 
-    Использует /api/v1/accounts/current_user/ — стабильный внутренний эндпоинт.
-    Возвращает True если пришёл JSON с полем user.pk (числовой ID аккаунта).
-    401/403 → куки протухли. Любое исключение → считаем сессию недействительной.
+    Оставлена как утилита для ручного тестирования.
+    В production-потоке не вызывается: Instagram отклоняет preflight-запросы
+    по useragent mismatch даже при живых куках.
+    Реальные ошибки сессии (401/403) обрабатываются в _get_json/_post_json.
     """
     try:
         r = session.get(
             "https://www.instagram.com/api/v1/accounts/current_user/?edit=true",
             timeout=15,
         )
-        logger.info(f"IG session_is_valid: status={r.status_code} body={r.text[:300]}")
-        print(f"  IG session check: status={r.status_code} body={r.text[:300]}")
         if r.status_code in (401, 403):
             return False
         if r.status_code == 200:
@@ -126,8 +125,7 @@ def session_is_valid(session: requests.Session) -> bool:
             user = data.get("user") or {}
             return bool(user.get("pk") or user.get("id"))
         return False
-    except Exception as e:
-        print(f"  IG session check exception: {e}")
+    except Exception:
         return False
 
 
@@ -175,6 +173,7 @@ def fetch_user_posts(
     max_posts: int = 12,
     only_newer_than: Optional[datetime] = None,
     skip_pinned: bool = True,
+    on_auth_error=None,
 ) -> list[dict]:
     """
     Возвращает список постов аккаунта username.
@@ -195,7 +194,7 @@ def fetch_user_posts(
             params["max_id"] = max_id
 
         url = _PROFILE_API_URL.format(user_id=user_id)
-        data = _get_json(session, url, params=params)
+        data = _get_json(session, url, params=params, on_auth_error=on_auth_error)
         if data is None:
             break
 
@@ -233,6 +232,7 @@ def fetch_hashtag_posts(
     session: requests.Session,
     max_posts: int = 10,
     only_newer_than: Optional[datetime] = None,
+    on_auth_error=None,
 ) -> list[dict]:
     """
     Возвращает список постов по хэштегу.
@@ -258,7 +258,7 @@ def fetch_hashtag_posts(
             payload["next_max_id"] = page_token
 
         url = _HASHTAG_API_URL.format(hashtag=hashtag)
-        data = _post_json(session, url, data=payload)
+        data = _post_json(session, url, data=payload, on_auth_error=on_auth_error)
         if data is None:
             break
 
@@ -386,12 +386,15 @@ def _get_json(
     session: requests.Session,
     url: str,
     params: Optional[dict] = None,
+    on_auth_error=None,
 ) -> Optional[dict]:
     for attempt in range(MAX_RETRIES):
         try:
             r = session.get(url, params=params, timeout=20)
             if r.status_code in (401, 403):
                 logger.error(f"IG: сессия недействительна ({r.status_code}) → {url}")
+                if on_auth_error:
+                    on_auth_error(r.status_code)
                 return None
             if r.status_code == 429:
                 wait = random.uniform(*RETRY_DELAY) * (attempt + 1)
@@ -413,12 +416,15 @@ def _post_json(
     session: requests.Session,
     url: str,
     data: Optional[dict] = None,
+    on_auth_error=None,
 ) -> Optional[dict]:
     for attempt in range(MAX_RETRIES):
         try:
             r = session.post(url, data=data, timeout=20)
             if r.status_code in (401, 403):
                 logger.error(f"IG: сессия недействительна ({r.status_code}) → {url}")
+                if on_auth_error:
+                    on_auth_error(r.status_code)
                 return None
             if r.status_code == 429:
                 wait = random.uniform(*RETRY_DELAY) * (attempt + 1)
