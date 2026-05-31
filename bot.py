@@ -2,7 +2,7 @@
 """
 NicoPaz Telegram Bot
 STEP 1: Twitter/Nitter по ключевым словам  -> DeepL + OpenRouter -> Telegram
-STEP 2: Instagram через Apify               -> DeepL -> Telegram
+STEP 2: Instagram (self-hosted scraper)     -> DeepL -> Telegram
 STEP 3: Twitter-аккаунты                   -> DeepL + OpenRouter -> Telegram
 
 Запуск: python bot.py --step 1|2|3|4
@@ -23,6 +23,10 @@ from pathlib import Path
 from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 
 import requests
+try:
+    import instagram_scraper as _ig
+except ImportError:
+    _ig = None  # type: ignore
 from format_model.rag_layout import (
     build_layout_prompt,
     call_openrouter_layout_checker,
@@ -36,6 +40,8 @@ from format_model.hard_cases import save_hard_case
 # ────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHANNEL_ID = os.environ["CHANNEL_ID"]
+BOT_NAME = os.environ.get("BOT_NAME", "NicoPazBot").strip()
+ALERT_CHANNEL_ID = os.environ.get("ALERT_CHANNEL_ID", "").strip()
 DEEPL_KEY = os.environ["DEEPL_KEY"]
 OPENROUTER_KEY = os.environ.get("OPENROUTER_KEY", "")
 OPENROUTER_MODEL = (
@@ -107,29 +113,18 @@ SCWEET_MANIFEST_SCRAPE_ON_INIT = os.environ.get("SCWEET_MANIFEST_SCRAPE_ON_INIT"
 STEP1_LIMIT = int((os.environ.get("STEP1_LIMIT") or "50").strip())
 STEP3_LIMIT = int((os.environ.get("STEP3_LIMIT") or "20").strip())
 
-# Шаг 2
-APIFY_TOKEN = os.environ.get("APIFY_TOKEN", "").strip()
-APIFY_BASE_URL = (os.environ.get("APIFY_BASE_URL") or "https://api.apify.com/v2").rstrip("/")
-APIFY_INSTAGRAM_ACTOR = (
-    os.environ.get("APIFY_INSTAGRAM_ACTOR")
-    or "apify~instagram-post-scraper"
-).strip().replace("/", "~")
-APIFY_INSTAGRAM_ACCOUNTS = [
+# Шаг 2 — self-hosted Instagram scraper (без Apify)
+IG_COOKIES_JSON = os.environ.get("IG_COOKIES_JSON", "").strip()
+IG_INSTAGRAM_ACCOUNTS = [
     a.strip()
     for a in (
-        os.environ.get("STEP2_INSTAGRAM_ACCOUNTS")
-        or os.environ.get("APIFY_INSTAGRAM_ACCOUNTS", "")
+        os.environ.get("STEP2_INSTAGRAM_ACCOUNTS", "")
     ).split(",")
     if a.strip()
 ]
-APIFY_INSTAGRAM_RESULTS_LIMIT = int((os.environ.get("APIFY_INSTAGRAM_RESULTS_LIMIT") or "10").strip())
-APIFY_INSTAGRAM_ONLY_NEWER_THAN = (os.environ.get("APIFY_INSTAGRAM_ONLY_NEWER_THAN") or "2 days").strip()
-APIFY_INSTAGRAM_DATA_DETAIL_LEVEL = (os.environ.get("APIFY_INSTAGRAM_DATA_DETAIL_LEVEL") or "detailedData").strip()
-APIFY_INSTAGRAM_SKIP_PINNED = (os.environ.get("APIFY_INSTAGRAM_SKIP_PINNED") or "1").strip().lower() not in {"0", "false", "no", "off"}
-APIFY_INSTAGRAM_INPUT_JSON = os.environ.get("APIFY_INSTAGRAM_INPUT_JSON", "").strip()
-APIFY_RUN_TIMEOUT = int((os.environ.get("APIFY_RUN_TIMEOUT") or "180").strip())
-APIFY_MAX_ITEMS = os.environ.get("APIFY_MAX_ITEMS", "").strip()
-APIFY_MAX_TOTAL_CHARGE_USD = os.environ.get("APIFY_MAX_TOTAL_CHARGE_USD", "").strip()
+IG_RESULTS_LIMIT = int((os.environ.get("IG_RESULTS_LIMIT") or "10").strip())
+IG_ONLY_NEWER_THAN_HOURS = int((os.environ.get("IG_ONLY_NEWER_THAN_HOURS") or "48").strip())
+IG_SKIP_PINNED = os.environ.get("IG_SKIP_PINNED", "1").strip().lower() not in {"0", "false", "no", "off"}
 INSTAGRAM_PREFIX = " "
 
 # Шаг 3
@@ -148,12 +143,8 @@ STEP4_HASHTAGS = [
     for h in os.environ.get("STEP4_HASHTAGS", "").split(",")
     if h.strip()
 ]
-APIFY_HASHTAG_ACTOR = (
-    os.environ.get("APIFY_HASHTAG_ACTOR")
-    or "apify~instagram-hashtag-scraper"
-).strip().replace("/", "~")
-APIFY_HASHTAG_RESULTS_LIMIT = int((os.environ.get("APIFY_HASHTAG_RESULTS_LIMIT") or "10").strip())
-APIFY_HASHTAG_ONLY_NEWER_THAN = (os.environ.get("APIFY_HASHTAG_ONLY_NEWER_THAN") or "2 days").strip()
+IG_HASHTAG_RESULTS_LIMIT = int((os.environ.get("IG_HASHTAG_RESULTS_LIMIT") or "10").strip())
+IG_HASHTAG_ONLY_NEWER_THAN_HOURS = int((os.environ.get("IG_HASHTAG_ONLY_NEWER_THAN_HOURS") or "48").strip())
 STEP4_SIGNATURE = os.environ.get("STEP4_SIGNATURE", "#NicoPaz | ...").strip()
 STEP4_PREFIX = os.environ.get("STEP4_PREFIX", "").strip()
 # Если задан — публикуем только посты от этих аккаунтов.
@@ -1850,84 +1841,52 @@ def instagram_account_to_username(value: str) -> str:
     return path_parts[0].lstrip("@")
 
 
-def build_apify_instagram_input() -> dict:
-    usernames = []
-    direct_urls = []
-    for account in APIFY_INSTAGRAM_ACCOUNTS:
-        normalized = instagram_account_to_username(account)
-        if not normalized:
-            continue
-        if re.search(r"^https?://", normalized, flags=re.I):
-            direct_urls.append(normalized)
-        else:
-            usernames.append(normalized)
-
-    actor_input = {
-        "username": usernames,
-        "resultsLimit": APIFY_INSTAGRAM_RESULTS_LIMIT,
-        "skipPinnedPosts": APIFY_INSTAGRAM_SKIP_PINNED,
-    }
-    if direct_urls:
-        actor_input["directUrls"] = direct_urls
-    if APIFY_INSTAGRAM_ONLY_NEWER_THAN:
-        actor_input["onlyPostsNewerThan"] = APIFY_INSTAGRAM_ONLY_NEWER_THAN
-    if APIFY_INSTAGRAM_DATA_DETAIL_LEVEL:
-        actor_input["dataDetailLevel"] = APIFY_INSTAGRAM_DATA_DETAIL_LEVEL
-
-    if APIFY_INSTAGRAM_INPUT_JSON:
-        try:
-            override = json.loads(APIFY_INSTAGRAM_INPUT_JSON)
-            if isinstance(override, dict):
-                actor_input.update(override)
-        except Exception as e:
-            print(f"  APIFY_INSTAGRAM_INPUT_JSON не разобран: {e}")
-
-    return actor_input
+def _ig_session():
+    """Возвращает готовую IG-сессию или None если куки не заданы / недействительны."""
+    if not IG_COOKIES_JSON:
+        print("  IG_COOKIES_JSON не задан — пропускаем Instagram")
+        return None
+    if _ig is None:
+        print("  instagram_scraper.py не найден — пропускаем Instagram")
+        return None
+    session = _ig.build_session(IG_COOKIES_JSON)
+    if not _ig.session_is_valid(session):
+        print("  IG: сессия недействительна — обновите IG_COOKIES_JSON в GitHub Secrets")
+        alert("IG сессия недействительна. Обновите IG_COOKIES_JSON в GitHub Secrets.")
+        return None
+    return session
 
 
 def fetch_instagram_posts() -> list:
-    """Fetch Instagram posts from Apify Instagram Post Scraper."""
-    if not APIFY_TOKEN:
-        print("  APIFY_TOKEN не задан — пропускаем")
+    """Получает посты из Instagram через self-hosted scraper (без Apify)."""
+    session = _ig_session()
+    if session is None:
         return []
-    if not APIFY_INSTAGRAM_ACCOUNTS and not APIFY_INSTAGRAM_INPUT_JSON:
+    if not IG_INSTAGRAM_ACCOUNTS:
         print("  STEP2_INSTAGRAM_ACCOUNTS не задан — пропускаем")
         return []
 
-    actor_input = build_apify_instagram_input()
-    url = f"{APIFY_BASE_URL}/acts/{APIFY_INSTAGRAM_ACTOR}/run-sync-get-dataset-items"
-    params = {
-        "format": "json",
-        "clean": "1",
-        "timeout": str(APIFY_RUN_TIMEOUT),
-    }
-    if APIFY_MAX_ITEMS:
-        params["maxItems"] = APIFY_MAX_ITEMS
-    if APIFY_MAX_TOTAL_CHARGE_USD:
-        params["maxTotalChargeUsd"] = APIFY_MAX_TOTAL_CHARGE_USD
-
-    try:
-        r = requests.post(
-            url,
-            params=params,
-            json=actor_input,
-            headers={
-                **REQUEST_HEADERS,
-                "Authorization": f"Bearer {APIFY_TOKEN}",
-                "Content-Type": "application/json",
-            },
-            timeout=APIFY_RUN_TIMEOUT + 45,
+    only_newer_than = datetime.now(timezone.utc) - timedelta(hours=IG_ONLY_NEWER_THAN_HOURS)
+    all_posts = []
+    for i, account_raw in enumerate(IG_INSTAGRAM_ACCOUNTS):
+        username = instagram_account_to_username(account_raw)
+        if not username:
+            continue
+        print(f"  IG scraper: @{username}")
+        posts = _ig.fetch_user_posts(
+            username,
+            session,
+            max_posts=IG_RESULTS_LIMIT,
+            only_newer_than=only_newer_than,
+            skip_pinned=IG_SKIP_PINNED,
         )
-        r.raise_for_status()
-        data = r.json()
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            return data.get("items", []) or data.get("data", {}).get("items", [])
-        return []
-    except Exception as e:
-        print(f"  Apify ошибка: {e}")
-        return []
+        print(f"    получено: {len(posts)} постов")
+        all_posts.extend(posts)
+        if i < len(IG_INSTAGRAM_ACCOUNTS) - 1:
+            wait = random.uniform(*_ig.DELAY_BETWEEN_ACCOUNTS)
+            print(f"    пауза {wait:.0f}с перед следующим аккаунтом...")
+            time.sleep(wait)
+    return all_posts
 
 
 def instagram_media_from_apify_post(post: dict) -> list:
@@ -2638,7 +2597,11 @@ def rag_check_telegram_layout(text: str) -> str:
 
 def log_tg_error(method: str, res: dict):
     if not res.get("ok"):
-        print(f"  Telegram ошибка {method}: {res.get('description')} | {res}")
+        desc = res.get('description', '')
+        print(f"  Telegram ошибка {method}: {desc} | {res}")
+        # Алерт только при реальных сбоях, а не при безобидных предупреждениях
+        if res.get("error_code") not in (None,) and res.get("error_code", 0) >= 400:
+            alert(f"Telegram API ошибка {method} [{res.get('error_code')}]: {desc}")
 
 
 def tg(method: str, payload: dict) -> dict:
@@ -2653,7 +2616,34 @@ def tg(method: str, payload: dict) -> dict:
         return res
     except Exception as e:
         print(f"  Telegram request ошибка {method}: {e}")
+        alert(f"Telegram request ошибка {method}: {e}")
         return {"ok": False, "description": str(e)}
+
+
+def _send_telegram_alert(text: str):
+    """Отправляет служебное сообщение в ALERT_CHANNEL_ID (или CHANNEL_ID как fallback).
+
+    Формат: «BOT_NAME: описание проблемы».
+    Используется только для критических ошибок, требующих ручного вмешательства.
+    """
+    target = ALERT_CHANNEL_ID or CHANNEL_ID
+    if not target:
+        return
+    message = f"{BOT_NAME}: {text}"
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": target, "text": message},
+            timeout=15,
+        )
+    except Exception as e:
+        print(f"  _send_telegram_alert ошибка: {e}")
+
+
+def alert(description: str):
+    """Сокращённый alias для _send_telegram_alert. Использовать везде в коде."""
+    print(f"  [ALERT] {description}")
+    _send_telegram_alert(description)
 
 
 def split_caption(full_text: str, has_media: bool) -> tuple:
@@ -2751,11 +2741,13 @@ def post_to_vk(full_text: str) -> bool:
         res = r.json()
         if "error" in res:
             print(f"  VK ошибка wall.post: {res['error']}")
+            alert(f"VK ошибка wall.post: {res['error']}")
             return False
         print(f"  VK опубликовано: {res.get('response')}")
         return True
     except Exception as e:
         print(f"  VK request ошибка: {e}")
+        alert(f"VK request ошибка: {e}")
         return False
 
 
@@ -2793,6 +2785,7 @@ def post_to_max(full_text: str) -> bool:
                 res = {"status_code": r.status_code, "text": r.text[:500]}
             if r.status_code >= 400:
                 print(f"  MAX ошибка messages: {res}")
+                alert(f"MAX ошибка messages [{r.status_code}]: {str(res)[:200]}")
                 ok = False
                 break
             print(f"  MAX опубликовано: часть {i + 1}/{len(parts)}")
@@ -2800,6 +2793,7 @@ def post_to_max(full_text: str) -> bool:
                 time.sleep(1)
         except Exception as e:
             print(f"  MAX request ошибка: {e}")
+            alert(f"MAX request ошибка: {e}")
             ok = False
             break
     return ok
@@ -2885,6 +2879,7 @@ def send_single_media(downloaded: dict, caption: str) -> bool:
         return res.get("ok", False)
     except Exception as e:
         print(f"  Telegram upload ошибка {method}: {e}")
+        alert(f"Telegram upload ошибка {method}: {e}")
         return False
 
 
@@ -2914,6 +2909,7 @@ def send_media_group(downloaded: list, caption: str) -> bool:
 
     except Exception as e:
         print(f"  Медиагруппа upload ошибка: {e}")
+        alert(f"Медиагруппа upload ошибка: {e}")
         return False
 
     finally:
@@ -3483,16 +3479,16 @@ def step1_twitter_keywords(published: set) -> set:
     print(f"\n  Итого опубликовано: {new_count}")
     return published
 def step2_instagram(published: set) -> set:
-    print("\n══════ ШАГ 2: Instagram ══════")
-    if not APIFY_TOKEN:
-        print("  APIFY_TOKEN не задан — пропускаем")
+    print("\n══════ ШАГ 2: Instagram (self-hosted) ══════")
+    if not IG_COOKIES_JSON:
+        print("  IG_COOKIES_JSON не задан — пропускаем")
         return published
-    if not APIFY_INSTAGRAM_ACCOUNTS and not APIFY_INSTAGRAM_INPUT_JSON:
+    if not IG_INSTAGRAM_ACCOUNTS:
         print("  STEP2_INSTAGRAM_ACCOUNTS не задан — пропускаем")
         return published
 
     posts = fetch_instagram_posts()
-    print(f"  Получено Apify posts: {len(posts)}")
+    print(f"  Получено постов: {len(posts)}")
     new_count = 0
 
     if not posts:
@@ -3668,57 +3664,29 @@ def flatten_hashtag_posts(data) -> list:
 
 
 def fetch_hashtag_posts(hashtag: str) -> list:
-    """Получает посты по хэштегу через apify~instagram-hashtag-scraper."""
-    if not APIFY_TOKEN:
+    """Получает посты по хэштегу через self-hosted Instagram scraper."""
+    session = _ig_session()
+    if session is None:
         return []
 
-    actor_input = {
-        "hashtags": [hashtag],
-        "resultsLimit": APIFY_HASHTAG_RESULTS_LIMIT,
-    }
-    if APIFY_HASHTAG_ONLY_NEWER_THAN:
-        actor_input["onlyPostsNewerThan"] = APIFY_HASHTAG_ONLY_NEWER_THAN
-
-    url = f"{APIFY_BASE_URL}/acts/{APIFY_HASHTAG_ACTOR}/run-sync-get-dataset-items"
-    params = {
-        "format": "json",
-        "clean": "1",
-        "timeout": str(APIFY_RUN_TIMEOUT),
-    }
-    if APIFY_MAX_TOTAL_CHARGE_USD:
-        params["maxTotalChargeUsd"] = APIFY_MAX_TOTAL_CHARGE_USD
-
+    only_newer_than = datetime.now(timezone.utc) - timedelta(hours=IG_HASHTAG_ONLY_NEWER_THAN_HOURS)
     try:
-        r = requests.post(
-            url,
-            params=params,
-            json=actor_input,
-            headers={
-                **REQUEST_HEADERS,
-                "Authorization": f"Bearer {APIFY_TOKEN}",
-                "Content-Type": "application/json",
-            },
-            timeout=APIFY_RUN_TIMEOUT + 45,
+        posts = _ig.fetch_hashtag_posts(
+            hashtag,
+            session,
+            max_posts=IG_HASHTAG_RESULTS_LIMIT,
+            only_newer_than=only_newer_than,
         )
-        r.raise_for_status()
-        data = r.json()
-        posts = flatten_hashtag_posts(data)
-        if posts:
-            return posts
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            return data.get("items", []) or data.get("data", {}).get("items", [])
-        return []
+        return posts
     except Exception as e:
-        print(f"  Apify hashtag ошибка (#{hashtag}): {e}")
+        print(f"  IG scraper hashtag ошибка (#{hashtag}): {e}")
         return []
 
 
 def hashtag_post_owner(post: dict) -> str:
-    """Извлекает username автора поста из ответа Apify hashtag-scraper.
+    """Извлекает username автора поста из ответа self-hosted Instagram scraper.
 
-    Поле может называться по-разному в зависимости от версии актора.
+    Поле может называться по-разному в зависимости от источника.
     Возвращает lowercase username без '@', или '' если не найден.
     """
     candidates = [
@@ -3774,9 +3742,9 @@ def make_hashtag_telegram_html(caption: str, hashtag: str) -> str:
 
 
 def step4_instagram_hashtags(published: set) -> set:
-    print("\n══════ ШАГ 4: Instagram Hashtags ══════")
-    if not APIFY_TOKEN:
-        print("  APIFY_TOKEN не задан — пропускаем")
+    print("\n══════ ШАГ 4: Instagram Hashtags (self-hosted) ══════")
+    if not IG_COOKIES_JSON:
+        print("  IG_COOKIES_JSON не задан — пропускаем")
         return published
     if not STEP4_HASHTAGS:
         print("  STEP4_HASHTAGS не задан — пропускаем")
@@ -3795,7 +3763,7 @@ def step4_instagram_hashtags(published: set) -> set:
             print("  Новых постов нет")
             continue
 
-        for post in posts[:APIFY_HASHTAG_RESULTS_LIMIT]:
+        for post in posts[:IG_HASHTAG_RESULTS_LIMIT]:
             if not is_allowed_account(post):
                 owner = hashtag_post_owner(post)
                 if owner:
