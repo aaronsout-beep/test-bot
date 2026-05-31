@@ -3,14 +3,14 @@ name: Step 1 - Twitter Keywords
 on:
   schedule:
     # Europe/Samara is UTC+4: 11:00, 14:00, 17:00, 20:00, 23:00 Samara.
-    - cron: '33 1 * * *'
+    - cron: '33 7,10,13,16,19 * * *'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: step1-published-state
+  group: bot-shared-state
   cancel-in-progress: false
 
 env:
@@ -67,6 +67,8 @@ jobs:
           MAX_TOKEN:          ${{ secrets.MAX_TOKEN }}
           MAX_CHAT_ID:        ${{ secrets.MAX_CHAT_ID }}
           MAX_USER_ID:        ${{ secrets.MAX_USER_ID }}
+          ALERT_CHANNEL_ID:   ${{ secrets.ALERT_CHANNEL_ID }}
+          BOT_NAME:           ${{ vars.BOT_NAME || 'NicoPazBot' }}
         run: python bot.py --step 1
 
       - name: Save state

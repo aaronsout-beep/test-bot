@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: step3-published-state
+  group: bot-shared-state
   cancel-in-progress: false
 
 env:
@@ -61,6 +61,8 @@ jobs:
           SCWEET_AUTH_TOKEN:  ${{ secrets.SCWEET_AUTH_TOKEN }}
           SCWEET_PROXY:       ${{ secrets.SCWEET_PROXY }}
           STEP3_LIMIT:        ${{ vars.STEP3_LIMIT || '20' }}
+          ALERT_CHANNEL_ID:   ${{ secrets.ALERT_CHANNEL_ID }}
+          BOT_NAME:           ${{ vars.BOT_NAME || 'NicoPazBot' }}
         run: python bot.py --step 3
 
       # Сохраняем состояние всегда — даже если бот упал.

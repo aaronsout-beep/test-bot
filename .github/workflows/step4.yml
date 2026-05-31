@@ -1,9 +1,9 @@
-name: Step 2 - Instagram Accounts
+name: Step 4 - Instagram Hashtags
 
 on:
   schedule:
-    # Europe/Samara is UTC+4: 12:00, 15:00, 18:00, 21:00, 00:00 Samara.
-    - cron: '0 8,11,14,17,20 * * *'
+    # Europe/Samara is UTC+4: 11:30, 14:30, 17:30, 20:30, 23:30 Samara.
+    - cron: '30 6,9,12,15,18,21,23 * * *'
   workflow_dispatch:
 
 permissions:
@@ -62,29 +62,32 @@ jobs:
       - name: Run bot
         if: steps.state.outputs.should_run == 'true'
         env:
-          BOT_TOKEN:                          ${{ secrets.BOT_TOKEN }}
-          CHANNEL_ID:                         ${{ secrets.CHANNEL_ID }}
-          DEEPL_KEY:                          ${{ secrets.DEEPL_KEY }}
-          OPENROUTER_KEY:                     ${{ secrets.OPENROUTER_KEY }}
-          OPENROUTER_MODEL:                   ${{ secrets.OPENROUTER_MODEL }}
-          GEMINI_API_KEY:                     ${{ secrets.GEMINI_API_KEY }}
-          FORMAT_RAG_ENABLED:                 "1"
-          REQUIRE_PUBLISHED_CACHE:            ${{ vars.ALLOW_EMPTY_STATE == '1' && '0' || '1' }}
-          IG_COOKIES_JSON:                    ${{ secrets.IG_COOKIES_JSON }}
-          STEP2_INSTAGRAM_ACCOUNTS:           ${{ secrets.STEP2_INSTAGRAM_ACCOUNTS }}
-          IG_RESULTS_LIMIT:                   ${{ vars.IG_RESULTS_LIMIT || '10' }}
-          IG_ONLY_NEWER_THAN_HOURS:           ${{ vars.IG_ONLY_NEWER_THAN_HOURS || '48' }}
-          IG_SKIP_PINNED:                     ${{ vars.IG_SKIP_PINNED || '1' }}
-          VK_ACCESS_TOKEN:                    ${{ secrets.VK_ACCESS_TOKEN }}
-          VK_OWNER_ID:                        ${{ secrets.VK_OWNER_ID }}
-          VK_API_VERSION:                     ${{ secrets.VK_API_VERSION }}
-          VK_FROM_GROUP:                      ${{ secrets.VK_FROM_GROUP }}
-          MAX_TOKEN:                          ${{ secrets.MAX_TOKEN }}
-          MAX_CHAT_ID:                        ${{ secrets.MAX_CHAT_ID }}
-          MAX_USER_ID:                        ${{ secrets.MAX_USER_ID }}
-          ALERT_CHANNEL_ID:                   ${{ secrets.ALERT_CHANNEL_ID }}
-          BOT_NAME:                           ${{ vars.BOT_NAME || 'NicoPazBot' }}
-        run: python bot.py --step 2
+          BOT_TOKEN:             ${{ secrets.BOT_TOKEN }}
+          CHANNEL_ID:            ${{ secrets.CHANNEL_ID }}
+          DEEPL_KEY:             ${{ secrets.DEEPL_KEY }}
+          OPENROUTER_KEY:        ${{ secrets.OPENROUTER_KEY }}
+          OPENROUTER_MODEL:      ${{ secrets.OPENROUTER_MODEL }}
+          GEMINI_API_KEY:        ${{ secrets.GEMINI_API_KEY }}
+          FORMAT_RAG_ENABLED:    "1"
+          REQUIRE_PUBLISHED_CACHE: ${{ vars.ALLOW_EMPTY_STATE == '1' && '0' || '1' }}
+          IG_COOKIES_JSON:       ${{ secrets.IG_COOKIES_JSON }}
+          STEP4_HASHTAGS:        ${{ secrets.STEP4_HASHTAGS }}
+          IG_HASHTAG_RESULTS_LIMIT:        ${{ vars.IG_HASHTAG_RESULTS_LIMIT || '10' }}
+          IG_HASHTAG_ONLY_NEWER_THAN_HOURS: ${{ vars.IG_HASHTAG_ONLY_NEWER_THAN_HOURS || '48' }}
+          STEP4_SIGNATURE:       ${{ secrets.STEP4_SIGNATURE }}
+          STEP4_PREFIX:          ${{ secrets.STEP4_PREFIX }}
+          STEP4_ALLOWED_ACCOUNTS: ${{ secrets.STEP4_ALLOWED_ACCOUNTS }}
+          APIFY_RUN_TIMEOUT:     ${{ secrets.APIFY_RUN_TIMEOUT }}
+          VK_ACCESS_TOKEN:       ${{ secrets.VK_ACCESS_TOKEN }}
+          VK_OWNER_ID:           ${{ secrets.VK_OWNER_ID }}
+          VK_API_VERSION:        ${{ secrets.VK_API_VERSION }}
+          VK_FROM_GROUP:         ${{ secrets.VK_FROM_GROUP }}
+          MAX_TOKEN:             ${{ secrets.MAX_TOKEN }}
+          MAX_CHAT_ID:           ${{ secrets.MAX_CHAT_ID }}
+          MAX_USER_ID:           ${{ secrets.MAX_USER_ID }}
+          ALERT_CHANNEL_ID:      ${{ secrets.ALERT_CHANNEL_ID }}
+          BOT_NAME:              ${{ vars.BOT_NAME || 'NicoPazBot' }}
+        run: python bot.py --step 4
 
       - name: Save state
         if: always() && steps.state.outputs.should_run == 'true'
