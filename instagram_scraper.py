@@ -117,6 +117,8 @@ def session_is_valid(session: requests.Session) -> bool:
             "https://www.instagram.com/api/v1/accounts/current_user/?edit=true",
             timeout=15,
         )
+        logger.info(f"IG session_is_valid: status={r.status_code} body={r.text[:300]}")
+        print(f"  IG session check: status={r.status_code} body={r.text[:300]}")
         if r.status_code in (401, 403):
             return False
         if r.status_code == 200:
@@ -124,7 +126,8 @@ def session_is_valid(session: requests.Session) -> bool:
             user = data.get("user") or {}
             return bool(user.get("pk") or user.get("id"))
         return False
-    except Exception:
+    except Exception as e:
+        print(f"  IG session check exception: {e}")
         return False
 
 
