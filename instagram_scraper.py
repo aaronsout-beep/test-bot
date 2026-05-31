@@ -32,7 +32,7 @@ _BASE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/125.0.0.0 Safari/537.36"
+        "Chrome/136.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "en-US,en;q=0.9",
     "Accept": "*/*",
@@ -43,7 +43,7 @@ _BASE_HEADERS = {
     "Origin": "https://www.instagram.com",
     "Sec-Fetch-Site": "same-origin",
     "Sec-Fetch-Mode": "cors",
-    "Sec-Ch-Ua": '"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"',
+    "Sec-Ch-Ua": '"Google Chrome";v="136", "Chromium";v="136", "Not.A/Brand";v="24"',
     "Sec-Ch-Ua-Mobile": "?0",
     "Sec-Ch-Ua-Platform": '"Windows"',
 }
@@ -106,15 +106,23 @@ def build_session(cookies_json: str) -> requests.Session:
 
 
 def session_is_valid(session: requests.Session) -> bool:
-    """Быстрая проверка: валидна ли сессия (не истёк ли sessionid)."""
+    """Быстрая проверка: валидна ли сессия (не истёк ли sessionid).
+
+    Использует /api/v1/accounts/current_user/ — стабильный внутренний эндпоинт.
+    Возвращает True если пришёл JSON с полем user.pk (числовой ID аккаунта).
+    401/403 → куки протухли. Любое исключение → считаем сессию недействительной.
+    """
     try:
         r = session.get(
-            "https://www.instagram.com/accounts/edit/?__a=1&__d=dis",
-            timeout=10,
+            "https://www.instagram.com/api/v1/accounts/current_user/?edit=true",
+            timeout=15,
         )
+        if r.status_code in (401, 403):
+            return False
         if r.status_code == 200:
             data = r.json()
-            return bool(data.get("form_data") or data.get("data"))
+            user = data.get("user") or {}
+            return bool(user.get("pk") or user.get("id"))
         return False
     except Exception:
         return False
@@ -238,6 +246,9 @@ def fetch_hashtag_posts(
         "rank_token": f"{''.join(random.choices('abcdef0123456789', k=32))}",
     }
 
+    stale_streak = 0          # сколько подряд постов оказались старше порога
+    _MAX_STALE_STREAK = 8     # выходим, если 8 подряд старых постов (лента кончилась)
+
     for _ in range(5):   # максимум 5 страниц
         payload = dict(payload_base)
         if page_token:
@@ -264,7 +275,11 @@ def fetch_hashtag_posts(
                 ts = item.get("taken_at", 0)
                 dt = datetime.fromtimestamp(ts, tz=timezone.utc) if ts else None
                 if only_newer_than and dt and dt <= only_newer_than:
+                    stale_streak += 1
+                    if stale_streak >= _MAX_STALE_STREAK:
+                        return posts   # достаточно старых постов подряд — выходим
                     continue
+                stale_streak = 0      # сбрасываем счётчик при свежем посте
 
                 owner = item.get("user") or {}
                 username = owner.get("username", "")
