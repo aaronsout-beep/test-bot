@@ -3,7 +3,7 @@ name: Step 4 - Instagram Hashtags
 on:
   schedule:
     # Europe/Samara is UTC+4: 11:30, 14:30, 17:30, 20:30, 23:30 Samara.
-    - cron: '30 6,9,12,15,18,21,23 * * *'
+    - cron: '30 8 * * *'
   workflow_dispatch:
 
 permissions:
