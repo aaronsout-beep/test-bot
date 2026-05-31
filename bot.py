@@ -1047,6 +1047,26 @@ def looks_like_speaker_heading(heading: str) -> bool:
     words = re.findall(r"[A-Za-zА-Яа-яЁёÀ-ÿ][\wА-Яа-яЁёÀ-ÿ'-]*", name, flags=re.UNICODE)
     if not 2 <= len(words) <= 5:
         return False
+
+    # Строки, начинающиеся с союза/предлога («И Бавария», «Для Реала»),
+    # не могут быть именем говорящего.
+    _NOT_NAME_STARTERS = {
+        "и", "а", "но", "или", "если", "когда", "что", "как", "чтобы",
+        "в", "для", "из", "к", "на", "о", "об", "от", "по", "при",
+        "про", "с", "у", "за", "до", "перед",
+    }
+    if words[0].casefold() in _NOT_NAME_STARTERS:
+        return False
+
+    # Если любое слово в имени является (или входит в) название клуба —
+    # это не заголовок говорящего, а часть предложения.
+    # Проверяем все возможные хвосты слов (1..N).
+    for count in range(1, len(words) + 1):
+        if is_football_club_name(" ".join(words[-count:])):
+            return False
+        if is_football_club_name(" ".join(words[:count])):
+            return False
+
     return sum(1 for word in words[:2] if word[:1].isupper()) >= 2
 
 
@@ -1114,14 +1134,20 @@ def lowercase_continuation_start(text: str) -> str:
     if text.lstrip().startswith(("#", "@", "http://", "https://", "<", "«", "\"", "“")):
         return text
 
+    # Однобуквенные союзы/предлоги, которые не являются аббревиатурами.
+    # word.isupper() == True для них, но это не аббревиатура — переводим в строчную.
+    _SINGLE_LETTER_NOT_ABBREV = {"И", "А", "В", "О", "С", "К", "У"}
+
     def replace(match: re.Match) -> str:
         prefix, word = match.group(1), match.group(2)
-        if word.upper() in CAPS_WORD_EXCEPTIONS or word.isupper():
+        if word.upper() in CAPS_WORD_EXCEPTIONS:
+            return match.group(0)
+        if word.isupper() and word not in _SINGLE_LETTER_NOT_ABBREV:
             return match.group(0)
         return prefix + word[:1].lower() + word[1:]
 
     return re.sub(
-        r"^(\s*[^\wА-Яа-яЁёA-Za-zÀ-ÿ#@<«\"“]*)([А-ЯЁA-Z][а-яёa-z][\wА-Яа-яЁёÀ-ÿ'-]*)",
+        r"^(\s*[^\wА-Яа-яЁёA-Za-zÀ-ÿ#@<«\"“]*)([А-ЯЁA-Z][а-яёa-z]?[\wА-Яа-яЁёÀ-ÿ'-]*)",
         replace,
         text,
         count=1,
@@ -1161,6 +1187,8 @@ def merge_football_club_line(line: str, nxt: str) -> str | None:
     _CLUB_PREPOSITIONS = {
         "в", "для", "из", "к", "на", "о", "об", "от", "перед", "по",
         "при", "про", "с", "у", "за", "до", "из-за", "из-под",
+        # союзы, с которых может начинаться оборванная строка с клубом
+        "и", "а", "но", "или",
     }
 
     nxt_words = text_words(nxt)
