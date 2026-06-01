@@ -173,6 +173,7 @@ def fetch_user_posts(
     max_posts: int = 12,
     only_newer_than: Optional[datetime] = None,
     skip_pinned: bool = True,
+    known_user_id: Optional[str] = None,
     on_auth_error=None,
 ) -> list[dict]:
     """
@@ -180,8 +181,12 @@ def fetch_user_posts(
 
     Каждый пост — dict совместимый с instagram_media_from_apify_post / 
     instagram_caption_from_apify_post / instagram_date_from_apify_post в bot.py.
+    Если known_user_id передан — пропускает запрос к web_profile_info (экономит лимиты).
     """
-    user_id = get_user_id(username, session)
+    if known_user_id:
+        user_id = known_user_id
+    else:
+        user_id = get_user_id(username, session)
     if not user_id:
         return []
 
@@ -212,7 +217,9 @@ def fetch_user_posts(
             if skip_pinned and item.get("is_pinned"):
                 continue
 
-            posts.append(_normalize_post(item, username))
+            post = _normalize_post(item, username)
+            post["_user_id"] = user_id  # для кеша user_id в bot.py
+            posts.append(post)
 
         if not data.get("more_available"):
             break
