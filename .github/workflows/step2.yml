@@ -3,7 +3,7 @@ name: Step 2 - Instagram Accounts
 on:
   schedule:
     # Europe/Samara is UTC+4: 12:00, 15:00, 18:00, 21:00, 00:00 Samara.
-    - cron: '0 8,11,14,17,20 * * *'
+    - cron: '0 12 * * *'
   workflow_dispatch:
 
 permissions:
