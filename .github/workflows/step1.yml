@@ -34,6 +34,7 @@ jobs:
           path: |
             published_ids.json
             source_news_cache.json
+            ig_user_id_cache.json
           key: shared-state-${{ github.run_id }}
           restore-keys: |
             shared-state-
@@ -78,4 +79,5 @@ jobs:
           path: |
             published_ids.json
             source_news_cache.json
+            ig_user_id_cache.json
           key: shared-state-${{ github.run_id }}

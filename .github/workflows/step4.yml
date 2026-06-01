@@ -3,7 +3,7 @@ name: Step 4 - Instagram Hashtags
 on:
   schedule:
     # Europe/Samara is UTC+4: 11:30, 14:30, 17:30, 20:30, 23:30 Samara.
-    - cron: '30 8 * * *'
+    - cron: '30 6,9,12,15,18,21,23 * * *'
   workflow_dispatch:
 
 permissions:
@@ -35,6 +35,7 @@ jobs:
           path: |
             published_ids.json
             source_news_cache.json
+            ig_user_id_cache.json
           key: shared-state-${{ github.run_id }}
           restore-keys: |
             shared-state-
@@ -96,4 +97,5 @@ jobs:
           path: |
             published_ids.json
             source_news_cache.json
+            ig_user_id_cache.json
           key: shared-state-${{ github.run_id }}
