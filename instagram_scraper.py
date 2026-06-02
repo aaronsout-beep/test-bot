@@ -1,17 +1,17 @@
 """
 instagram_scraper.py — самостоятельный парсер Instagram без Apify.
-
+ 
 Используется вместо Apify в Step 2 (аккаунты) и Step 4 (хэштеги).
 Работает через внутренний GraphQL API Instagram с куками залогиненного
 аккаунта. Куки хранятся в секрете IG_COOKIES_JSON (GitHub Actions).
-
+ 
 Формат IG_COOKIES_JSON: JSON-массив объектов вида:
     [{"name": "sessionid", "value": "...", "domain": ".instagram.com"}, ...]
-
+ 
 Экспортируется расширением Cookie-Editor или EditThisCookie из браузера,
 где выполнен вход в Instagram-аккаунт, предназначенный только для парсинга.
 """
-
+ 
 import json
 import logging
 import random
@@ -20,19 +20,19 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
-
+ 
 import requests
-
+ 
 logger = logging.getLogger(__name__)
-
+ 
 # ── Кэш user_id ───────────────────────────────────────────────────────────────
-
+ 
 _USER_ID_CACHE_FILE = Path("ig_user_id_cache.json")
 # Срок жизни кэша — 30 дней. user_id никогда не меняется, но на случай
 # удаления/пересоздания аккаунта обновляем изредка.
 _USER_ID_CACHE_TTL_DAYS = 30
-
-
+ 
+ 
 def _load_user_id_cache() -> dict:
     if _USER_ID_CACHE_FILE.exists():
         try:
@@ -40,8 +40,8 @@ def _load_user_id_cache() -> dict:
         except Exception as e:
             logger.warning(f"IG: не удалось прочитать кэш user_id: {e}")
     return {}
-
-
+ 
+ 
 def _save_user_id_cache(cache: dict) -> None:
     try:
         _USER_ID_CACHE_FILE.write_text(
@@ -49,8 +49,8 @@ def _save_user_id_cache(cache: dict) -> None:
         )
     except Exception as e:
         logger.warning(f"IG: не удалось сохранить кэш user_id: {e}")
-
-
+ 
+ 
 def _get_cached_user_id(username: str, cache: dict) -> Optional[str]:
     entry = cache.get(username)
     if not entry:
@@ -66,12 +66,12 @@ def _get_cached_user_id(username: str, cache: dict) -> Optional[str]:
     except Exception:
         pass
     return None
-
-
+ 
+ 
 # ── Константы Instagram API ───────────────────────────────────────────────────
-
+ 
 _IG_APP_ID = "936619743392459"       # публичный ID веб-приложения IG (стабилен)
-
+ 
 _BASE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -91,50 +91,50 @@ _BASE_HEADERS = {
     "Sec-Ch-Ua-Mobile": "?0",
     "Sec-Ch-Ua-Platform": '"Windows"',
 }
-
+ 
 # GraphQL query_hash для профиля пользователя (edge_owner_to_timeline_media).
 # Если Instagram вернёт 400 — нужно обновить (см. инструкцию).
 _PROFILE_QUERY_HASH = "58b6785bea111c67129decbe6a448951"
-
+ 
 # Альтернативный эндпоинт профиля (v1 API, более стабилен чем GraphQL).
 _PROFILE_API_URL = "https://www.instagram.com/api/v1/feed/user/{user_id}/"
-
+ 
 # Эндпоинт хэштега
 _HASHTAG_API_URL = "https://www.instagram.com/api/v1/tags/{hashtag}/sections/"
-
+ 
 # Задержки между запросами (секунды). Увеличьте при частых 429.
 DELAY_BETWEEN_PAGES   = (2.5, 5.0)   # между страницами одного аккаунта
 DELAY_BETWEEN_ACCOUNTS = (30.0, 70.0) # между разными аккаунтами/хэштегами
 MAX_RETRIES = 3
 RETRY_DELAY = (15.0, 30.0)
-
-
+ 
+ 
 # ── Сессия ────────────────────────────────────────────────────────────────────
-
+ 
 def build_session(cookies_json: str, proxy: str = "") -> requests.Session:
     """
     Создаёт requests.Session с куками из JSON-строки (секрет IG_COOKIES_JSON).
-
+ 
     Обязательные куки: sessionid, csrftoken, ds_user_id.
     При их отсутствии сессия будет создана, но запросы вернут 401.
-
+ 
     proxy — опциональный прокси в формате http://user:pass@host:port
     или socks5://user:pass@host:port. Нужен при запуске из GitHub Actions,
     так как IP-адреса Azure заблокированы Instagram.
     Передаётся через переменную окружения IG_PROXY.
     """
     session = requests.Session()
-
+ 
     if proxy:
         session.proxies = {"http": proxy, "https": proxy}
         logger.info(f"IG: используется прокси {proxy.split('@')[-1]}")  # не логируем пароль
-
+ 
     try:
         cookies = json.loads(cookies_json)
     except Exception as e:
         logger.error(f"IG: ошибка разбора IG_COOKIES_JSON: {e}")
         return session
-
+ 
     required = {"sessionid", "csrftoken", "ds_user_id"}
     found = set()
     for c in cookies:
@@ -146,22 +146,22 @@ def build_session(cookies_json: str, proxy: str = "") -> requests.Session:
         session.cookies.set(name, value, domain=domain)
         if name in required:
             found.add(name)
-
+ 
     missing = required - found
     if missing:
         logger.warning(f"IG: в куках отсутствуют обязательные поля: {missing}")
-
+ 
     csrf = session.cookies.get("csrftoken", "")
     if csrf:
         session.headers.update({"X-CSRFToken": csrf})
-
+ 
     session.headers.update(_BASE_HEADERS)
     return session
-
-
+ 
+ 
 def session_is_valid(session: requests.Session) -> bool:
     """Пассивная проверка сессии — не используется в основном потоке.
-
+ 
     Оставлена как утилита для ручного тестирования.
     В production-потоке не вызывается: Instagram отклоняет preflight-запросы
     по useragent mismatch даже при живых куках.
@@ -181,13 +181,13 @@ def session_is_valid(session: requests.Session) -> bool:
         return False
     except Exception:
         return False
-
-
+ 
+ 
 # ── Получение user_id ─────────────────────────────────────────────────────────
-
+ 
 def get_user_id(username: str, session: requests.Session) -> Optional[str]:
     """Получает числовой user_id по username.
-
+ 
     Результат кэшируется в ig_user_id_cache.json на 30 дней,
     чтобы не делать лишний запрос к Instagram при каждом запуске.
     """
@@ -196,7 +196,7 @@ def get_user_id(username: str, session: requests.Session) -> Optional[str]:
     if cached:
         logger.info(f"IG: user_id для @{username} взят из кэша ({cached})")
         return cached
-
+ 
     url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
     for attempt in range(MAX_RETRIES):
         try:
@@ -234,10 +234,10 @@ def get_user_id(username: str, session: requests.Session) -> Optional[str]:
             logger.warning(f"IG: ошибка get_user_id({username}): {e}")
             return None
     return None
-
-
+ 
+ 
 # ── Парсинг постов аккаунта ───────────────────────────────────────────────────
-
+ 
 def fetch_user_posts(
     username: str,
     session: requests.Session,
@@ -249,59 +249,59 @@ def fetch_user_posts(
 ) -> list[dict]:
     """
     Возвращает список постов аккаунта username.
-
+ 
     known_user_id — если передан, пропускает запрос get_user_id к Instagram
     (используется когда bot.py сам кэширует user_id).
-
+ 
     Каждый пост — dict совместимый с instagram_media_from_apify_post /
     instagram_caption_from_apify_post / instagram_date_from_apify_post в bot.py.
     """
     user_id = known_user_id or get_user_id(username, session)
     if not user_id:
         return []
-
+ 
     posts = []
     max_id = None   # курсор пагинации
-
+ 
     while len(posts) < max_posts:
         params: dict = {"count": min(12, max_posts - len(posts))}
         if max_id:
             params["max_id"] = max_id
-
+ 
         url = _PROFILE_API_URL.format(user_id=user_id)
         data = _get_json(session, url, params=params, on_auth_error=on_auth_error)
         if data is None:
             break
-
+ 
         items = data.get("items", [])
         if not items:
             break
-
+ 
         for item in items:
             ts = item.get("taken_at", 0)
             dt = datetime.fromtimestamp(ts, tz=timezone.utc) if ts else None
-
+ 
             if only_newer_than and dt and dt <= only_newer_than:
                 return posts  # посты идут от новых к старым
-
+ 
             if skip_pinned and item.get("is_pinned"):
                 continue
-
+ 
             posts.append(_normalize_post(item, username))
-
+ 
         if not data.get("more_available"):
             break
         max_id = data.get("next_max_id")
         if not max_id:
             break
-
+ 
         time.sleep(random.uniform(*DELAY_BETWEEN_PAGES))
-
+ 
     return posts
-
-
+ 
+ 
 # ── Парсинг постов по хэштегу ─────────────────────────────────────────────────
-
+ 
 def fetch_hashtag_posts(
     hashtag: str,
     session: requests.Session,
@@ -316,27 +316,27 @@ def fetch_hashtag_posts(
     posts = []
     page_token = None
     seen_ids: set = set()
-
+ 
     payload_base = {
         "include_persistent": "0",
         "tab": "recent",  # 'top' или 'recent'
         "surface": "grid",
         "rank_token": f"{''.join(random.choices('abcdef0123456789', k=32))}",
     }
-
+ 
     stale_streak = 0          # сколько подряд постов оказались старше порога
     _MAX_STALE_STREAK = 8     # выходим, если 8 подряд старых постов (лента кончилась)
-
+ 
     for _ in range(5):   # максимум 5 страниц
         payload = dict(payload_base)
         if page_token:
             payload["next_max_id"] = page_token
-
+ 
         url = _HASHTAG_API_URL.format(hashtag=hashtag)
         data = _post_json(session, url, data=payload, on_auth_error=on_auth_error)
         if data is None:
             break
-
+ 
         sections = data.get("sections") or []
         for section in sections:
             layout_content = section.get("layout_content") or {}
@@ -349,7 +349,7 @@ def fetch_hashtag_posts(
                 if not item_id or item_id in seen_ids:
                     continue
                 seen_ids.add(item_id)
-
+ 
                 ts = item.get("taken_at", 0)
                 dt = datetime.fromtimestamp(ts, tz=timezone.utc) if ts else None
                 if only_newer_than and dt and dt <= only_newer_than:
@@ -358,26 +358,26 @@ def fetch_hashtag_posts(
                         return posts   # достаточно старых постов подряд — выходим
                     continue
                 stale_streak = 0      # сбрасываем счётчик при свежем посте
-
+ 
                 owner = item.get("user") or {}
                 username = owner.get("username", "")
                 posts.append(_normalize_post(item, username))
                 if len(posts) >= max_posts:
                     return posts
-
+ 
         if not data.get("more_available"):
             break
         page_token = data.get("next_max_id")
         if not page_token:
             break
-
+ 
         time.sleep(random.uniform(*DELAY_BETWEEN_PAGES))
-
+ 
     return posts
-
-
+ 
+ 
 # ── Нормализация поста в формат совместимый с bot.py ─────────────────────────
-
+ 
 def _normalize_post(item: dict, username: str = "") -> dict:
     """
     Приводит сырой объект Instagram API к формату Apify-поста,
@@ -392,12 +392,12 @@ def _normalize_post(item: dict, username: str = "") -> dict:
         else str(caption_obj or "")
     )
     post_url = f"https://www.instagram.com/p/{code}/" if code else ""
-
+ 
     owner = item.get("user") or {}
     owner_username = username or (
         owner.get("username", "") if isinstance(owner, dict) else ""
     )
-
+ 
     # Медиа: карусель, видео или фото
     media_urls: list[dict] = []
     carousel = item.get("carousel_media") or []
@@ -406,7 +406,7 @@ def _normalize_post(item: dict, username: str = "") -> dict:
             _extract_media_urls(child, media_urls)
     else:
         _extract_media_urls(item, media_urls)
-
+ 
     return {
         # Поля, которые читает bot.py
         "id":           item_id,
@@ -434,12 +434,12 @@ def _normalize_post(item: dict, username: str = "") -> dict:
         "username":      owner_username,
         "owner": {"username": owner_username},
     }
-
-
+ 
+ 
 def _extract_media_urls(item: dict, out: list) -> None:
     """Извлекает URL медиа из объекта поста Instagram API v1."""
     media_type = item.get("media_type", 1)  # 1=фото, 2=видео, 8=карусель
-
+ 
     if media_type == 2:
         # Видео: берём версию наибольшего битрейта
         versions = item.get("video_versions") or []
@@ -447,16 +447,16 @@ def _extract_media_urls(item: dict, out: list) -> None:
             best = max(versions, key=lambda v: v.get("width", 0) * v.get("height", 0))
             out.append({"url": best["url"], "type": "video"})
             return
-
+ 
     # Фото: берём версию наибольшего разрешения
     candidates = item.get("image_versions2", {}).get("candidates") or []
     if candidates:
         best = max(candidates, key=lambda c: c.get("width", 0) * c.get("height", 0))
         out.append({"url": best["url"], "type": "photo"})
-
-
+ 
+ 
 # ── HTTP-хелперы с ретраями ───────────────────────────────────────────────────
-
+ 
 def _get_json(
     session: requests.Session,
     url: str,
@@ -485,8 +485,8 @@ def _get_json(
             logger.warning(f"IG: ошибка GET {url}: {e}")
             return None
     return None
-
-
+ 
+ 
 def _post_json(
     session: requests.Session,
     url: str,
@@ -515,3 +515,4 @@ def _post_json(
             logger.warning(f"IG: ошибка POST {url}: {e}")
             return None
     return None
+ 
