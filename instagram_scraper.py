@@ -18,11 +18,55 @@ import random
 import re
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 import requests
 
 logger = logging.getLogger(__name__)
+
+# ── Кэш user_id ───────────────────────────────────────────────────────────────
+
+_USER_ID_CACHE_FILE = Path("ig_user_id_cache.json")
+# Срок жизни кэша — 30 дней. user_id никогда не меняется, но на случай
+# удаления/пересоздания аккаунта обновляем изредка.
+_USER_ID_CACHE_TTL_DAYS = 30
+
+
+def _load_user_id_cache() -> dict:
+    if _USER_ID_CACHE_FILE.exists():
+        try:
+            return json.loads(_USER_ID_CACHE_FILE.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning(f"IG: не удалось прочитать кэш user_id: {e}")
+    return {}
+
+
+def _save_user_id_cache(cache: dict) -> None:
+    try:
+        _USER_ID_CACHE_FILE.write_text(
+            json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception as e:
+        logger.warning(f"IG: не удалось сохранить кэш user_id: {e}")
+
+
+def _get_cached_user_id(username: str, cache: dict) -> Optional[str]:
+    entry = cache.get(username)
+    if not entry:
+        return None
+    cached_at_str = entry.get("cached_at", "")
+    try:
+        cached_at = datetime.fromisoformat(cached_at_str)
+        if cached_at.tzinfo is None:
+            cached_at = cached_at.replace(tzinfo=timezone.utc)
+        age_days = (datetime.now(timezone.utc) - cached_at).days
+        if age_days <= _USER_ID_CACHE_TTL_DAYS:
+            return str(entry.get("user_id", "")) or None
+    except Exception:
+        pass
+    return None
+
 
 # ── Константы Instagram API ───────────────────────────────────────────────────
 
@@ -132,7 +176,17 @@ def session_is_valid(session: requests.Session) -> bool:
 # ── Получение user_id ─────────────────────────────────────────────────────────
 
 def get_user_id(username: str, session: requests.Session) -> Optional[str]:
-    """Получает числовой user_id по username."""
+    """Получает числовой user_id по username.
+
+    Результат кэшируется в ig_user_id_cache.json на 30 дней,
+    чтобы не делать лишний запрос к Instagram при каждом запуске.
+    """
+    cache = _load_user_id_cache()
+    cached = _get_cached_user_id(username, cache)
+    if cached:
+        logger.info(f"IG: user_id для @{username} взят из кэша ({cached})")
+        return cached
+
     url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
     for attempt in range(MAX_RETRIES):
         try:
@@ -153,7 +207,14 @@ def get_user_id(username: str, session: requests.Session) -> Optional[str]:
             user = data.get("data", {}).get("user") or {}
             uid = user.get("id")
             if uid:
-                return str(uid)
+                uid_str = str(uid)
+                cache[username] = {
+                    "user_id": uid_str,
+                    "cached_at": datetime.now(timezone.utc).isoformat(),
+                }
+                _save_user_id_cache(cache)
+                logger.info(f"IG: user_id для @{username} сохранён в кэш ({uid_str})")
+                return uid_str
             logger.warning(f"IG: user_id не найден в ответе для @{username}")
             return None
         except requests.exceptions.Timeout:
@@ -173,7 +234,6 @@ def fetch_user_posts(
     max_posts: int = 12,
     only_newer_than: Optional[datetime] = None,
     skip_pinned: bool = True,
-    known_user_id: Optional[str] = None,
     on_auth_error=None,
 ) -> list[dict]:
     """
@@ -181,12 +241,8 @@ def fetch_user_posts(
 
     Каждый пост — dict совместимый с instagram_media_from_apify_post / 
     instagram_caption_from_apify_post / instagram_date_from_apify_post в bot.py.
-    Если known_user_id передан — пропускает запрос к web_profile_info (экономит лимиты).
     """
-    if known_user_id:
-        user_id = known_user_id
-    else:
-        user_id = get_user_id(username, session)
+    user_id = get_user_id(username, session)
     if not user_id:
         return []
 
@@ -217,9 +273,7 @@ def fetch_user_posts(
             if skip_pinned and item.get("is_pinned"):
                 continue
 
-            post = _normalize_post(item, username)
-            post["_user_id"] = user_id  # для кеша user_id в bot.py
-            posts.append(post)
+            posts.append(_normalize_post(item, username))
 
         if not data.get("more_available"):
             break
