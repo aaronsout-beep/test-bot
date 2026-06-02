@@ -107,6 +107,7 @@ STEP1_ACCOUNTS = [
 ]
 SCWEET_AUTH_TOKEN = os.environ.get("SCWEET_AUTH_TOKEN", "").strip()
 SCWEET_PROXY = os.environ.get("SCWEET_PROXY", "").strip()  # http://user:pass@host:port
+IG_PROXY = os.environ.get("IG_PROXY", "").strip()  # прокси для Instagram, напр. http://user:pass@host:port
 SCWEET_MANIFEST_SCRAPE_ON_INIT = os.environ.get("SCWEET_MANIFEST_SCRAPE_ON_INIT", "1").strip().lower() not in {
     "0", "false", "no", "off"
 }
@@ -175,31 +176,6 @@ REQUIRE_PUBLISHED_CACHE = os.environ.get("REQUIRE_PUBLISHED_CACHE", "0").strip()
 SOURCE_NEWS_FILE = "source_news_cache.json"
 SOURCE_NEWS_CACHE_DAYS = 2
 SOURCE_NEWS_CACHE_LIMIT = 500
-
-IG_USER_ID_CACHE_FILE = "ig_user_id_cache.json"
-
-
-def load_ig_user_id_cache() -> dict:
-    """Загружает кеш {username: user_id} из файла."""
-    path = Path(IG_USER_ID_CACHE_FILE)
-    if not path.exists():
-        return {}
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception as e:
-        print(f"  Не удалось прочитать {IG_USER_ID_CACHE_FILE}: {e}")
-        return {}
-
-
-def save_ig_user_id_cache(cache: dict):
-    """Сохраняет кеш {username: user_id} в файл."""
-    try:
-        with open(IG_USER_ID_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(cache, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"  Не удалось сохранить {IG_USER_ID_CACHE_FILE}: {e}")
 SEMANTIC_CANDIDATE_LIMIT = 3
 SEMANTIC_LOCAL_DUPLICATE_THRESHOLD = 0.86
 SEMANTIC_AI_PREFILTER_THRESHOLD = 0.24
@@ -1879,7 +1855,7 @@ def _ig_session():
     if _ig is None:
         print("  instagram_scraper.py не найден — пропускаем Instagram")
         return None
-    return _ig.build_session(IG_COOKIES_JSON)
+    return _ig.build_session(IG_COOKIES_JSON, proxy=IG_PROXY)
 
 
 def fetch_instagram_posts() -> list:
@@ -1893,48 +1869,25 @@ def fetch_instagram_posts() -> list:
 
     only_newer_than = datetime.now(timezone.utc) - timedelta(hours=IG_ONLY_NEWER_THAN_HOURS)
     all_posts = []
-    uid_cache = load_ig_user_id_cache()
-    uid_cache_updated = False
-
     for i, account_raw in enumerate(IG_INSTAGRAM_ACCOUNTS):
         username = instagram_account_to_username(account_raw)
         if not username:
             continue
-
-        # Подставляем user_id из кеша, чтобы не делать лишний запрос к web_profile_info
-        cached_uid = uid_cache.get(username)
-        if cached_uid:
-            print(f"  IG scraper: @{username} (user_id из кеша: {cached_uid})")
-        else:
-            print(f"  IG scraper: @{username}")
-
+        print(f"  IG scraper: @{username}")
         posts = _ig.fetch_user_posts(
             username,
             session,
             max_posts=IG_RESULTS_LIMIT,
             only_newer_than=only_newer_than,
             skip_pinned=IG_SKIP_PINNED,
-            known_user_id=cached_uid,
             on_auth_error=lambda code: alert(f"IG сессия недействительна ({code}). Обновите IG_COOKIES_JSON в GitHub Secrets."),
         )
-
-        # Сохраняем user_id если он был получен впервые
-        if posts and not cached_uid:
-            new_uid = posts[0].get("_user_id")
-            if new_uid and new_uid not in uid_cache.values():
-                uid_cache[username] = new_uid
-                uid_cache_updated = True
-                print(f"    user_id {new_uid} сохранён в кеш")
-
         print(f"    получено: {len(posts)} постов")
         all_posts.extend(posts)
         if i < len(IG_INSTAGRAM_ACCOUNTS) - 1:
             wait = random.uniform(*_ig.DELAY_BETWEEN_ACCOUNTS)
             print(f"    пауза {wait:.0f}с перед следующим аккаунтом...")
             time.sleep(wait)
-
-    if uid_cache_updated:
-        save_ig_user_id_cache(uid_cache)
     return all_posts
 
 

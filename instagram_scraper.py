@@ -111,14 +111,24 @@ RETRY_DELAY = (15.0, 30.0)
 
 # ── Сессия ────────────────────────────────────────────────────────────────────
 
-def build_session(cookies_json: str) -> requests.Session:
+def build_session(cookies_json: str, proxy: str = "") -> requests.Session:
     """
     Создаёт requests.Session с куками из JSON-строки (секрет IG_COOKIES_JSON).
 
     Обязательные куки: sessionid, csrftoken, ds_user_id.
     При их отсутствии сессия будет создана, но запросы вернут 401.
+
+    proxy — опциональный прокси в формате http://user:pass@host:port
+    или socks5://user:pass@host:port. Нужен при запуске из GitHub Actions,
+    так как IP-адреса Azure заблокированы Instagram.
+    Передаётся через переменную окружения IG_PROXY.
     """
     session = requests.Session()
+
+    if proxy:
+        session.proxies = {"http": proxy, "https": proxy}
+        logger.info(f"IG: используется прокси {proxy.split('@')[-1]}")  # не логируем пароль
+
     try:
         cookies = json.loads(cookies_json)
     except Exception as e:
