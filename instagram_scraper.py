@@ -235,14 +235,18 @@ def fetch_user_posts(
     only_newer_than: Optional[datetime] = None,
     skip_pinned: bool = True,
     on_auth_error=None,
+    known_user_id: Optional[str] = None,
 ) -> list[dict]:
     """
     Возвращает список постов аккаунта username.
 
-    Каждый пост — dict совместимый с instagram_media_from_apify_post / 
+    known_user_id — если передан, пропускает запрос get_user_id к Instagram
+    (используется когда bot.py сам кэширует user_id).
+
+    Каждый пост — dict совместимый с instagram_media_from_apify_post /
     instagram_caption_from_apify_post / instagram_date_from_apify_post в bot.py.
     """
-    user_id = get_user_id(username, session)
+    user_id = known_user_id or get_user_id(username, session)
     if not user_id:
         return []
 
