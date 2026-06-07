@@ -23,11 +23,6 @@ from pathlib import Path
 from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 
 import requests
-from queue_patch import (
-#            MAIN_POST_LIMIT, QUEUE_BATCH_SIZE,
-#            load_queue, save_queue, enqueue_post,
-#            step5_publish_queue,
-#        )
 from format_model.rag_layout import (
     build_layout_prompt,
     load_examples,
@@ -209,6 +204,10 @@ PUBLISHED_FILE = "published_ids.json"
 REQUIRE_PUBLISHED_CACHE = os.environ.get("REQUIRE_PUBLISHED_CACHE", "0").strip().lower() not in {
     "", "0", "false", "no", "off"
 }
+QUEUE_FILE = "queue.json"
+MAIN_POST_LIMIT = int((os.environ.get("MAIN_POST_LIMIT") or "2").strip())
+QUEUE_BATCH_SIZE = int((os.environ.get("QUEUE_BATCH_SIZE") or "2").strip())
+
 SOURCE_NEWS_FILE = "source_news_cache.json"
 SOURCE_NEWS_CACHE_DAYS = 2
 SOURCE_NEWS_CACHE_LIMIT = 500
@@ -4656,6 +4655,157 @@ def step3_should_use_nitter_fallback(scweet_tweets: list) -> bool:
     return False
 
 
+def load_queue() -> list:
+    """Загрузить очередь из queue.json. Возвращает список dict."""
+    path = Path(QUEUE_FILE)
+    if not path.exists():
+        return []
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        print(f"  Не удалось прочитать {QUEUE_FILE}: {e}")
+        return []
+
+
+def save_queue(queue: list):
+    """Сохранить очередь в queue.json."""
+    with open(QUEUE_FILE, "w", encoding="utf-8") as f:
+        json.dump(queue, f, ensure_ascii=False, indent=2)
+
+
+def enqueue_post(
+    published: set,
+    *,
+    step: int,
+    post_id: str = "",
+    post_url: str = "",
+    raw_text: str = "",
+    translated: str = "",
+    edited: str = "",
+    full_text: str = "",
+    media_items: list | None = None,
+    source: str = "",
+    extra_keys: list | set | None = None,
+    step4_custom_sig: bool = False,
+):
+    """
+    Добавить пост в очередь и сразу пометить его как «уже отработан» в published.
+    Если full_text передан — шаг 5 применит только финальную проверку верстки.
+    Если не передан — шаг 5 заново прогонит полный pipeline.
+    """
+    mark_published(
+        published,
+        post_id=post_id,
+        url=post_url,
+        text=raw_text,
+        source=source,
+        media_items=media_items or [],
+        extra_keys=extra_keys,
+    )
+    save_published(published)
+
+    entry = {
+        "queued_at": datetime.now(timezone.utc).isoformat(),
+        "step": step,
+        "post_id": post_id,
+        "post_url": post_url,
+        "source": source,
+        "raw_text": raw_text,
+        "translated": translated,
+        "edited": edited,
+        "full_text": full_text,
+        "media_items": media_items or [],
+        "extra_keys": list(extra_keys or []),
+        "step4_custom_sig": step4_custom_sig,
+    }
+    queue = load_queue()
+    queue.append(entry)
+    save_queue(queue)
+    print(f"  → Пост добавлен в очередь (в очереди: {len(queue)}): {post_id[:60] or post_url[:60]}")
+
+
+def step5_publish_queue(published: set) -> set:
+    """
+    Шаг 5 — запускается планировщиком каждые 30 минут.
+    Публикует до QUEUE_BATCH_SIZE постов из очереди.
+    """
+    print("\n══════ ШАГ 5: Публикация из очереди ══════")
+
+    queue = load_queue()
+    if not queue:
+        print("  Очередь пуста — нечего публиковать")
+        return published
+
+    print(f"  Постов в очереди: {len(queue)}")
+
+    batch     = queue[:QUEUE_BATCH_SIZE]
+    remaining = queue[QUEUE_BATCH_SIZE:]
+
+    published_count = 0
+    failed_entries  = []
+
+    for entry in batch:
+        post_id     = entry.get("post_id", "")
+        post_url    = entry.get("post_url", "")
+        raw_text    = entry.get("raw_text", "")
+        translated  = entry.get("translated", "")
+        edited_text = entry.get("edited", "")
+        full_text   = entry.get("full_text", "")
+        media_items = entry.get("media_items", [])
+        source      = entry.get("source", "")
+        extra_keys  = set(entry.get("extra_keys", []))
+        step_num    = entry.get("step", 0)
+        step4_sig   = entry.get("step4_custom_sig", False)
+
+        print(f"\n  Публикуем из очереди: {post_id[:60] or post_url[:60]}")
+
+        if not full_text:
+            if not translated and raw_text:
+                translated = translate_deepl(raw_text)
+            if not edited_text and translated:
+                edited_text = edit_openrouter(translated)
+            text_for_html = edited_text or translated or raw_text
+            if step_num == 2:
+                full_text = make_instagram_telegram_html(text_for_html)
+            elif step_num == 4:
+                full_text = make_telegram_html(text_for_html, bold_first_line=False)
+                step4_sig = False
+            else:
+                full_text = make_telegram_html(text_for_html, bold_first_line=False)
+
+        if not step4_sig:
+            full_text = ai_check_telegram_layout(full_text)
+
+        print(f"  Отправка ({len(media_items)} медиа): {post_id[:60]}")
+        ok = send_to_telegram(media_items, full_text, step4_custom_sig=step4_sig)
+
+        if ok:
+            mark_published(
+                published,
+                post_id=post_id,
+                url=post_url,
+                text=raw_text,
+                source=source,
+                media_items=media_items,
+                extra_keys=extra_keys,
+            )
+            save_published(published)
+            if raw_text:
+                record_source_news(raw_text, step=step_num, source=source, post_id=post_id, url=post_url)
+            published_count += 1
+        elif ok is False:
+            print("  Временная ошибка Telegram — возвращаем пост в очередь")
+            failed_entries.append(entry)
+        else:
+            print("  Медиа недоступны — пост удалён из очереди без публикации")
+
+    save_queue(failed_entries + remaining)
+    print(f"\n  Итого опубликовано: {published_count}, осталось в очереди: {len(failed_entries + remaining)}")
+    return published
+
+
 def step1_twitter_keywords(published: set) -> set:
     print("\n══════ ШАГ 1: Twitter по ключевым словам (Scweet) ══════")
     if not STEP1_KEYWORDS:
@@ -4705,13 +4855,28 @@ def step1_twitter_keywords(published: set) -> set:
         edited = edit_openrouter(translated)
         full_text = make_telegram_html(edited, bold_first_line=False)
 
-        print(f"  Публикуем ({len(media_items)} медиа): {post_id[:80]}")
-        ok = send_to_telegram(media_items, full_text)
-        if ok:
-            mark_published(published, post_id=post_id, url=post_url, text=raw, source=source_label, media_items=media_items)
-            save_published(published)
-            record_source_news(raw, step=1, source=source_label, post_id=post_id, url=post_url)
-            new_count += 1
+        if new_count < MAIN_POST_LIMIT:
+            print(f"  Публикуем ({len(media_items)} медиа): {post_id[:80]}")
+            ok = send_to_telegram(media_items, full_text)
+            if ok:
+                mark_published(published, post_id=post_id, url=post_url, text=raw, source=source_label, media_items=media_items)
+                save_published(published)
+                record_source_news(raw, step=1, source=source_label, post_id=post_id, url=post_url)
+                new_count += 1
+        else:
+            print(f"  Лимит {MAIN_POST_LIMIT} достигнут — в очередь: {post_id[:60]}")
+            enqueue_post(
+                published,
+                step=1,
+                post_id=post_id,
+                post_url=post_url,
+                raw_text=raw,
+                translated=translated,
+                edited=edited,
+                full_text=full_text,
+                media_items=media_items,
+                source=source_label,
+            )
 
     print(f"\n  Итого опубликовано: {new_count}")
     return published
@@ -4783,21 +4948,37 @@ def step2_instagram(published: set) -> set:
         else:
             full_text = make_instagram_telegram_html("")
 
-        print(f"  Публикуем ({len(media_items)} медиа): {post_id}")
-        ok = send_to_telegram(media_items, full_text)
-        if ok:
-            mark_published(
+        if new_count < MAIN_POST_LIMIT:
+            print(f"  Публикуем ({len(media_items)} медиа): {post_id}")
+            ok = send_to_telegram(media_items, full_text)
+            if ok:
+                mark_published(
+                    published,
+                    post_id=post_id,
+                    url=post_url,
+                    text=raw_caption,
+                    source=source_label,
+                    media_items=media_items,
+                    extra_keys=ig_keys,
+                )
+                save_published(published)
+                record_source_news(raw_caption, step=2, source=source_label, post_id=post_id, url=post_url)
+                new_count += 1
+        else:
+            print(f"  Лимит {MAIN_POST_LIMIT} достигнут — в очередь: {post_id[:60]}")
+            enqueue_post(
                 published,
+                step=2,
                 post_id=post_id,
-                url=post_url,
-                text=raw_caption,
-                source=source_label,
+                post_url=post_url,
+                raw_text=raw_caption,
+                translated=translated,
+                edited=edited,
+                full_text=full_text,
                 media_items=media_items,
+                source=source_label,
                 extra_keys=ig_keys,
             )
-            save_published(published)
-            record_source_news(raw_caption, step=2, source=source_label, post_id=post_id, url=post_url)
-            new_count += 1
 
     print(f"\n  Итого опубликовано: {new_count}")
     return published
@@ -4860,13 +5041,28 @@ def step3_twitter_accounts(published: set) -> set:
         edited = edit_openrouter(translated)
         full_text = make_telegram_html(edited, bold_first_line=False)
 
-        print(f"  Публикуем ({len(media_items)} медиа): {post_id[:80]}")
-        ok = send_to_telegram(media_items, full_text)
-        if ok:
-            mark_published(published, post_id=post_id, url=post_url, text=raw, source=f"@{source}", media_items=media_items)
-            save_published(published)
-            record_source_news(raw, step=3, source=f"@{source}", post_id=post_id, url=post_url)
-            new_count += 1
+        if new_count < MAIN_POST_LIMIT:
+            print(f"  Публикуем ({len(media_items)} медиа): {post_id[:80]}")
+            ok = send_to_telegram(media_items, full_text)
+            if ok:
+                mark_published(published, post_id=post_id, url=post_url, text=raw, source=f"@{source}", media_items=media_items)
+                save_published(published)
+                record_source_news(raw, step=3, source=f"@{source}", post_id=post_id, url=post_url)
+                new_count += 1
+        else:
+            print(f"  Лимит {MAIN_POST_LIMIT} достигнут — в очередь: {post_id[:60]}")
+            enqueue_post(
+                published,
+                step=3,
+                post_id=post_id,
+                post_url=post_url,
+                raw_text=raw,
+                translated=translated,
+                edited=edited,
+                full_text=full_text,
+                media_items=media_items,
+                source=f"@{source}",
+            )
 
     print(f"\n  Итого опубликовано: {new_count}")
     return published
@@ -5110,27 +5306,44 @@ def step4_instagram_hashtags(published: set) -> set:
             edited = edit_openrouter(translated) if translated else ""
             full_text = ai_check_telegram_layout(make_hashtag_telegram_html(edited, hashtag))
 
-            print(f"  Публикуем ({len(media_items)} медиа): {post_id[:80]}")
-            ok = send_to_telegram(media_items, full_text, step4_custom_sig=True)
-            if ok:
-                mark_published(
+            if new_count < MAIN_POST_LIMIT:
+                print(f"  Публикуем ({len(media_items)} медиа): {post_id[:80]}")
+                ok = send_to_telegram(media_items, full_text, step4_custom_sig=True)
+                if ok:
+                    mark_published(
+                        published,
+                        post_id=post_id,
+                        url=post_url,
+                        text=raw_caption,
+                        source=source_label,
+                        media_items=media_items,
+                        extra_keys=ig_keys,
+                    )
+                    save_published(published)
+                    record_source_news(raw_caption, step=4, source=source_label, post_id=post_id, url=post_url)
+                    new_count += 1
+            else:
+                print(f"  Лимит {MAIN_POST_LIMIT} достигнут — в очередь: {post_id[:60]}")
+                enqueue_post(
                     published,
+                    step=4,
                     post_id=post_id,
-                    url=post_url,
-                    text=raw_caption,
-                    source=source_label,
+                    post_url=post_url,
+                    raw_text=raw_caption,
+                    translated=translated,
+                    edited=edited,
+                    full_text=full_text,
                     media_items=media_items,
+                    source=source_label,
                     extra_keys=ig_keys,
+                    step4_custom_sig=True,
                 )
-                save_published(published)
-                record_source_news(raw_caption, step=4, source=source_label, post_id=post_id, url=post_url)
-                new_count += 1
 
     print(f"\n  Итого опубликовано: {new_count}")
     return published
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--step", type=int, required=True, choices=[1, 2, 3, 4])
+    parser.add_argument("--step", type=int, required=True, choices=[1, 2, 3, 4, 5])
     args = parser.parse_args()
 
     print(f"▶ Шаг {args.step} | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
@@ -5153,6 +5366,8 @@ def main():
         step3_twitter_accounts(published)
     elif args.step == 4:
         step4_instagram_hashtags(published)
+    elif args.step == 5:
+        step5_publish_queue(published)
 
     ensure_state_files(published)
     print("\n✓ Готово.")
