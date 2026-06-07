@@ -1,16 +1,13 @@
 name: Step 4 - Instagram Hashtags
 
 on:
-  schedule:
-    # Europe/Samara is UTC+4: 11:30, 14:30, 17:30, 20:30, 23:30 Samara.
-    - cron: '30 15 * * *'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: bot-shared-state
+  group: step4-${{ github.repository }}
   cancel-in-progress: false
 
 env:
@@ -35,10 +32,9 @@ jobs:
           path: |
             published_ids.json
             source_news_cache.json
-            ig_user_id_cache.json
-          key: shared-state-${{ github.run_id }}
+          key: step4-state-${{ github.run_id }}
           restore-keys: |
-            shared-state-
+            step4-state-
 
       - name: Show state
         run: |
@@ -71,14 +67,16 @@ jobs:
           GEMINI_API_KEY:        ${{ secrets.GEMINI_API_KEY }}
           FORMAT_RAG_ENABLED:    "1"
           REQUIRE_PUBLISHED_CACHE: ${{ vars.ALLOW_EMPTY_STATE == '1' && '0' || '1' }}
-          IG_COOKIES_JSON:       ${{ secrets.IG_COOKIES_JSON }}
+          APIFY_TOKEN:           ${{ secrets.APIFY_TOKEN }}
           STEP4_HASHTAGS:        ${{ secrets.STEP4_HASHTAGS }}
-          IG_HASHTAG_RESULTS_LIMIT:        ${{ vars.IG_HASHTAG_RESULTS_LIMIT || '10' }}
-          IG_HASHTAG_ONLY_NEWER_THAN_HOURS: ${{ vars.IG_HASHTAG_ONLY_NEWER_THAN_HOURS || '48' }}
+          APIFY_HASHTAG_ACTOR:   ${{ secrets.APIFY_HASHTAG_ACTOR }}
+          APIFY_HASHTAG_RESULTS_LIMIT:     ${{ secrets.APIFY_HASHTAG_RESULTS_LIMIT }}
+          APIFY_HASHTAG_ONLY_NEWER_THAN:   ${{ secrets.APIFY_HASHTAG_ONLY_NEWER_THAN }}
+          APIFY_MAX_TOTAL_CHARGE_USD:      ${{ secrets.APIFY_MAX_TOTAL_CHARGE_USD }}
+          APIFY_RUN_TIMEOUT:     ${{ secrets.APIFY_RUN_TIMEOUT }}
           STEP4_SIGNATURE:       ${{ secrets.STEP4_SIGNATURE }}
           STEP4_PREFIX:          ${{ secrets.STEP4_PREFIX }}
           STEP4_ALLOWED_ACCOUNTS: ${{ secrets.STEP4_ALLOWED_ACCOUNTS }}
-          APIFY_RUN_TIMEOUT:     ${{ secrets.APIFY_RUN_TIMEOUT }}
           VK_ACCESS_TOKEN:       ${{ secrets.VK_ACCESS_TOKEN }}
           VK_OWNER_ID:           ${{ secrets.VK_OWNER_ID }}
           VK_API_VERSION:        ${{ secrets.VK_API_VERSION }}
@@ -88,6 +86,9 @@ jobs:
           MAX_USER_ID:           ${{ secrets.MAX_USER_ID }}
           ALERT_CHANNEL_ID:      ${{ secrets.ALERT_CHANNEL_ID }}
           BOT_NAME:              ${{ vars.BOT_NAME || 'NicoPazBot' }}
+          SIGNATURE_HASHTAG:     ${{ secrets.SIGNATURE_HASHTAG }}
+          SIGNATURE_URL:         ${{ secrets.SIGNATURE_URL }}
+          SIGNATURE_URL_TEXT:    ${{ secrets.SIGNATURE_URL_TEXT }}
         run: python bot.py --step 4
 
       - name: Save state
@@ -97,5 +98,4 @@ jobs:
           path: |
             published_ids.json
             source_news_cache.json
-            ig_user_id_cache.json
-          key: shared-state-${{ github.run_id }}
+          key: step4-state-${{ github.run_id }}
