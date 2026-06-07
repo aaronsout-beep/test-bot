@@ -2,7 +2,7 @@
 """
 NicoPaz Telegram Bot
 STEP 1: Twitter/Nitter по ключевым словам  -> DeepL + OpenRouter -> Telegram
-STEP 2: Instagram (self-hosted scraper)     -> DeepL -> Telegram
+STEP 2: Instagram через Apify               -> DeepL -> Telegram
 STEP 3: Twitter-аккаунты                   -> DeepL + OpenRouter -> Telegram
 
 Запуск: python bot.py --step 1|2|3|4
@@ -23,17 +23,20 @@ from pathlib import Path
 from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 
 import requests
-try:
-    import instagram_scraper as _ig
-except ImportError:
-    _ig = None  # type: ignore
+from queue_patch import (
+#            MAIN_POST_LIMIT, QUEUE_BATCH_SIZE,
+#            load_queue, save_queue, enqueue_post,
+#            step5_publish_queue,
+#        )
 from format_model.rag_layout import (
     build_layout_prompt,
-    call_openrouter_layout_checker,
     load_examples,
+    parse_checker_json,
     select_similar_examples,
 )
 from format_model.hard_cases import save_hard_case
+from format_model.candidates import save_candidate, pending_count
+from glossary import GLOSSARY, glossary_for_prompt
 
 # ────────────────────────────────────────────────────────────
 # НАСТРОЙКИ
@@ -107,25 +110,46 @@ STEP1_ACCOUNTS = [
 ]
 SCWEET_AUTH_TOKEN = os.environ.get("SCWEET_AUTH_TOKEN", "").strip()
 SCWEET_PROXY = os.environ.get("SCWEET_PROXY", "").strip()  # http://user:pass@host:port
-IG_PROXY = os.environ.get("IG_PROXY", "").strip()  # прокси для Instagram, напр. http://user:pass@host:port
 SCWEET_MANIFEST_SCRAPE_ON_INIT = os.environ.get("SCWEET_MANIFEST_SCRAPE_ON_INIT", "1").strip().lower() not in {
     "0", "false", "no", "off"
 }
 STEP1_LIMIT = int((os.environ.get("STEP1_LIMIT") or "50").strip())
 STEP3_LIMIT = int((os.environ.get("STEP3_LIMIT") or "20").strip())
+STEP3_SCAN_LIMIT = int(
+    (
+        os.environ.get("STEP3_SCAN_LIMIT")
+        or os.environ.get("STEP3_FETCH_LIMIT")
+        or str(max(STEP3_LIMIT, 50))
+    ).strip()
+)
+STEP3_NITTER_FALLBACK = os.environ.get("STEP3_NITTER_FALLBACK", "1").strip().lower() not in {
+    "0", "false", "no", "off"
+}
+STEP3_NITTER_STALE_HOURS = float((os.environ.get("STEP3_NITTER_STALE_HOURS") or "12").strip())
 
-# Шаг 2 — self-hosted Instagram scraper (без Apify)
-IG_COOKIES_JSON = os.environ.get("IG_COOKIES_JSON", "").strip()
-IG_INSTAGRAM_ACCOUNTS = [
+# Шаг 2
+APIFY_TOKEN = os.environ.get("APIFY_TOKEN", "").strip()
+APIFY_BASE_URL = (os.environ.get("APIFY_BASE_URL") or "https://api.apify.com/v2").rstrip("/")
+APIFY_INSTAGRAM_ACTOR = (
+    os.environ.get("APIFY_INSTAGRAM_ACTOR")
+    or "apify~instagram-post-scraper"
+).strip().replace("/", "~")
+APIFY_INSTAGRAM_ACCOUNTS = [
     a.strip()
     for a in (
-        os.environ.get("STEP2_INSTAGRAM_ACCOUNTS", "")
+        os.environ.get("STEP2_INSTAGRAM_ACCOUNTS")
+        or os.environ.get("APIFY_INSTAGRAM_ACCOUNTS", "")
     ).split(",")
     if a.strip()
 ]
-IG_RESULTS_LIMIT = int((os.environ.get("IG_RESULTS_LIMIT") or "10").strip())
-IG_ONLY_NEWER_THAN_HOURS = int((os.environ.get("IG_ONLY_NEWER_THAN_HOURS") or "48").strip())
-IG_SKIP_PINNED = os.environ.get("IG_SKIP_PINNED", "1").strip().lower() not in {"0", "false", "no", "off"}
+APIFY_INSTAGRAM_RESULTS_LIMIT = int((os.environ.get("APIFY_INSTAGRAM_RESULTS_LIMIT") or "10").strip())
+APIFY_INSTAGRAM_ONLY_NEWER_THAN = (os.environ.get("APIFY_INSTAGRAM_ONLY_NEWER_THAN") or "2 days").strip()
+APIFY_INSTAGRAM_DATA_DETAIL_LEVEL = (os.environ.get("APIFY_INSTAGRAM_DATA_DETAIL_LEVEL") or "detailedData").strip()
+APIFY_INSTAGRAM_SKIP_PINNED = (os.environ.get("APIFY_INSTAGRAM_SKIP_PINNED") or "1").strip().lower() not in {"0", "false", "no", "off"}
+APIFY_INSTAGRAM_INPUT_JSON = os.environ.get("APIFY_INSTAGRAM_INPUT_JSON", "").strip()
+APIFY_RUN_TIMEOUT = int((os.environ.get("APIFY_RUN_TIMEOUT") or "180").strip())
+APIFY_MAX_ITEMS = os.environ.get("APIFY_MAX_ITEMS", "").strip()
+APIFY_MAX_TOTAL_CHARGE_USD = os.environ.get("APIFY_MAX_TOTAL_CHARGE_USD", "").strip()
 INSTAGRAM_PREFIX = " "
 
 # Шаг 3
@@ -144,8 +168,12 @@ STEP4_HASHTAGS = [
     for h in os.environ.get("STEP4_HASHTAGS", "").split(",")
     if h.strip()
 ]
-IG_HASHTAG_RESULTS_LIMIT = int((os.environ.get("IG_HASHTAG_RESULTS_LIMIT") or "10").strip())
-IG_HASHTAG_ONLY_NEWER_THAN_HOURS = int((os.environ.get("IG_HASHTAG_ONLY_NEWER_THAN_HOURS") or "48").strip())
+APIFY_HASHTAG_ACTOR = (
+    os.environ.get("APIFY_HASHTAG_ACTOR")
+    or "apify~instagram-hashtag-scraper"
+).strip().replace("/", "~")
+APIFY_HASHTAG_RESULTS_LIMIT = int((os.environ.get("APIFY_HASHTAG_RESULTS_LIMIT") or "10").strip())
+APIFY_HASHTAG_ONLY_NEWER_THAN = (os.environ.get("APIFY_HASHTAG_ONLY_NEWER_THAN") or "2 days").strip()
 STEP4_SIGNATURE = os.environ.get("STEP4_SIGNATURE", "#NicoPaz | ...").strip()
 STEP4_PREFIX = os.environ.get("STEP4_PREFIX", "").strip()
 # Если задан — публикуем только посты от этих аккаунтов.
@@ -162,8 +190,16 @@ NITTER_MIRRORS = [
     "https://nitter.poast.org",
 ]
  
-SIGNATURE = '\n\n#DesireDoue | <a href="https://t.me/+8Sjg2DI4xGRiZTEy">Follow us</a>'
-CROSSPOST_SIGNATURE = "\n\n#NicoPaz"
+_SIG_HASHTAG  = os.environ.get("SIGNATURE_HASHTAG", "").strip()
+_SIG_URL      = os.environ.get("SIGNATURE_URL", "").strip()
+_SIG_URL_TEXT = os.environ.get("SIGNATURE_URL_TEXT", "Follow us").strip()
+if _SIG_HASHTAG and _SIG_URL:
+    SIGNATURE = f'\n\n#{_SIG_HASHTAG} | <a href="{_SIG_URL}">{_SIG_URL_TEXT}</a>'
+elif _SIG_HASHTAG:
+    SIGNATURE = f'\n\n#{_SIG_HASHTAG}'
+else:
+    SIGNATURE = '\n\n#KenanYildiz | <a href="https://t.me/+6mqOQu0luT0yNzMy">Follow us</a>'
+CROSSPOST_SIGNATURE = f"\n\n#{_SIG_HASHTAG}" if _SIG_HASHTAG else "\n\n#NicoPaz"
 CAPTION_LIMIT = 1024
 MSG_LIMIT = 4096
 MAX_TEXT_LIMIT = 4000
@@ -178,13 +214,23 @@ SOURCE_NEWS_CACHE_DAYS = 2
 SOURCE_NEWS_CACHE_LIMIT = 500
 SEMANTIC_CANDIDATE_LIMIT = 3
 SEMANTIC_LOCAL_DUPLICATE_THRESHOLD = 0.86
-SEMANTIC_AI_PREFILTER_THRESHOLD = 0.24
+SEMANTIC_AI_PREFILTER_THRESHOLD = 0.18  # было 0.24 — снижено чтобы цитаты с другими словами проходили на AI
+DUPLICATE_TEXT_MIN_WORDS = int((os.environ.get("DUPLICATE_TEXT_MIN_WORDS") or "7").strip())
+DUPLICATE_TEXT_MIN_CHARS = int((os.environ.get("DUPLICATE_TEXT_MIN_CHARS") or "45").strip())
+SOURCE_DUPLICATE_TEXT_MIN_WORDS = int((os.environ.get("SOURCE_DUPLICATE_TEXT_MIN_WORDS") or "5").strip())
+SOURCE_DUPLICATE_TEXT_MIN_CHARS = int((os.environ.get("SOURCE_DUPLICATE_TEXT_MIN_CHARS") or "35").strip())
 LAYOUT_AI_MODEL = os.environ.get(
     "LAYOUT_AI_MODEL",
     "gemini-2.5-flash-lite",
 ).strip()
 LAYOUT_AI_MAX_CHARS = int(os.environ.get("LAYOUT_AI_MAX_CHARS", "3200"))
 LAYOUT_AI_TIMEOUT = int(os.environ.get("LAYOUT_AI_TIMEOUT", "12"))
+STYLE_EDIT_ENABLED = os.environ.get("STYLE_EDIT_ENABLED", "1").strip().lower() not in {
+    "0", "false", "no", "off"
+}
+STYLE_EDIT_MODEL = (os.environ.get("STYLE_EDIT_MODEL") or LAYOUT_AI_MODEL).strip()
+STYLE_EDIT_MAX_CHARS = int(os.environ.get("STYLE_EDIT_MAX_CHARS", "1800"))
+STYLE_EDIT_TIMEOUT = int(os.environ.get("STYLE_EDIT_TIMEOUT", "18"))
 FORMAT_RAG_ENABLED = os.environ.get("FORMAT_RAG_ENABLED", "1").strip().lower() not in {
     "0", "false", "no", "off"
 }
@@ -232,7 +278,13 @@ def load_published() -> set:
     if Path(PUBLISHED_FILE).exists():
         try:
             with open(PUBLISHED_FILE, encoding="utf-8") as f:
-                return expand_published_keys(set(json.load(f)))
+                published = expand_published_keys(set(json.load(f)))
+                before_source_keys = len(published)
+                published.update(source_news_duplicate_keys())
+                if len(published) > before_source_keys:
+                    print(f"  Content-дедуп из {SOURCE_NEWS_FILE}: +{len(published) - before_source_keys} ключей")
+                    save_published(published)
+                return published
         except Exception as e:
             print(f"  Не удалось прочитать {PUBLISHED_FILE}: {e}")
     return set()
@@ -324,6 +376,50 @@ def short_hash(value: str) -> str:
     return hashlib.sha1(value.encode("utf-8", errors="ignore")).hexdigest()[:20]
 
 
+def normalize_duplicate_text(text: str) -> str:
+    text = html.unescape(str(text or ""))
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"https?://\S+", " ", text)
+    text = re.sub(r"[@#][\wА-Яа-яÀ-ÿ_]+", " ", text, flags=re.UNICODE)
+    text = unicodedata.normalize("NFKC", text).casefold()
+    text = re.sub(r"[^\w\sА-Яа-яÀ-ÿ-]", " ", text, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def duplicate_text_word_count(normalized_text: str) -> int:
+    return len(re.findall(r"[\wА-Яа-яÀ-ÿ-]{2,}", normalized_text or "", flags=re.UNICODE))
+
+
+def stable_duplicate_text_fingerprint(
+    text: str,
+    min_words: int = DUPLICATE_TEXT_MIN_WORDS,
+    min_chars: int = DUPLICATE_TEXT_MIN_CHARS,
+) -> str:
+    normalized = normalize_duplicate_text(text)
+    if not normalized:
+        return ""
+    if len(normalized) < min_chars and duplicate_text_word_count(normalized) < min_words:
+        return ""
+    return short_hash(normalized[:700])
+
+
+def source_fingerprint(source: str) -> str:
+    source = html.unescape(str(source or "")).strip().casefold()
+    if not source:
+        return ""
+    if re.search(r"^(?:https?://|www\.)", source) or re.search(
+        r"(?:instagram\.com|twitter\.com|x\.com|nitter\.)/",
+        source,
+    ):
+        normalized_url = canonical_url(source)
+        source = normalized_url
+    else:
+        source = source.lstrip("@")
+        source = re.sub(r"\s+", " ", source)
+        source = re.sub(r"[^\w\sА-Яа-яÀ-ÿ.-]", "", source, flags=re.UNICODE).strip()
+    return short_hash(source) if source else ""
+
+
 def text_fingerprint(text: str) -> str:
     text = strip_html_tags(text or "")
     text = re.sub(r"https?://\S+", "", text)
@@ -404,11 +500,14 @@ def instagram_shortcode_from_post(post: dict) -> str:
 
 
 def instagram_extra_duplicate_keys(post: dict) -> set:
-    """Stable extra keys for Instagram duplicates."""
+    """Stable extra keys for Instagram duplicates.
+    Использует только надёжные идентификаторы поста:
+    shortCode, id, и прямой URL поста на instagram.com.
+    НЕ собирает CDN/медиа ссылки — они нестабильны и вызывают ложные дубли.
+    """
     keys = set()
-    candidates = []
-    collect_string_values(post, candidates)
 
+    # shortCode — самый надёжный идентификатор Instagram поста
     for field in ("shortCode", "shortcode", "code"):
         shortcode = str(post.get(field) or "").strip().lower()
         if shortcode:
@@ -417,12 +516,12 @@ def instagram_extra_duplicate_keys(post: dict) -> set:
     for shortcode in instagram_shortcodes_from_post(post):
         keys.add(f"ig:{shortcode}")
 
-    for candidate in candidates:
-        text = html.unescape(candidate)
-        for match in re.finditer(r"https?://[^\s\"'<>]+", text):
-            url = match.group(0).rstrip(").,;]")
+    # Только прямой URL поста на instagram.com (не CDN, не медиа)
+    for field in ("url", "postUrl", "permalink", "link"):
+        url = str(post.get(field) or "").strip()
+        if url and "instagram.com/p/" in url:
             normalized = canonical_url(url)
-            if "instagram.com/" in normalized:
+            if normalized:
                 keys.add(f"igurl:{normalized}")
 
     return keys
@@ -432,6 +531,7 @@ def duplicate_keys(
     post_id: str = "",
     url: str = "",
     text: str = "",
+    source: str = "",
     media_items: list | None = None,
     extra_keys: list | set | tuple | None = None,
 ) -> set:
@@ -451,13 +551,29 @@ def duplicate_keys(
             keys.add(f"id:{status_id}")
             keys.add(f"tweet:{status_id}")
 
-    text_key = text_fingerprint(text)
-    if text_key:
-        keys.add(f"text:{text_key}")
-
     media_key = media_fingerprint(media_items or [])
     if media_key:
         keys.add(f"media:{media_key}")
+
+    stable_text_key = stable_duplicate_text_fingerprint(text)
+
+    # Different media posts can legitimately reuse a short caption.
+    # Long exact captions are stable enough to block repost loops.
+    text_key = text_fingerprint(text)
+    if text_key and (not media_key or stable_text_key):
+        keys.add(f"text:{text_key}")
+
+    if stable_text_key:
+        keys.add(f"content:{stable_text_key}")
+
+    source_key = source_fingerprint(source)
+    source_text_key = stable_duplicate_text_fingerprint(
+        text,
+        min_words=SOURCE_DUPLICATE_TEXT_MIN_WORDS,
+        min_chars=SOURCE_DUPLICATE_TEXT_MIN_CHARS,
+    )
+    if source_key and source_text_key:
+        keys.add(f"source-text:{source_key}:{source_text_key}")
 
     return {key for key in keys if key and not key.endswith(":")}
 
@@ -477,6 +593,30 @@ def find_duplicate(published: set, **kwargs) -> str:
 
 def mark_published(published: set, **kwargs):
     published.update(duplicate_keys(**kwargs))
+
+
+def source_news_duplicate_keys() -> set:
+    try:
+        records = load_source_news_cache()
+    except NameError:
+        return set()
+    except Exception as e:
+        print(f"  Не удалось подмешать content-дубли из {SOURCE_NEWS_FILE}: {e}")
+        return set()
+
+    keys = set()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        keys.update(
+            duplicate_keys(
+                post_id=str(record.get("post_id") or ""),
+                url=str(record.get("url") or ""),
+                text=str(record.get("text") or ""),
+                source=str(record.get("source") or ""),
+            )
+        )
+    return keys
 
 
 NEWS_STOPWORDS = {
@@ -500,6 +640,56 @@ def parse_cache_datetime(value: str) -> datetime | None:
         return dt
     except ValueError:
         return None
+
+
+def parse_datetime_utc(value) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    normalized = str(value or "").strip()
+    if not normalized:
+        return None
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+
+    try:
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except ValueError:
+        pass
+
+    try:
+        dt = parsedate_to_datetime(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except (TypeError, ValueError, IndexError):
+        pass
+
+    for fmt in (
+        "%a %b %d %H:%M:%S %z %Y",
+        "%a, %d %b %Y %H:%M:%S %z",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%d %H:%M:%S%z",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d",
+    ):
+        try:
+            dt = datetime.strptime(normalized, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except ValueError:
+            continue
+
+    return None
 
 
 def prune_source_news_cache(records: list) -> list:
@@ -550,15 +740,27 @@ def news_tokens(text: str) -> set:
 
 
 def token_similarity(left: str, right: str) -> float:
-    left_tokens = news_tokens(left)
+    """
+    Возвращает максимум из трёх метрик схожести.
+
+    overlap  — доля общих токенов относительно МЕНЬШЕГО текста.
+               Высокий когда короткий текст является подмножеством длинного.
+    cosine   — геометрическая метрика, менее чувствительна к разнице размеров.
+    contain  — направленная метрика: насколько кандидат из кэша «покрывает»
+               новый текст. Используется только когда новый текст длиннее
+               кэшированного — защищает от пропуска «сборных» постов.
+    """
+    left_tokens  = news_tokens(left)
     right_tokens = news_tokens(right)
     if not left_tokens or not right_tokens:
         return 0.0
 
     common = len(left_tokens & right_tokens)
-    overlap = common / min(len(left_tokens), len(right_tokens))
-    cosine = common / ((len(left_tokens) * len(right_tokens)) ** 0.5)
-    return max(overlap, cosine)
+    overlap  = common / min(len(left_tokens), len(right_tokens))
+    cosine   = common / ((len(left_tokens) * len(right_tokens)) ** 0.5)
+    # contain: насколько left покрывается right (right — из кэша, left — новый)
+    contain  = common / len(left_tokens) if left_tokens else 0.0
+    return max(overlap, cosine, contain)
 
 
 def source_news_key(text: str, post_id: str = "", url: str = "") -> str:
@@ -586,7 +788,8 @@ def top_semantic_candidates(text: str, cache: list, url: str = "") -> list:
 
 
 def openrouter_semantic_duplicate(text: str, candidates: list) -> bool:
-    if not OPENROUTER_KEY or not candidates:
+    """AI-проверка семантических дублей через Gemini (ранее OpenRouter)."""
+    if not GEMINI_API_KEY or not candidates:
         return False
 
     previous = [
@@ -602,38 +805,84 @@ def openrouter_semantic_duplicate(text: str, candidates: list) -> bool:
         "You are checking football news duplicates before publication.\n"
         "A NEW item is allowed only if at least 80% of its information is new "
         "compared with the PREVIOUS items.\n"
-        "Mark duplicate=true only when it is the same event/news with mostly the same facts, "
-        "even if it is worded differently or comes from another account.\n"
-        "Return only valid JSON: {\"duplicate\": true|false, \"reason\": \"short\"}.\n\n"
+        "Mark duplicate=true when it is the same event/quote/news with mostly the same facts, "
+        "even if worded differently or from another source.\n"
+        "Pay special attention to quotes: if the NEW item quotes the same person "
+        "saying essentially the same thing as a PREVIOUS item — mark as duplicate.\n"
+        "Return only valid JSON without markdown: "
+        "{\"duplicate\": true|false, \"reason\": \"one short sentence\"}.\n\n"
         f"NEW:\n{text[:1600]}\n\n"
         f"PREVIOUS:\n{json.dumps(previous, ensure_ascii=False)}"
     )
 
     try:
         r = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_KEY}",
-                "Content-Type": "application/json",
-            },
+            f"{GEMINI_BASE_URL}/models/{LAYOUT_AI_MODEL}:generateContent",
+            params={"key": GEMINI_API_KEY},
+            headers={"Content-Type": "application/json"},
             json={
-                "model": OPENROUTER_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0,
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0,
+                    "maxOutputTokens": 120,
+                    "candidateCount": 1,
+                    "responseMimeType": "application/json",
+                },
             },
             timeout=18,
         )
         r.raise_for_status()
-        content = r.json()["choices"][0]["message"]["content"].strip()
-        match = re.search(r"\{.*\}", content, flags=re.S)
-        data = json.loads(match.group(0) if match else content)
+        parts = r.json()["candidates"][0]["content"].get("parts", [])
+        content = "\n".join(p.get("text", "") for p in parts).strip()
+        # Парсим: от первой { до последней }
+        start, end = content.find("{"), content.rfind("}")
+        if start != -1 and end > start:
+            data = json.loads(content[start:end + 1])
+        else:
+            data = json.loads(content)
         if data.get("duplicate") is True:
             print(f"  AI-дубль по смыслу: {data.get('reason', '')}")
             return True
         return False
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "?"
+        print(f"  AI-проверка дублей недоступна: HTTP {status}")
+        return False
     except Exception as e:
         print(f"  AI-проверка дублей недоступна: {e}")
         return False
+
+
+def _looks_like_quote_post(text: str) -> bool:
+    """
+    True если пост выглядит как цитата конкретного человека.
+    Цитата одного спикера в разных источниках — почти всегда дубль.
+    Срабатывает на паттерны: 🎙/🗣 + имя + двоеточие, или «Имя о Ком-то:»
+    """
+    plain = strip_html_tags(html.unescape(text or ""))
+    # Эмодзи спикера + текст перед двоеточием
+    if re.search(r"[🎙🗣️].{3,60}:", plain):
+        return True
+    # «Имя Фамилия о Имя:» или «Имя Фамилия:»
+    if re.search(r"[A-ZА-ЯЁ][a-zа-яё]{2,}\s+[A-ZА-ЯЁ][a-zа-яё]{2,}.*:", plain):
+        return True
+    return False
+
+
+def _quote_speaker(text: str) -> str:
+    """
+    Извлекает имя спикера из поста-цитаты для сравнения.
+    Возвращает нормализованную строку вида «франческо тотти».
+    """
+    plain = strip_html_tags(html.unescape(text or ""))
+    # «🎙 Франческо Тотти о Кенане:» → «франческо тотти»
+    m = re.search(r"[🎙🗣️]\s*([A-ZА-ЯЁ][^\n:]{3,50}):", plain)
+    if m:
+        name_part = m.group(1).strip()
+        # Убираем «о Ком-то» в конце
+        name_part = re.sub(r"\s+[оo]\s+.+$", "", name_part, flags=re.I)
+        return name_part.strip().casefold()
+    return ""
 
 
 def is_semantic_duplicate(text: str, source: str = "", post_id: str = "", url: str = "") -> bool:
@@ -646,13 +895,41 @@ def is_semantic_duplicate(text: str, source: str = "", post_id: str = "", url: s
         return False
 
     best_score, best_record = candidates[0]
-    if best_score >= SEMANTIC_LOCAL_DUPLICATE_THRESHOLD:
+
+    # ── Адаптивный локальный порог ──────────────────────────────────────────
+    # Для постов-цитат (🎙 Спикер: «...») порог снижаем:
+    # один человек даёт одно интервью — разные источники цитируют одно и то же.
+    # Дополнительно проверяем что спикер совпадает — чтобы не блокировать
+    # два разных интервью одного человека.
+    is_quote = _looks_like_quote_post(text)
+    local_threshold = SEMANTIC_LOCAL_DUPLICATE_THRESHOLD  # 0.86 по умолчанию
+
+    if is_quote:
+        speaker_new = _quote_speaker(text)
+        speaker_old = _quote_speaker(best_record.get("text", ""))
+        same_speaker = (
+            speaker_new
+            and speaker_old
+            and (speaker_new in speaker_old or speaker_old in speaker_new)
+        )
+        if same_speaker:
+            # Цитата того же спикера — достаточно 0.45 токен-схожести
+            local_threshold = 0.45
+        else:
+            # Спикер другой или не распознан — стандартный порог
+            local_threshold = SEMANTIC_LOCAL_DUPLICATE_THRESHOLD
+
+    if best_score >= local_threshold:
+        label = "цитата" if is_quote and local_threshold < SEMANTIC_LOCAL_DUPLICATE_THRESHOLD else "смысловой дубль"
         print(
-            "  Смысловой дубль по локальному кэшу "
-            f"({best_score:.2f}, {best_record.get('source', '')}) — пропуск"
+            f"  {label.capitalize()} по локальному кэшу "
+            f"({best_score:.2f} ≥ {local_threshold:.2f}, {best_record.get('source', '')}) — пропуск"
         )
         return True
 
+    # ── AI-проверка для оставшихся кандидатов ───────────────────────────────
+    # Для цитат передаём все кандидаты — AI лучше понимает что «та же мысль,
+    # другими словами» это дубль.
     if openrouter_semantic_duplicate(text, candidates):
         return True
 
@@ -686,39 +963,9 @@ def record_source_news(text: str, step: int, source: str = "", post_id: str = ""
 def is_too_old(date_str: str) -> bool:
     if not date_str:
         return False
-    normalized = date_str.strip()
-    if normalized.endswith("Z"):
-        normalized = normalized[:-1] + "+00:00"
-    try:
-        dt = datetime.fromisoformat(normalized)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+    dt = parse_datetime_utc(date_str)
+    if dt:
         return (datetime.now(timezone.utc) - dt) > timedelta(days=MAX_AGE_DAYS)
-    except ValueError:
-        pass
-
-    try:
-        dt = parsedate_to_datetime(normalized)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return (datetime.now(timezone.utc) - dt) > timedelta(days=MAX_AGE_DAYS)
-    except (TypeError, ValueError, IndexError):
-        pass
-
-    for fmt in (
-        "%a, %d %b %Y %H:%M:%S %z",
-        "%Y-%m-%dT%H:%M:%S%z",
-        "%Y-%m-%dT%H:%M:%SZ",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d",
-    ):
-        try:
-            dt = datetime.strptime(date_str.strip(), fmt)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return (datetime.now(timezone.utc) - dt) > timedelta(days=MAX_AGE_DAYS)
-        except ValueError:
-            continue
     print(f"  Не удалось разобрать дату: {date_str}")
     return False
 
@@ -1035,30 +1282,19 @@ def looks_like_speaker_heading(heading: str) -> bool:
         return False
     if re.search(r"\d|https?://", name, flags=re.I):
         return False
+    # Строки рейтингов/номинаций вида «25/26», «NN/NN» — не спикер
+    if re.search(r"\d{1,2}/\d{2}", plain):
+        return False
+    # Строки с флагами стран — элементы списка, не спикер
+    if re.search(r"[\U0001F1E0-\U0001F1FF]", plain):
+        return False
+    # Строки вида «Имя (Клуб)» — элементы рейтинга/номинации, не спикер
+    if re.search(r"\([^)]{2,30}\)\s*$", name):
+        return False
 
     words = re.findall(r"[A-Za-zА-Яа-яЁёÀ-ÿ][\wА-Яа-яЁёÀ-ÿ'-]*", name, flags=re.UNICODE)
     if not 2 <= len(words) <= 5:
         return False
-
-    # Строки, начинающиеся с союза/предлога («И Бавария», «Для Реала»),
-    # не могут быть именем говорящего.
-    _NOT_NAME_STARTERS = {
-        "и", "а", "но", "или", "если", "когда", "что", "как", "чтобы",
-        "в", "для", "из", "к", "на", "о", "об", "от", "по", "при",
-        "про", "с", "у", "за", "до", "перед",
-    }
-    if words[0].casefold() in _NOT_NAME_STARTERS:
-        return False
-
-    # Если любое слово в имени является (или входит в) название клуба —
-    # это не заголовок говорящего, а часть предложения.
-    # Проверяем все возможные хвосты слов (1..N).
-    for count in range(1, len(words) + 1):
-        if is_football_club_name(" ".join(words[-count:])):
-            return False
-        if is_football_club_name(" ".join(words[:count])):
-            return False
-
     return sum(1 for word in words[:2] if word[:1].isupper()) >= 2
 
 
@@ -1126,20 +1362,14 @@ def lowercase_continuation_start(text: str) -> str:
     if text.lstrip().startswith(("#", "@", "http://", "https://", "<", "«", "\"", "“")):
         return text
 
-    # Однобуквенные союзы/предлоги, которые не являются аббревиатурами.
-    # word.isupper() == True для них, но это не аббревиатура — переводим в строчную.
-    _SINGLE_LETTER_NOT_ABBREV = {"И", "А", "В", "О", "С", "К", "У"}
-
     def replace(match: re.Match) -> str:
         prefix, word = match.group(1), match.group(2)
-        if word.upper() in CAPS_WORD_EXCEPTIONS:
-            return match.group(0)
-        if word.isupper() and word not in _SINGLE_LETTER_NOT_ABBREV:
+        if word.upper() in CAPS_WORD_EXCEPTIONS or word.isupper():
             return match.group(0)
         return prefix + word[:1].lower() + word[1:]
 
     return re.sub(
-        r"^(\s*[^\wА-Яа-яЁёA-Za-zÀ-ÿ#@<«\"“]*)([А-ЯЁA-Z][а-яёa-z]?[\wА-Яа-яЁёÀ-ÿ'-]*)",
+        r"^(\s*[^\wА-Яа-яЁёA-Za-zÀ-ÿ#@<«\"“]*)([А-ЯЁA-Z][а-яёa-z][\wА-Яа-яЁёÀ-ÿ'-]*)",
         replace,
         text,
         count=1,
@@ -1179,8 +1409,6 @@ def merge_football_club_line(line: str, nxt: str) -> str | None:
     _CLUB_PREPOSITIONS = {
         "в", "для", "из", "к", "на", "о", "об", "от", "перед", "по",
         "при", "про", "с", "у", "за", "до", "из-за", "из-под",
-        # союзы, с которых может начинаться оборванная строка с клубом
-        "и", "а", "но", "или",
     }
 
     nxt_words = text_words(nxt)
@@ -1842,53 +2070,84 @@ def instagram_account_to_username(value: str) -> str:
     return path_parts[0].lstrip("@")
 
 
-def _ig_session():
-    """Возвращает готовую IG-сессию или None если куки не заданы.
+def build_apify_instagram_input() -> dict:
+    usernames = []
+    direct_urls = []
+    for account in APIFY_INSTAGRAM_ACCOUNTS:
+        normalized = instagram_account_to_username(account)
+        if not normalized:
+            continue
+        if re.search(r"^https?://", normalized, flags=re.I):
+            direct_urls.append(normalized)
+        else:
+            usernames.append(normalized)
 
-    Проверка валидности сессии не выполняется здесь намеренно:
-    Instagram отклоняет preflight-запросы по useragent mismatch даже при живых куках.
-    Реальные ошибки сессии (401/403) обрабатываются в _get_json/_post_json.
-    """
-    if not IG_COOKIES_JSON:
-        print("  IG_COOKIES_JSON не задан — пропускаем Instagram")
-        return None
-    if _ig is None:
-        print("  instagram_scraper.py не найден — пропускаем Instagram")
-        return None
-    return _ig.build_session(IG_COOKIES_JSON, proxy=IG_PROXY)
+    actor_input = {
+        "username": usernames,
+        "resultsLimit": APIFY_INSTAGRAM_RESULTS_LIMIT,
+        "skipPinnedPosts": APIFY_INSTAGRAM_SKIP_PINNED,
+    }
+    if direct_urls:
+        actor_input["directUrls"] = direct_urls
+    if APIFY_INSTAGRAM_ONLY_NEWER_THAN:
+        actor_input["onlyPostsNewerThan"] = APIFY_INSTAGRAM_ONLY_NEWER_THAN
+    if APIFY_INSTAGRAM_DATA_DETAIL_LEVEL:
+        actor_input["dataDetailLevel"] = APIFY_INSTAGRAM_DATA_DETAIL_LEVEL
+
+    if APIFY_INSTAGRAM_INPUT_JSON:
+        try:
+            override = json.loads(APIFY_INSTAGRAM_INPUT_JSON)
+            if isinstance(override, dict):
+                actor_input.update(override)
+        except Exception as e:
+            print(f"  APIFY_INSTAGRAM_INPUT_JSON не разобран: {e}")
+
+    return actor_input
 
 
 def fetch_instagram_posts() -> list:
-    """Получает посты из Instagram через self-hosted scraper (без Apify)."""
-    session = _ig_session()
-    if session is None:
+    """Fetch Instagram posts from Apify Instagram Post Scraper."""
+    if not APIFY_TOKEN:
+        print("  APIFY_TOKEN не задан — пропускаем")
         return []
-    if not IG_INSTAGRAM_ACCOUNTS:
+    if not APIFY_INSTAGRAM_ACCOUNTS and not APIFY_INSTAGRAM_INPUT_JSON:
         print("  STEP2_INSTAGRAM_ACCOUNTS не задан — пропускаем")
         return []
 
-    only_newer_than = datetime.now(timezone.utc) - timedelta(hours=IG_ONLY_NEWER_THAN_HOURS)
-    all_posts = []
-    for i, account_raw in enumerate(IG_INSTAGRAM_ACCOUNTS):
-        username = instagram_account_to_username(account_raw)
-        if not username:
-            continue
-        print(f"  IG scraper: @{username}")
-        posts = _ig.fetch_user_posts(
-            username,
-            session,
-            max_posts=IG_RESULTS_LIMIT,
-            only_newer_than=only_newer_than,
-            skip_pinned=IG_SKIP_PINNED,
-            on_auth_error=lambda code: alert(f"IG сессия недействительна ({code}). Обновите IG_COOKIES_JSON в GitHub Secrets."),
+    actor_input = build_apify_instagram_input()
+    url = f"{APIFY_BASE_URL}/acts/{APIFY_INSTAGRAM_ACTOR}/run-sync-get-dataset-items"
+    params = {
+        "format": "json",
+        "clean": "1",
+        "timeout": str(APIFY_RUN_TIMEOUT),
+    }
+    if APIFY_MAX_ITEMS:
+        params["maxItems"] = APIFY_MAX_ITEMS
+    if APIFY_MAX_TOTAL_CHARGE_USD:
+        params["maxTotalChargeUsd"] = APIFY_MAX_TOTAL_CHARGE_USD
+
+    try:
+        r = requests.post(
+            url,
+            params=params,
+            json=actor_input,
+            headers={
+                **REQUEST_HEADERS,
+                "Authorization": f"Bearer {APIFY_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            timeout=APIFY_RUN_TIMEOUT + 45,
         )
-        print(f"    получено: {len(posts)} постов")
-        all_posts.extend(posts)
-        if i < len(IG_INSTAGRAM_ACCOUNTS) - 1:
-            wait = random.uniform(*_ig.DELAY_BETWEEN_ACCOUNTS)
-            print(f"    пауза {wait:.0f}с перед следующим аккаунтом...")
-            time.sleep(wait)
-    return all_posts
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return data.get("items", []) or data.get("data", {}).get("items", [])
+        return []
+    except Exception as e:
+        print(f"  Apify ошибка: {e}")
+        return []
 
 
 def instagram_media_from_apify_post(post: dict) -> list:
@@ -1984,6 +2243,10 @@ def instagram_media_from_apify_post(post: dict) -> list:
             print(f"    instagram media: {item['type']} {item['url'][:160]}")
         if len(media_items) > TELEGRAM_MEDIA_GROUP_LIMIT:
             print(f"    ...и еще {len(media_items) - TELEGRAM_MEDIA_GROUP_LIMIT} медиа")
+    else:
+        # Логируем ключи поста чтобы понять структуру ответа Apify
+        top_keys = list(post.keys())[:20]
+        print(f"  Apify media не найдено. Ключи поста: {top_keys}")
 
     return media_items
 
@@ -2038,42 +2301,586 @@ def translate_deepl(text: str) -> str:
         return text
 
 
-def edit_openrouter(text: str) -> str:
-    if not text or not OPENROUTER_KEY:
+def parse_gemini_editor_response(content: str) -> str:
+    content = (content or "").strip()
+    content = re.sub(r"^```(?:text)?\s*", "", content, flags=re.I)
+    content = re.sub(r"\s*```$", "", content)
+    content = re.sub(
+        r"^\s*(?:вот|держи)\s+[^:\n]{0,80}:\s*",
+        "",
+        content,
+        flags=re.I,
+    )
+    content = re.sub(
+        r"^\s*(?:исправленный|отредактированный|готовый)\s+текст\s*:\s*",
+        "",
+        content,
+        flags=re.I,
+    )
+    return content.strip()
+
+
+def gemini_text_completion(
+    prompt: str,
+    max_tokens: int,
+    timeout: int,
+    model: str | None = None,
+) -> str:
+    model = (model or LAYOUT_AI_MODEL).strip()
+    r = requests.post(
+        f"{GEMINI_BASE_URL}/models/{model}:generateContent",
+        params={"key": GEMINI_API_KEY},
+        headers={"Content-Type": "application/json"},
+        json={
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0,
+                "maxOutputTokens": max_tokens,
+                "candidateCount": 1,
+            },
+        },
+        timeout=timeout,
+    )
+    r.raise_for_status()
+    data = r.json()
+    parts = data["candidates"][0]["content"].get("parts", [])
+    return "\n".join(part.get("text", "") for part in parts).strip()
+
+
+def parse_json_response(content: str):
+    content = parse_gemini_editor_response(content)
+    content = re.sub(r"^```(?:json)?\s*", "", content, flags=re.I)
+    content = re.sub(r"\s*```$", "", content)
+    try:
+        return json.loads(content)
+    except Exception:
+        pass
+
+    for opener, closer in (("{", "}"), ("[", "]")):
+        start = content.find(opener)
+        end = content.rfind(closer)
+        if start != -1 and end > start:
+            try:
+                return json.loads(content[start:end + 1])
+            except Exception:
+                pass
+    return None
+
+
+def parse_replacement_ops(content: str) -> list[tuple[str, str]]:
+    data = parse_json_response(content)
+    if isinstance(data, dict):
+        items = (
+            data.get("replacements")
+            or data.get("operations")
+            or data.get("edits")
+            or []
+        )
+    elif isinstance(data, list):
+        items = data
+    else:
+        return []
+
+    ops: list[tuple[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        old = (
+            item.get("from")
+            or item.get("old")
+            or item.get("source")
+            or item.get("before")
+            or ""
+        )
+        new = (
+            item.get("to")
+            or item.get("new")
+            or item.get("target")
+            or item.get("after")
+            or ""
+        )
+        old = html.unescape(str(old)).replace("\r\n", "\n").replace("\r", "\n").strip()
+        new = html.unescape(str(new)).replace("\r\n", "\n").replace("\r", "\n").strip()
+        if old and old != new:
+            ops.append((old, new))
+    return ops
+
+
+def apply_case_insensitive_literal(text: str, bad: str, good: str) -> str:
+    if not text or not bad or bad == good:
         return text
+    pattern = re.compile(
+        r"(?<![\w-])" + re.escape(bad) + r"(?![\w-])",
+        flags=re.I | re.UNICODE,
+    )
+    return pattern.sub(good, text)
+
+
+LOCAL_NAME_REPLACEMENTS = (
+    ("Kendry Páez", "Кендри Паэс"),
+    ("Kendry Paez", "Кендри Паэс"),
+    ("кендри паэс", "Кендри Паэс"),
+    ("кендри паес", "Кендри Паэс"),
+    ("кендри паэз", "Кендри Паэс"),
+    ("кендри кавиедес", "Кендри Паэс"),
+    ("кендри кавидес", "Кендри Паэс"),
+    ("паэс", "Паэс"),
+    ("паес", "Паэс"),
+    ("паэз", "Паэс"),
+)
+
+
+def normalize_known_player_names(text: str) -> str:
+    for bad, good in LOCAL_NAME_REPLACEMENTS:
+        text = apply_case_insensitive_literal(text, bad, good)
+    return text
+
+
+def apply_literal_glossary_replacements(text: str) -> str:
+    fixed = text or ""
+    for entry in sorted(GLOSSARY, key=lambda e: len(e.get("bad", "")), reverse=True):
+        fixed = apply_case_insensitive_literal(
+            fixed,
+            str(entry.get("bad", "")),
+            str(entry.get("good", "")),
+        )
+    return fixed
+
+
+def capitalize_first_word(value: str) -> str:
+    return re.sub(
+        r"^([a-zа-яё])",
+        lambda m: m.group(1).upper(),
+        str(value or ""),
+        count=1,
+        flags=re.I,
+    )
+
+
+def apply_local_translation_fixes(text: str) -> str:
+    text = normalize_known_player_names(text or "")
+    if not text:
+        return text
+
+    text = re.sub(
+        r"(?m)^([^\w\s<@#«“\"'‘(\[]{1,8})(?=[А-ЯЁA-Z])",
+        r"\1 ",
+        text,
+        flags=re.UNICODE,
+    )
+    text = re.sub(r"([«“])\s+", r"\1", text)
+    text = re.sub(r"\s+([»”])", r"\1", text)
+    text = re.sub(
+        r"(?<=[А-Яа-яЁёA-Za-z0-9»])([:!?])(?=[А-Яа-яЁёA-Za-z«])",
+        r"\1 ",
+        text,
+    )
+    text = re.sub(r"([»\"])\s*[-–]\s*(?=[A-Za-zА-Яа-яЁё0-9_@])", r"\1 — ", text)
+
+    def repl_new_ten(match: re.Match) -> str:
+        country = capitalize_first_word(match.group("country"))
+        return f"{match.group('prefix')}новая «десятка» {country}"
+
+    text = re.sub(
+        r"(?P<prefix>\b)"
+        r"нов(?:ый|ая|ое|ым|ой)\s+"
+        r"[«\"“”]?\s*10\s*[-–—]?\s*(?:й|я|е|ый|ая|ое)\s*[»\"“”]?"
+        r"\s+(?P<country>[А-Яа-яЁёA-Za-z][\wА-Яа-яЁё-]*)",
+        repl_new_ten,
+        text,
+        flags=re.I | re.UNICODE,
+    )
+    text = re.sub(
+        r"\b([Вв])\s+возрасте\s+(Кендри\s+Паэс)\s+уже\b",
+        lambda m: f"{'В' if m.group(1).isupper() else 'в'} свои годы {m.group(2)} уже",
+        text,
+    )
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
+
+
+def glossary_bad_regex(bad: str) -> re.Pattern | None:
+    words = re.findall(r"[\wА-Яа-яЁёÀ-ÿ'-]+", str(bad or ""), flags=re.UNICODE)
+    if not words:
+        return None
+
+    parts = [re.escape(word) for word in words]
+    last = words[-1]
+    if re.search(r"[А-Яа-яЁё]", last):
+        parts[-1] = (
+            re.escape(last)
+            + r"(?:а|у|ом|е|ы|ой|ого|ому|ым|их|ыми|ами|ями)?"
+        )
+    pattern = r"(?<![\w-])" + r"\s+".join(parts) + r"(?![\w-])"
+    return re.compile(pattern, flags=re.I | re.UNICODE)
+
+
+def matching_glossary_entries(text: str) -> list[dict]:
+    entries = []
+    for entry in GLOSSARY:
+        pattern = glossary_bad_regex(entry.get("bad", ""))
+        if pattern and pattern.search(text or ""):
+            entries.append(entry)
+    return entries
+
+
+def glossary_hit_count(text: str) -> int:
+    return len(matching_glossary_entries(text))
+
+
+def glossary_entries_for_prompt(entries: list[dict]) -> str:
+    lines = []
+    for entry in entries:
+        bad = entry.get("bad", "")
+        good = entry.get("good", "")
+        comment = entry.get("comment", "")
+        if not bad or not good or bad == good:
+            continue
+        line = f'  • Неверно: «{bad}» → Верно: «{good}»'
+        if comment:
+            line += f"  ({comment})"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def cyrillic_token_variants(token: str) -> set[str]:
+    token = normalize_news_for_similarity(token)
+    if not token or not re.search(r"[а-яё]", token):
+        return {token} if token else set()
+
+    variants = {token}
+    if token.endswith(("ь", "й")):
+        stem = token[:-1]
+        variants.update({stem + end for end in ("я", "ю", "ем", "е")})
+    elif token.endswith("а"):
+        stem = token[:-1]
+        variants.update({stem + end for end in ("ы", "е", "у", "ой", "ою")})
+    elif token.endswith("я"):
+        stem = token[:-1]
+        variants.update({stem + end for end in ("и", "е", "ю", "ей", "ею")})
+    else:
+        variants.update({token + end for end in ("а", "у", "ом", "е", "ы", "ов", "ев")})
+    return variants
+
+
+def glossary_allowed_good_tokens() -> set[str]:
+    allowed: set[str] = set()
+    for entry in GLOSSARY:
+        for token in news_tokens(entry.get("good", "")):
+            allowed.update(cyrillic_token_variants(token))
+            allowed.add(token)
+    return allowed
+
+
+def numeric_facts(text: str) -> set[str]:
+    plain = html.unescape(strip_html_tags(text or ""))
+    return set(re.findall(r"(?<!\w)\d+(?:[.,]\d+)?(?:\s*[%№])?(?!\w)", plain))
+
+
+def proper_name_phrases(text: str) -> set[str]:
+    plain = html.unescape(strip_html_tags(text or ""))
+    word = r"[A-ZА-ЯЁ][A-Za-zА-Яа-яЁёÀ-ÿ'’.-]{1,}"
+    phrases = set()
+    for match in re.finditer(rf"\b{word}(?:\s+{word}){{1,4}}\b", plain):
+        normalized = normalize_news_for_similarity(match.group(0))
+        if normalized:
+            phrases.add(normalized)
+    return phrases
+
+
+def glossary_name_mentions(text: str) -> set[str]:
+    normalized = normalize_news_for_similarity(text)
+    mentions = set()
+    for entry in GLOSSARY:
+        good = str(entry.get("good", ""))
+        comment = str(entry.get("comment", "")).casefold()
+        looks_like_name = (
+            word_count(good) >= 2
+            or any(marker in comment for marker in ("футболист", "игрок", "форвард", "защитник", "фамилия"))
+        )
+        if not looks_like_name:
+            continue
+        good_norm = normalize_news_for_similarity(good)
+        if good_norm and good_norm in normalized:
+            mentions.add(good_norm)
+    return mentions
+
+
+def replacement_ops_preview(ops: list[tuple[str, str]]) -> str:
+    return json.dumps(
+        [{"from": old, "to": new} for old, new in ops[:8]],
+        ensure_ascii=False,
+    )
+
+
+def glossary_edit_preserved(original: str, candidate: str) -> bool:
+    """Проверяет что Gemini только заменил словарные термины, ничего не добавив.
+
+    Логика строгая: допускается только уменьшение или нейтральное изменение
+    количества токенов (замена bad→good), но не добавление новых токенов
+    которых не было в оригинале И не входят в good-формы словаря.
+    """
+    original_plain = html.unescape(strip_html_tags(original or "")).strip()
+    candidate_plain = html.unescape(strip_html_tags(candidate or "")).strip()
+    if not original_plain or not candidate_plain:
+        return False
+
+    # Ссылки в ответе — признак галлюцинации
+    if re.search(r"\[[^\]\n]{1,80}\]\(\s*https?://", candidate_plain, flags=re.I):
+        return False
+    original_urls = set(re.findall(r"https?://\S+", original_plain, flags=re.I))
+    candidate_urls = set(re.findall(r"https?://\S+", candidate_plain, flags=re.I))
+    if candidate_urls - original_urls:
+        return False
+
+    # Кандидат не должен быть существенно длиннее оригинала
+    # Допуск: +10% или +40 символов — только для склонений
+    max_growth = max(40, int(len(original_plain) * 0.10))
+    if len(candidate_plain) > len(original_plain) + max_growth:
+        return False
+    if len(candidate_plain) < max(1, int(len(original_plain) * 0.80)):
+        return False
+
+    # Глоссарная правка не имеет права менять структуру строк.
+    original_lines = [l for l in original_plain.splitlines() if l.strip()]
+    candidate_lines = [l for l in candidate_plain.splitlines() if l.strip()]
+    if len(candidate_lines) != len(original_lines):
+        return False
+
+    # Новые токены в кандидате — только если они являются good-формами из словаря
+    original_tokens = news_tokens(original_plain)
+    candidate_tokens = news_tokens(candidate_plain)
+    if not original_tokens:
+        return candidate_tokens == original_tokens
+    if not candidate_tokens:
+        return False
+
+    added_tokens = candidate_tokens - original_tokens
+    if added_tokens:
+        # Разрешаем только токены из good-форм словаря, включая простые падежные формы.
+        forbidden = added_tokens - glossary_allowed_good_tokens()
+        if forbidden:
+            return False
+
+    return True
+
+
+def edit_gemini(text: str) -> str:
+    """Глоссарный этап: ТОЛЬКО точечные замены плохих форм на хорошие.
+
+    Модель возвращает JSON с операциями from→to. Код применяет только операции,
+    где from буквально есть в исходном тексте, а итог проходит строгий валидатор.
+    """
+    if not text:
+        return text
+
+    text = apply_literal_glossary_replacements(normalize_known_player_names(text))
+    entries = matching_glossary_entries(text)
+    if not entries or not GEMINI_API_KEY:
+        return text
+
+    glossary_block = glossary_entries_for_prompt(entries)
     prompt = (
-        "Ты опытный редактор русскоязычного Telegram-канала.\n"
-        "Отредактируй текст так, чтобы он звучал естественно по-русски.\n"
-        "Правила:\n"
-        "- Сохрани все факты и эмодзи.\n"
-        "- Не используй HTML, Markdown и ссылки.\n"
-        "- Не разбивай одно предложение на несколько строк.\n"
-        "- Не используй символ | как разделитель.\n"
-        "- Формат интервью: ❓ вопрос?, пустая строка, 🎙️ Имя:, цитата в «ёлочках».\n"
-        "- Списки стран: «флаг Страна — Игрок» в одной строке, без кавычек вокруг имён.\n"
-        "- Перед хештегом #... оставь пустую строку.\n"
-        "- Верни ТОЛЬКО готовый текст.\n\n"
-        + text
+        "Ты НЕ редактор и НЕ переводчик. Ты только проверяешь глоссарий.\n"
+        "Нельзя возвращать готовый пост, переписывать текст, добавлять факты, вопросы, "
+        "ответы, цитаты, имена, клубы или пояснения.\n"
+        "Можно предложить только точечные замены фрагментов, которые БУКВАЛЬНО есть "
+        "в исходном тексте, по парам «неверно → верно» ниже. Падеж/род/число можно "
+        "подстроить только внутри заменяемого имени или термина.\n\n"
+        "Верни строго JSON без Markdown:\n"
+        "{\"replacements\":[{\"from\":\"точный фрагмент из исходного текста\",\"to\":\"исправленный фрагмент\"}]}\n"
+        "Если замен нет, верни {\"replacements\":[]}.\n\n"
+        "ДОСТУПНЫЙ СЛОВАРЬ ДЛЯ ЭТОГО ТЕКСТА:\n"
+        f"{glossary_block}\n\n"
+        "ИСХОДНЫЙ ТЕКСТ:\n"
+        f"{text}"
     )
     try:
-        r = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": OPENROUTER_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.7,
-            },
-            timeout=20,
+        content = gemini_text_completion(
+            prompt,
+            max_tokens=700,
+            timeout=STYLE_EDIT_TIMEOUT,
+            model=LAYOUT_AI_MODEL,
         )
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        print(f"  OpenRouter ошибка: {e}")
+        ops = parse_replacement_ops(content)
+        if not ops:
+            return text
+
+        candidate = text
+        applied: list[tuple[str, str]] = []
+        for old, new in ops[:8]:
+            if old not in candidate:
+                continue
+            if not any((glossary_bad_regex(e.get("bad", "")) or re.compile(r"$^")).search(old) for e in entries):
+                continue
+            next_candidate = candidate.replace(old, new, 1)
+            if glossary_edit_preserved(text, next_candidate):
+                candidate = next_candidate
+                applied.append((old, new))
+
+        if applied:
+            return candidate
+
+        print("  Gemini глоссарий отклонён: нет безопасных точечных замен")
+        save_hard_case(
+            stage="gemini_glossary",
+            reason="unsafe_or_missing_replacement_ops",
+            original=text,
+            candidate=replacement_ops_preview(ops),
+        )
         return text
+    except Exception as e:
+        print(f"  Gemini глоссарий ошибка: {e}")
+        return text
+
+
+def style_edit_preserved(original: str, candidate: str) -> bool:
+    original_plain = html.unescape(strip_html_tags(original or "")).strip()
+    candidate_plain = html.unescape(strip_html_tags(candidate or "")).strip()
+    if not original_plain or not candidate_plain:
+        return False
+
+    if re.search(r"\[[^\]\n]{1,80}\]\(\s*https?://", candidate_plain, flags=re.I):
+        return False
+    if set(re.findall(r"https?://\S+", original_plain, flags=re.I)) != set(
+        re.findall(r"https?://\S+", candidate_plain, flags=re.I)
+    ):
+        return False
+    if numeric_facts(original_plain) != numeric_facts(candidate_plain):
+        return False
+
+    original_lines = [l for l in original_plain.splitlines() if l.strip()]
+    candidate_lines = [l for l in candidate_plain.splitlines() if l.strip()]
+    if len(candidate_lines) > len(original_lines) + 2:
+        return False
+    if len(candidate_lines) < max(1, len(original_lines) - 2):
+        return False
+
+    length_ratio = len(candidate_plain) / max(1, len(original_plain))
+    if length_ratio < 0.70 or length_ratio > 1.25:
+        return False
+
+    original_names = proper_name_phrases(original_plain)
+    candidate_names = proper_name_phrases(candidate_plain)
+    if candidate_names - original_names:
+        return False
+
+    original_glossary_names = glossary_name_mentions(original_plain)
+    candidate_glossary_names = glossary_name_mentions(candidate_plain)
+    if not original_glossary_names <= candidate_glossary_names:
+        return False
+    if candidate_glossary_names - original_glossary_names:
+        return False
+
+    original_tokens = news_tokens(original_plain)
+    candidate_tokens = news_tokens(candidate_plain)
+    if not original_tokens or not candidate_tokens:
+        return True
+
+    common = len(original_tokens & candidate_tokens)
+    min_size = min(len(original_tokens), len(candidate_tokens))
+    required_overlap = 0.45 if min_size <= 8 else 0.58
+    original_overlap = common / max(1, len(original_tokens))
+    candidate_overlap = common / max(1, len(candidate_tokens))
+    return original_overlap >= required_overlap and candidate_overlap >= required_overlap
+
+
+def edit_style_gemini(text: str) -> str:
+    """Литературная редактура русского текста без новых смыслов.
+
+    Как и глоссарий, принимает только список локальных replacements. Модель не
+    получает права вернуть новый пост целиком.
+    """
+    if (
+        not text
+        or not STYLE_EDIT_ENABLED
+        or not GEMINI_API_KEY
+        or not STYLE_EDIT_MODEL
+        or len(text) > STYLE_EDIT_MAX_CHARS
+    ):
+        return text
+
+    prompt = (
+        "Ты аккуратный русскоязычный редактор спортивного Telegram-канала.\n"
+        "Нужно сделать текст естественным по-русски, но НЕЛЬЗЯ менять смысл.\n\n"
+        "Строгие запреты:\n"
+        "1) Не добавляй факты, вопросы, ответы, цитаты, имена, клубы, источники и числа.\n"
+        "2) Не заменяй имена и термины, уже исправленные по глоссарию; можно менять только их падеж.\n"
+        "3) Не переписывай пост целиком и не меняй порядок абзацев.\n"
+        "4) Не используй HTML, Markdown, ссылки или пояснения.\n\n"
+        "Разрешены только короткие локальные замены неестественных фрагментов: "
+        "падежи, согласование, порядок слов, пробелы, пунктуация, капитализация.\n"
+        "Примеры допустимого типа правки: «новый 10-й» → «новая «десятка»», "
+        "«В возрасте Кендри Паэс уже» → «В свои годы Кендри Паэс уже».\n\n"
+        "Верни строго JSON без Markdown:\n"
+        "{\"replacements\":[{\"from\":\"точный фрагмент из исходного текста\",\"to\":\"естественный вариант\"}]}\n"
+        "Если текст уже нормальный или для улучшения нужен новый смысл, верни {\"replacements\":[]}.\n\n"
+        "ТЕКСТ:\n"
+        f"{text}"
+    )
+    try:
+        content = gemini_text_completion(
+            prompt,
+            max_tokens=900,
+            timeout=STYLE_EDIT_TIMEOUT,
+            model=STYLE_EDIT_MODEL,
+        )
+        ops = parse_replacement_ops(content)
+        if not ops:
+            return text
+
+        candidate = text
+        applied: list[tuple[str, str]] = []
+        replaced_chars = 0
+        max_replaced_chars = max(140, int(len(text) * 0.45))
+
+        for old, new in ops[:6]:
+            if old not in candidate:
+                continue
+            if "\n\n\n" in new or re.search(r"https?://", new, flags=re.I):
+                continue
+            if len(new) > len(old) + max(45, int(len(old) * 0.35)):
+                continue
+            if len(new) < max(1, int(len(old) * 0.55)):
+                continue
+            if replaced_chars + len(old) > max_replaced_chars:
+                continue
+
+            next_candidate = candidate.replace(old, new, 1)
+            next_candidate = apply_local_translation_fixes(next_candidate)
+            if style_edit_preserved(text, next_candidate):
+                candidate = next_candidate
+                applied.append((old, new))
+                replaced_chars += len(old)
+
+        if applied and candidate != text:
+            print("  Gemini редактура текста поправлена")
+            return candidate
+
+        if ops:
+            print("  Gemini редактура текста отклонена: нет безопасных точечных замен")
+            save_hard_case(
+                stage="gemini_style",
+                reason="unsafe_or_missing_replacement_ops",
+                original=text,
+                candidate=replacement_ops_preview(ops),
+            )
+        return text
+    except Exception as e:
+        print(f"  Gemini редактура текста ошибка: {e}")
+        return text
+
+
+def edit_translation_text(text: str) -> str:
+    text = apply_local_translation_fixes(text)
+    glossary_checked = edit_gemini(text)
+    glossary_checked = apply_local_translation_fixes(glossary_checked)
+    styled = edit_style_gemini(glossary_checked)
+    return apply_local_translation_fixes(styled)
+
+
+# Обратная совместимость: старое имя функции → двухэтапная редактура.
+edit_openrouter = edit_translation_text
 
 
 def telegram_html_tags_balanced(text: str) -> bool:
@@ -2210,7 +3017,7 @@ def content_preserved(original: str, candidate: str) -> bool:
         return False
 
     length_ratio = len(candidate_plain) / max(1, len(original_plain))
-    if length_ratio < 0.72 or length_ratio > 1.35:
+    if length_ratio < 0.72 or length_ratio > 1.20:
         return False
 
     original_tokens = news_tokens(original_plain)
@@ -2220,8 +3027,10 @@ def content_preserved(original: str, candidate: str) -> bool:
     if not candidate_tokens:
         return False
 
-    overlap = len(original_tokens & candidate_tokens) / max(1, len(original_tokens))
-    return overlap >= 0.72
+    common = len(original_tokens & candidate_tokens)
+    original_overlap = common / max(1, len(original_tokens))
+    candidate_overlap = common / max(1, len(candidate_tokens))
+    return original_overlap >= 0.72 and candidate_overlap >= 0.86
 
 
 def protected_formatting_preserved(original: str, candidate: str) -> bool:
@@ -2416,7 +3225,11 @@ def gemini_layout_text(prompt: str) -> str:
 
 
 def ai_check_telegram_layout(full_text: str) -> str:
-    locally_repaired = local_layout_repair(normalize_posting_text(full_text))
+    # Сохраняем оригинал до любых изменений — используется как fallback
+    # если и local_layout_repair, и все AI-проверки провалились.
+    original_text = normalize_posting_text(full_text)
+
+    locally_repaired = local_layout_repair(original_text)
     locally_repaired = normalize_posting_text(locally_repaired)
     rag_candidate = rag_check_telegram_layout(locally_repaired)
     if rag_candidate != locally_repaired:
@@ -2424,14 +3237,16 @@ def ai_check_telegram_layout(full_text: str) -> str:
 
     if not GEMINI_API_KEY or not LAYOUT_AI_MODEL:
         print("  Gemini-проверка верстки пропущена: GEMINI_API_KEY не задан")
-        return normalize_posting_text(locally_repaired)
+        return locally_repaired
     if len(locally_repaired) > LAYOUT_AI_MAX_CHARS:
         print("  Gemini-проверка верстки пропущена: текст слишком длинный")
-        return normalize_posting_text(locally_repaired)
+        return locally_repaired
 
     prompt = (
-        "Поправь форматирование для телеграм канала, не меняй сам текст можно менять "
-        "только форматирование абзацев, строк и расположения эмоджи. Выводи только "
+        "Поправь форматирование для телеграм канала. Нельзя добавлять новые слова, "
+        "новые факты, ответы, вопросы или цитаты. Можно менять только форматирование "
+        "абзацев, строк и расположения эмоджи. Если для исправления нужно придумать "
+        "содержимое — верни исходный текст. Выводи только "
         "сам отформатированный текст, без вспомогательных слов вроде "
         "\"вот отличный вариант\":\n\n"
         "Текст будет отправлен в Telegram parse_mode=HTML.\n"
@@ -2473,7 +3288,7 @@ def ai_check_telegram_layout(full_text: str) -> str:
         candidate = normalize_posting_text(candidate)
 
         if not candidate:
-            return normalize_posting_text(locally_repaired)
+            return locally_repaired
         if not telegram_html_tags_balanced(candidate):
             print("  Gemini-верстка отклонена: HTML-теги не сбалансированы")
             save_hard_case(
@@ -2482,7 +3297,7 @@ def ai_check_telegram_layout(full_text: str) -> str:
                 original=locally_repaired,
                 candidate=candidate,
             )
-            return normalize_posting_text(locally_repaired)
+            return locally_repaired
         if not protected_formatting_preserved(locally_repaired, candidate):
             print("  Gemini-верстка отклонена: удалены обязательные quote/переносы")
             save_hard_case(
@@ -2491,7 +3306,13 @@ def ai_check_telegram_layout(full_text: str) -> str:
                 original=locally_repaired,
                 candidate=candidate,
             )
-            return normalize_posting_text(locally_repaired)
+            # Если local_layout_repair добавил лишние blockquote (ложный спикер),
+            # а Gemini их правильно убрала — не откатываемся к locally_repaired,
+            # а откатываемся к оригиналу до local_layout_repair.
+            if "<blockquote>" in locally_repaired and "<blockquote>" not in original_text:
+                print("  Откат к оригиналу (local_layout_repair добавил лишние blockquote)")
+                return original_text
+            return locally_repaired
         if not content_preserved(locally_repaired, candidate):
             print("  Gemini-верстка отклонена: текст изменился слишком сильно")
             save_hard_case(
@@ -2500,7 +3321,7 @@ def ai_check_telegram_layout(full_text: str) -> str:
                 original=locally_repaired,
                 candidate=candidate,
             )
-            return normalize_posting_text(locally_repaired)
+            return locally_repaired
         # Double-check: if local repair has interview answers (blockquotes) but Gemini removed them — revert.
         if "<blockquote>" in locally_repaired and "<blockquote>" not in candidate:
             print("  Gemini-верстка отклонена: потеряно blockquote после спикера")
@@ -2510,22 +3331,32 @@ def ai_check_telegram_layout(full_text: str) -> str:
                 original=locally_repaired,
                 candidate=candidate,
             )
-            return normalize_posting_text(locally_repaired)
+            return locally_repaired
         if candidate != locally_repaired:
             print("  Gemini-верстка поправлена")
+            # Сохраняем пару bad→good в кандидаты для ревью.
+            # locally_repaired — текст до Gemini (bad), candidate — после (good).
+            # Тег определяем автоматически по структуре текста.
+            _save_layout_candidate(bad=locally_repaired, good=candidate, source="gemini")
         else:
             print("  Gemini-верстка проверена")
         return candidate
     except Exception as e:
         print(f"  Gemini-проверка верстки недоступна: {e}")
-        return normalize_posting_text(locally_repaired)
+        # При полном провале Gemini возвращаем locally_repaired.
+        # Если local_layout_repair добавил лишние blockquote (ложный спикер),
+        # откатываемся к оригиналу до local_layout_repair.
+        if "<blockquote>" in locally_repaired and "<blockquote>" not in original_text:
+            print("  Откат к оригиналу (local_layout_repair добавил лишние blockquote)")
+            return original_text
+        return locally_repaired
 
 
 def rag_check_telegram_layout(text: str) -> str:
     if not FORMAT_RAG_ENABLED:
         return text
-    if not OPENROUTER_KEY:
-        print("  RAG-проверка верстки пропущена: OPENROUTER_KEY не задан")
+    if not GEMINI_API_KEY:
+        print("  RAG-проверка верстки пропущена: GEMINI_API_KEY не задан")
         return text
 
     examples = load_examples()
@@ -2535,7 +3366,36 @@ def rag_check_telegram_layout(text: str) -> str:
 
     selected = select_similar_examples(text, examples)
     prompt = build_layout_prompt(text, selected)
-    result = call_openrouter_layout_checker(prompt, OPENROUTER_KEY, FORMAT_RAG_MODEL)
+
+    # Вызов через Gemini с responseMimeType для гарантированного JSON
+    result = None
+    try:
+        r = requests.post(
+            f"{GEMINI_BASE_URL}/models/{LAYOUT_AI_MODEL}:generateContent",
+            params={"key": GEMINI_API_KEY},
+            headers={"Content-Type": "application/json"},
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0,
+                    "maxOutputTokens": 1400,
+                    "responseMimeType": "application/json",
+                },
+            },
+            timeout=LAYOUT_AI_TIMEOUT,
+        )
+        r.raise_for_status()
+        parts = r.json()["candidates"][0]["content"].get("parts", [])
+        content = "\n".join(p.get("text", "") for p in parts).strip()
+        result = parse_checker_json(content)
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "?"
+        print(f"  RAG-проверка верстки недоступна: HTTP {status} от Gemini")
+        return text
+    except Exception as e:
+        print(f"  RAG-проверка верстки недоступна: {e}")
+        return text
+
     if not result:
         print("  RAG-проверка верстки недоступна: неверный ответ модели")
         save_hard_case(
@@ -2558,39 +3418,120 @@ def rag_check_telegram_layout(text: str) -> str:
             candidate=fixed_raw,
         )
         return text
-    if not telegram_html_tags_balanced(fixed_text):
-        print("  RAG-верстка отклонена: HTML-теги не сбалансированы")
+
+    def _log_rag_rejection(reason_label: str, reason_key: str) -> None:
+        """Логирует отклонение RAG с diff'ом и сохраняет в hard_cases."""
+        print(f"  RAG-верстка отклонена: {reason_label}")
+        _log_layout_diff(original=text, candidate=fixed_text, label="RAG")
         save_hard_case(
             stage="rag_layout",
-            reason="unbalanced_html_tags",
+            reason=reason_key,
             original=text,
             candidate=fixed_text,
         )
+
+    if not telegram_html_tags_balanced(fixed_text):
+        _log_rag_rejection("HTML-теги не сбалансированы", "unbalanced_html_tags")
         return text
     if not protected_formatting_preserved(text, fixed_text):
-        print("  RAG-верстка отклонена: удалены обязательные quote/переносы")
-        save_hard_case(
-            stage="rag_layout",
-            reason="protected_formatting_lost",
-            original=text,
-            candidate=fixed_text,
-        )
+        _log_rag_rejection("удалены обязательные quote/переносы", "protected_formatting_lost")
         return text
     if not content_preserved(text, fixed_text):
-        print("  RAG-верстка отклонена: текст изменился слишком сильно")
-        save_hard_case(
-            stage="rag_layout",
-            reason="content_changed_too_much",
-            original=text,
-            candidate=fixed_text,
-        )
+        _log_rag_rejection("текст изменился слишком сильно", "content_changed_too_much")
         return text
 
     if fixed_text != text:
         print(f"  RAG-верстка поправлена (примеров: {len(selected)})")
+        _save_layout_candidate(bad=text, good=fixed_text, source="rag")
     else:
         print(f"  RAG-верстка проверена (примеров: {len(selected)})")
     return fixed_text
+
+
+def _log_layout_diff(original: str, candidate: str, label: str = "RAG") -> None:
+    """
+    Выводит построчный diff между оригиналом и кандидатом прямо в лог.
+    Показывает только изменившиеся строки — не более DIFF_MAX_LINES строк контекста.
+    Формат: «- » удалено / «+ » добавлено — легко читается в GitHub Actions.
+    """
+    DIFF_MAX_LINES = 30  # защита от огромных диффов в логе
+    orig_lines = original.splitlines()
+    cand_lines = candidate.splitlines()
+
+    # Простой построчный diff без внешних библиотек
+    changes: list[str] = []
+    max_len = max(len(orig_lines), len(cand_lines))
+    for i in range(max_len):
+        o = orig_lines[i] if i < len(orig_lines) else None
+        c = cand_lines[i] if i < len(cand_lines) else None
+        if o == c:
+            continue
+        if o is not None and c is None:
+            changes.append(f"  - {o!r}")
+        elif o is None and c is not None:
+            changes.append(f"  + {c!r}")
+        else:
+            changes.append(f"  - {o!r}")
+            changes.append(f"  + {c!r}")
+
+    if not changes:
+        return
+
+    print(f"  [{label}-diff] изменения ({min(len(changes), DIFF_MAX_LINES)} из {len(changes)} строк):")
+    for line in changes[:DIFF_MAX_LINES]:
+        print(f"  {line}")
+    if len(changes) > DIFF_MAX_LINES:
+        print(f"  ... и ещё {len(changes) - DIFF_MAX_LINES} строк")
+
+
+def _auto_tag_layout(text: str) -> str:
+    """
+    Определяет тег для кандидата по структурным признакам текста.
+    Используется при автосохранении — чтобы кандидаты сразу были размечены.
+    """
+    import re
+    # interview_qa проверяем первым — ❓ более специфичен, чем 🎙
+    if re.search(r"❓", text):
+        return "interview_qa"
+    if re.search(r"[🎙🗣]", text):
+        return "speaker_quote"
+    if re.search(r"[✅☑️•·]\s", text) or re.search(r"^\d+[.)]\s", text, re.M):
+        return "stats_list"
+    if re.search(r"\d:\s*\n\s*\d", text):
+        return "linebreakes"
+    if re.search(r"<b>.*?</b>", text, re.S) and re.search(r"\n{3,}", text):
+        return "extralinebreakes"
+    if re.search(r"[🚨❗]{2,}", text):
+        return "extraemoji"
+    if re.search(r"#\w+.*#\w+", text):
+        return "extrahashtags"
+    if re.search(r"\[[\w\s@.-]{2,30}\]", text):
+        return "source_brackets"
+    return "linebreakes"
+
+
+def _save_layout_candidate(bad: str, good: str, source: str = "gemini") -> None:
+    """
+    Сохраняет успешное исправление верстки в candidates.jsonl для ревью.
+
+    Не пишет напрямую в examples.jsonl — сначала нужен ручной approve
+    через review_candidates.py. Это защищает выборку от ошибок модели.
+    """
+    tag = _auto_tag_layout(bad)
+    added = save_candidate(bad=bad, good=good, source=source, tag=tag)
+    if added:
+        pending = pending_count()
+        print(f"  [candidates] сохранён кандидат (тег: {tag}, в очереди: {pending})")
+        if pending >= 20:
+            print("  [candidates] ⚠️  накопилось 20+ кандидатов — запустите review_candidates.py")
+
+
+def _save_rag_example(bad: str, good: str, tag: str = "auto") -> None:
+    """
+    Устаревшая функция — теперь делегирует в _save_layout_candidate.
+    Оставлена для обратной совместимости если где-то вызывается напрямую.
+    """
+    _save_layout_candidate(bad=bad, good=good, source="rag")
 
 
 # ════════════════════════════════════════════════════════════
@@ -2599,11 +3540,7 @@ def rag_check_telegram_layout(text: str) -> str:
 
 def log_tg_error(method: str, res: dict):
     if not res.get("ok"):
-        desc = res.get('description', '')
-        print(f"  Telegram ошибка {method}: {desc} | {res}")
-        # Алерт только при реальных сбоях, а не при безобидных предупреждениях
-        if res.get("error_code") not in (None,) and res.get("error_code", 0) >= 400:
-            alert(f"Telegram API ошибка {method} [{res.get('error_code')}]: {desc}")
+        print(f"  Telegram ошибка {method}: {res.get('description')} | {res}")
 
 
 def tg(method: str, payload: dict) -> dict:
@@ -2618,24 +3555,24 @@ def tg(method: str, payload: dict) -> dict:
         return res
     except Exception as e:
         print(f"  Telegram request ошибка {method}: {e}")
-        alert(f"Telegram request ошибка {method}: {e}")
         return {"ok": False, "description": str(e)}
-
 
 def _send_telegram_alert(text: str):
     """Отправляет служебное сообщение в ALERT_CHANNEL_ID (или CHANNEL_ID как fallback).
 
-    Формат: «BOT_NAME: описание проблемы».
+    Формат: «BOT_NAME: описание проблемы + SIGNATURE».
     Используется только для критических ошибок, требующих ручного вмешательства.
     """
     target = ALERT_CHANNEL_ID or CHANNEL_ID
     if not target:
         return
-    message = f"{BOT_NAME}: {text}"
+    # Извлекаем plain-text подпись из SIGNATURE (убираем HTML-теги для служебного канала)
+    sig_plain = re.sub(r"<[^>]+>", "", SIGNATURE).strip()
+    message = f"{BOT_NAME}: {text}\n{sig_plain}" if sig_plain else f"{BOT_NAME}: {text}"
     try:
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": target, "text": message},
+            json={"chat_id": target, "text": message, "parse_mode": "HTML"},
             timeout=15,
         )
     except Exception as e:
@@ -2646,7 +3583,6 @@ def alert(description: str):
     """Сокращённый alias для _send_telegram_alert. Использовать везде в коде."""
     print(f"  [ALERT] {description}")
     _send_telegram_alert(description)
-
 
 def split_caption(full_text: str, has_media: bool) -> tuple:
     limit = CAPTION_LIMIT if has_media else MSG_LIMIT
@@ -2743,13 +3679,11 @@ def post_to_vk(full_text: str) -> bool:
         res = r.json()
         if "error" in res:
             print(f"  VK ошибка wall.post: {res['error']}")
-            alert(f"VK ошибка wall.post: {res['error']}")
             return False
         print(f"  VK опубликовано: {res.get('response')}")
         return True
     except Exception as e:
         print(f"  VK request ошибка: {e}")
-        alert(f"VK request ошибка: {e}")
         return False
 
 
@@ -2787,7 +3721,6 @@ def post_to_max(full_text: str) -> bool:
                 res = {"status_code": r.status_code, "text": r.text[:500]}
             if r.status_code >= 400:
                 print(f"  MAX ошибка messages: {res}")
-                alert(f"MAX ошибка messages [{r.status_code}]: {str(res)[:200]}")
                 ok = False
                 break
             print(f"  MAX опубликовано: часть {i + 1}/{len(parts)}")
@@ -2795,7 +3728,6 @@ def post_to_max(full_text: str) -> bool:
                 time.sleep(1)
         except Exception as e:
             print(f"  MAX request ошибка: {e}")
-            alert(f"MAX request ошибка: {e}")
             ok = False
             break
     return ok
@@ -2861,6 +3793,97 @@ def download_media(url: str, media_type: str, index: int) -> Path | None:
         return None
 
 
+VIDEO_SIZE_LIMIT = 40 * 1024 * 1024  # 40 MB — Telegram bot API limit
+
+
+def compress_video(path: Path) -> Path:
+    """Сжимает видео если оно больше VIDEO_SIZE_LIMIT.
+    Возвращает путь к сжатому файлу (или исходный если ffmpeg недоступен / файл уже маленький).
+    """
+    try:
+        size = path.stat().st_size
+    except Exception:
+        return path
+
+    if size <= VIDEO_SIZE_LIMIT:
+        return path
+
+    import shutil as _shutil
+    if not _shutil.which("ffmpeg"):
+        print(f"  ffmpeg не найден — видео {size // (1024*1024)} MB не сжато, пропуск")
+        return path
+
+    out_path = path.with_suffix(".compressed.mp4")
+    size_mb = size / (1024 * 1024)
+    print(f"  Видео {size_mb:.1f} MB > 40 MB — сжимаем...")
+
+    # Целевой битрейт: вписать в 38 MB за длину видео
+    # Сначала узнаём длительность через ffprobe
+    duration = None
+    try:
+        import subprocess
+        probe = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True, text=True, timeout=15,
+        )
+        duration = float(probe.stdout.strip())
+    except Exception:
+        pass
+
+    try:
+        import subprocess
+        if duration and duration > 0:
+            # Целевой размер 38 MB в битах, минус ~128kbps аудио
+            target_bits = 38 * 1024 * 1024 * 8
+            audio_bits = 128 * 1024 * duration
+            video_bits = max(target_bits - audio_bits, 200 * 1024 * duration)
+            video_bitrate = int(video_bits / duration)
+            cmd = [
+                "ffmpeg", "-y", "-i", str(path),
+                "-c:v", "libx264", "-b:v", str(video_bitrate),
+                "-maxrate", str(int(video_bitrate * 1.5)),
+                "-bufsize", str(video_bitrate * 2),
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
+                "-vf", "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease",
+                str(out_path),
+            ]
+        else:
+            # Без длительности — просто понижаем разрешение и качество
+            cmd = [
+                "ffmpeg", "-y", "-i", str(path),
+                "-c:v", "libx264", "-crf", "28", "-preset", "fast",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
+                "-vf", "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease",
+                str(out_path),
+            ]
+        result = subprocess.run(cmd, capture_output=True, timeout=120)
+        if result.returncode == 0 and out_path.exists():
+            new_size = out_path.stat().st_size
+            if new_size <= VIDEO_SIZE_LIMIT:
+                path.unlink(missing_ok=True)
+                print(f"  Видео сжато: {new_size // (1024*1024)} MB")
+                return out_path
+            else:
+                print(f"  Сжатие не помогло ({new_size // (1024*1024)} MB) — пропускаем")
+                out_path.unlink(missing_ok=True)
+                return path
+        else:
+            print(f"  ffmpeg ошибка (код {result.returncode})")
+            out_path.unlink(missing_ok=True)
+            return path
+    except Exception as e:
+        print(f"  Ошибка сжатия видео: {e}")
+        out_path.unlink(missing_ok=True)
+        return path
+
+
 def send_single_media(downloaded: dict, caption: str) -> bool:
     method = "sendVideo" if downloaded["type"] == "video" else "sendPhoto"
     field = "video" if downloaded["type"] == "video" else "photo"
@@ -2881,7 +3904,6 @@ def send_single_media(downloaded: dict, caption: str) -> bool:
         return res.get("ok", False)
     except Exception as e:
         print(f"  Telegram upload ошибка {method}: {e}")
-        alert(f"Telegram upload ошибка {method}: {e}")
         return False
 
 
@@ -2911,7 +3933,6 @@ def send_media_group(downloaded: list, caption: str) -> bool:
 
     except Exception as e:
         print(f"  Медиагруппа upload ошибка: {e}")
-        alert(f"Медиагруппа upload ошибка: {e}")
         return False
 
     finally:
@@ -2944,6 +3965,26 @@ def send_to_telegram(
 
     if not downloaded:
         print("  Все медиа недоступны — пост не отправляем")
+        shutil.rmtree(MEDIA_DIR, ignore_errors=True)
+        return None
+
+    # Сжимаем видео больше 40 MB
+    for item in downloaded:
+        if item["type"] == "video":
+            item["path"] = compress_video(item["path"])
+
+    # Пропускаем видео которые после сжатия всё ещё > 40 MB
+    oversized = [
+        item for item in downloaded
+        if item["type"] == "video" and item["path"].stat().st_size > VIDEO_SIZE_LIMIT
+    ]
+    if oversized:
+        for item in oversized:
+            print(f"  Видео {item['path'].name} слишком большое после сжатия — пропуск")
+            item["path"].unlink(missing_ok=True)
+        downloaded = [item for item in downloaded if item not in oversized]
+    if not downloaded:
+        print("  Все медиа недоступны после фильтрации — пост не отправляем")
         shutil.rmtree(MEDIA_DIR, ignore_errors=True)
         return None
 
@@ -3055,6 +4096,88 @@ def scweet_result_items(tweets) -> list:
             return values
         return [tweets]
     return list(tweets)
+
+
+TWITTER_SNOWFLAKE_EPOCH_MS = 1288834974657
+
+
+def twitter_snowflake_datetime(post_id: str) -> datetime | None:
+    try:
+        numeric_id = int(str(post_id or "").strip())
+    except (TypeError, ValueError):
+        return None
+    if numeric_id <= 0:
+        return None
+    timestamp_ms = (numeric_id >> 22) + TWITTER_SNOWFLAKE_EPOCH_MS
+    try:
+        return datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def twitter_item_datetime(item: dict) -> datetime | None:
+    if not isinstance(item, dict):
+        return None
+    parsed_date = parse_datetime_utc(item.get("pub_date", ""))
+    if parsed_date:
+        return parsed_date
+    return twitter_snowflake_datetime(item.get("post_id", ""))
+
+
+def twitter_item_sort_key(item: dict) -> tuple:
+    item_dt = twitter_item_datetime(item)
+    timestamp = item_dt.timestamp() if item_dt else 0
+    try:
+        numeric_id = int(str(item.get("post_id") or "0"))
+    except (TypeError, ValueError):
+        numeric_id = 0
+    return (timestamp, numeric_id)
+
+
+def sort_twitter_items_newest_first(items: list) -> list:
+    return sorted(items or [], key=twitter_item_sort_key, reverse=True)
+
+
+def twitter_merge_key(item: dict) -> str:
+    post_id = str(item.get("post_id") or "").strip()
+    if post_id:
+        return f"id:{post_id}"
+
+    post_url = str(item.get("post_url") or "").strip()
+    ids = twitter_status_ids_from_text(post_url)
+    if ids:
+        return f"id:{sorted(ids)[0]}"
+
+    normalized_url = canonical_url(post_url)
+    if normalized_url:
+        return f"url:{normalized_url}"
+
+    media_key = media_fingerprint(item.get("media_items") or [])
+    if media_key:
+        return f"media:{media_key}"
+
+    return short_hash(str(item))
+
+
+def merge_twitter_results(*groups: list) -> list:
+    seen = set()
+    merged = []
+    for group in groups:
+        for item in group or []:
+            key = twitter_merge_key(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+    return sort_twitter_items_newest_first(merged)
+
+
+def twitter_newest_age_hours(items: list) -> float | None:
+    dates = [twitter_item_datetime(item) for item in items or []]
+    dates = [dt for dt in dates if dt]
+    if not dates:
+        return None
+    return (datetime.now(timezone.utc) - max(dates)).total_seconds() / 3600
 
 
 def is_probable_twitter_media_url(url: str) -> bool:
@@ -3418,7 +4541,119 @@ def fetch_scweet_tweets(
         })
 
     print(f"  Scweet: получено {len(items)} твитов, с медиа: {len(results)}")
+    results = sort_twitter_items_newest_first(results)
+    if results:
+        newest = twitter_item_datetime(results[0])
+        if newest:
+            print(f"  Scweet: самый свежий твит {newest:%Y-%m-%d %H:%M} UTC")
     return results
+
+
+def normalize_twitter_post_url(url: str, post_id: str = "") -> str:
+    url = normalize_scweet_tweet_url(url, post_id)
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return url
+
+    host = (parsed.netloc or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if "nitter." in host or host in {"twitter.com", "x.com"}:
+        return urlunparse(("https", "x.com", parsed.path, "", "", ""))
+    return url
+
+
+def nitter_item_text(account: str, item: dict) -> str:
+    title = html.unescape(str(item.get("title") or "")).strip()
+    content = html.unescape(str(item.get("content_text") or "")).strip()
+    text = title or content
+    account_re = re.escape(account.lstrip("@"))
+    patterns = (
+        rf"^\s*@?{account_re}\s*:\s*",
+        rf"^\s*[^:]+?\(\s*@?{account_re}\s*\)\s*:\s*",
+        rf"^\s*{account_re}\s+on\s+(?:X|Twitter)\s*:\s*",
+    )
+    for pattern in patterns:
+        text = re.sub(pattern, "", text, flags=re.I)
+    text = re.sub(r"\s+(?:/|-)\s*Nitter\s*$", "", text, flags=re.I)
+    return text.strip() or content
+
+
+def fetch_nitter_account_tweets(account: str, limit: int = 20) -> list:
+    account = normalize_twitter_account(account)
+    if not account:
+        return []
+
+    rss_url = nitter_rss_url(account)
+    if not rss_url:
+        print(f"  Nitter @{account}: RSS недоступен")
+        return []
+
+    items = fetch_rss_items(rss_url)
+    results = []
+    for item in items[:limit]:
+        post_url = normalize_twitter_post_url(item.get("url") or item.get("id"), "")
+        ids = twitter_status_ids_from_text(post_url or str(item.get("id") or ""))
+        post_id = sorted(ids)[0] if ids else ""
+        if post_id and not post_url:
+            post_url = normalize_twitter_post_url("", post_id)
+
+        raw = nitter_item_text(account, item)
+        pub_date = str(item.get("date_published") or "")
+        if not raw:
+            continue
+
+        repost_reason = scweet_repost_reference_reason({}, raw, post_id)
+        if repost_reason:
+            print(f"  Nitter @{account}: репост/ссылка — пропуск ({repost_reason})")
+            continue
+
+        media_items = extract_media_from_feed_item(item, rss_url)
+        if not media_items and post_url:
+            media_items = extract_media_from_nitter_page(post_url)
+        if not media_items:
+            continue
+
+        results.append(
+            {
+                "post_id": post_id,
+                "post_url": post_url,
+                "author": account,
+                "raw": raw,
+                "pub_date": pub_date,
+                "media_items": media_items,
+            }
+        )
+
+    results = sort_twitter_items_newest_first(results)
+    print(f"  Nitter @{account}: получено {len(items)} RSS items, с медиа: {len(results)}")
+    return results
+
+
+def fetch_nitter_accounts_tweets(accounts: list, limit: int = 20) -> list:
+    results = []
+    for account in accounts or []:
+        results.extend(fetch_nitter_account_tweets(account, limit=limit))
+    return sort_twitter_items_newest_first(results)
+
+
+def step3_should_use_nitter_fallback(scweet_tweets: list) -> bool:
+    if not STEP3_NITTER_FALLBACK:
+        return False
+    newest_age = twitter_newest_age_hours(scweet_tweets)
+    if newest_age is None:
+        print("  Scweet не дал датированных твитов — включаем Nitter fallback")
+        return True
+    if newest_age > STEP3_NITTER_STALE_HOURS:
+        print(
+            "  Scweet выглядит устаревшим "
+            f"(самый свежий твит {newest_age:.1f} ч назад) — включаем Nitter fallback"
+        )
+        return True
+    return False
 
 
 def step1_twitter_keywords(published: set) -> set:
@@ -3458,7 +4693,7 @@ def step1_twitter_keywords(published: set) -> set:
         if not raw:
             continue
 
-        dup = find_duplicate(published, post_id=post_id, url=post_url, text=raw, media_items=media_items)
+        dup = find_duplicate(published, post_id=post_id, url=post_url, text=raw, source=source_label, media_items=media_items)
         if dup:
             print(f"  Дубль ({dup[:80]}) — пропуск")
             continue
@@ -3473,7 +4708,7 @@ def step1_twitter_keywords(published: set) -> set:
         print(f"  Публикуем ({len(media_items)} медиа): {post_id[:80]}")
         ok = send_to_telegram(media_items, full_text)
         if ok:
-            mark_published(published, post_id=post_id, url=post_url, text=raw, media_items=media_items)
+            mark_published(published, post_id=post_id, url=post_url, text=raw, source=source_label, media_items=media_items)
             save_published(published)
             record_source_news(raw, step=1, source=source_label, post_id=post_id, url=post_url)
             new_count += 1
@@ -3481,16 +4716,16 @@ def step1_twitter_keywords(published: set) -> set:
     print(f"\n  Итого опубликовано: {new_count}")
     return published
 def step2_instagram(published: set) -> set:
-    print("\n══════ ШАГ 2: Instagram (self-hosted) ══════")
-    if not IG_COOKIES_JSON:
-        print("  IG_COOKIES_JSON не задан — пропускаем")
+    print("\n══════ ШАГ 2: Instagram ══════")
+    if not APIFY_TOKEN:
+        print("  APIFY_TOKEN не задан — пропускаем")
         return published
-    if not IG_INSTAGRAM_ACCOUNTS:
+    if not APIFY_INSTAGRAM_ACCOUNTS and not APIFY_INSTAGRAM_INPUT_JSON:
         print("  STEP2_INSTAGRAM_ACCOUNTS не задан — пропускаем")
         return published
 
     posts = fetch_instagram_posts()
-    print(f"  Получено постов: {len(posts)}")
+    print(f"  Получено Apify posts: {len(posts)}")
     new_count = 0
 
     if not posts:
@@ -3502,6 +4737,7 @@ def step2_instagram(published: set) -> set:
         post_url = post.get("url") or ""
         if not post_url and post.get("shortCode"):
             post_url = f"https://www.instagram.com/p/{post['shortCode']}/"
+        source_label = hashtag_post_owner(post) or "instagram-apify"
         ig_keys = instagram_extra_duplicate_keys(post)
         if not post_id:
             print("  Пост без id/url — пропуск")
@@ -3524,26 +4760,43 @@ def step2_instagram(published: set) -> set:
 
         raw_caption = clean_text(instagram_caption_from_apify_post(post))
 
-        dup = find_duplicate(published, post_id=post_id, url=post_url, text=raw_caption, media_items=media_items, extra_keys=ig_keys)
+        dup = find_duplicate(
+            published,
+            post_id=post_id,
+            url=post_url,
+            text=raw_caption,
+            source=source_label,
+            media_items=media_items,
+            extra_keys=ig_keys,
+        )
         if dup:
             print(f"  Дубль ({dup[:80]}) — пропуск")
             continue
 
-        if raw_caption and is_semantic_duplicate(raw_caption, source="instagram-apify", post_id=post_id, url=post_url):
+        if raw_caption and is_semantic_duplicate(raw_caption, source=source_label, post_id=post_id, url=post_url):
             continue
 
         if raw_caption:
             translated = translate_deepl(raw_caption)
-            full_text = make_instagram_telegram_html(translated)
+            edited = edit_openrouter(translated)
+            full_text = make_instagram_telegram_html(edited)
         else:
             full_text = make_instagram_telegram_html("")
 
         print(f"  Публикуем ({len(media_items)} медиа): {post_id}")
         ok = send_to_telegram(media_items, full_text)
         if ok:
-            mark_published(published, post_id=post_id, url=post_url, text=raw_caption, media_items=media_items, extra_keys=ig_keys)
+            mark_published(
+                published,
+                post_id=post_id,
+                url=post_url,
+                text=raw_caption,
+                source=source_label,
+                media_items=media_items,
+                extra_keys=ig_keys,
+            )
             save_published(published)
-            record_source_news(raw_caption, step=2, source="instagram-apify", post_id=post_id, url=post_url)
+            record_source_news(raw_caption, step=2, source=source_label, post_id=post_id, url=post_url)
             new_count += 1
 
     print(f"\n  Итого опубликовано: {new_count}")
@@ -3559,12 +4812,20 @@ def step3_twitter_accounts(published: set) -> set:
 
     new_count = 0
 
+    scan_limit = max(STEP3_LIMIT, STEP3_SCAN_LIMIT)
+
     # Забираем свежие посты сразу по всем аккаунтам одним запросом
     tweets = fetch_scweet_tweets(
         keywords=[],           # без фильтра по словам — все посты аккаунтов
         from_accounts=STEP3_ACCOUNTS,
-        limit=STEP3_LIMIT,
+        limit=scan_limit,
     )
+    if step3_should_use_nitter_fallback(tweets):
+        fallback_tweets = fetch_nitter_accounts_tweets(STEP3_ACCOUNTS, limit=scan_limit)
+        if fallback_tweets:
+            before_merge = len(tweets)
+            tweets = merge_twitter_results(tweets, fallback_tweets)
+            print(f"  Step 3 merge: Scweet {before_merge} + Nitter {len(fallback_tweets)} => {len(tweets)}")
 
     for tw in tweets:
         post_id     = tw["post_id"]
@@ -3587,7 +4848,7 @@ def step3_twitter_accounts(published: set) -> set:
         if not raw:
             continue
 
-        dup = find_duplicate(published, post_id=post_id, url=post_url, text=raw, media_items=media_items)
+        dup = find_duplicate(published, post_id=post_id, url=post_url, text=raw, source=f"@{source}", media_items=media_items)
         if dup:
             print(f"  Дубль ({dup[:80]}) — пропуск")
             continue
@@ -3602,7 +4863,7 @@ def step3_twitter_accounts(published: set) -> set:
         print(f"  Публикуем ({len(media_items)} медиа): {post_id[:80]}")
         ok = send_to_telegram(media_items, full_text)
         if ok:
-            mark_published(published, post_id=post_id, url=post_url, text=raw, media_items=media_items)
+            mark_published(published, post_id=post_id, url=post_url, text=raw, source=f"@{source}", media_items=media_items)
             save_published(published)
             record_source_news(raw, step=3, source=f"@{source}", post_id=post_id, url=post_url)
             new_count += 1
@@ -3666,30 +4927,57 @@ def flatten_hashtag_posts(data) -> list:
 
 
 def fetch_hashtag_posts(hashtag: str) -> list:
-    """Получает посты по хэштегу через self-hosted Instagram scraper."""
-    session = _ig_session()
-    if session is None:
+    """Получает посты по хэштегу через apify~instagram-hashtag-scraper."""
+    if not APIFY_TOKEN:
         return []
 
-    only_newer_than = datetime.now(timezone.utc) - timedelta(hours=IG_HASHTAG_ONLY_NEWER_THAN_HOURS)
+    actor_input = {
+        "hashtags": [hashtag],
+        "resultsLimit": APIFY_HASHTAG_RESULTS_LIMIT,
+    }
+    if APIFY_HASHTAG_ONLY_NEWER_THAN:
+        actor_input["onlyPostsNewerThan"] = APIFY_HASHTAG_ONLY_NEWER_THAN
+
+    url = f"{APIFY_BASE_URL}/acts/{APIFY_HASHTAG_ACTOR}/run-sync-get-dataset-items"
+    params = {
+        "format": "json",
+        "clean": "1",
+        "timeout": str(APIFY_RUN_TIMEOUT),
+    }
+    if APIFY_MAX_TOTAL_CHARGE_USD:
+        params["maxTotalChargeUsd"] = APIFY_MAX_TOTAL_CHARGE_USD
+
     try:
-        posts = _ig.fetch_hashtag_posts(
-            hashtag,
-            session,
-            max_posts=IG_HASHTAG_RESULTS_LIMIT,
-            only_newer_than=only_newer_than,
-            on_auth_error=lambda code: alert(f"IG сессия недействительна ({code}). Обновите IG_COOKIES_JSON в GitHub Secrets."),
+        r = requests.post(
+            url,
+            params=params,
+            json=actor_input,
+            headers={
+                **REQUEST_HEADERS,
+                "Authorization": f"Bearer {APIFY_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            timeout=APIFY_RUN_TIMEOUT + 45,
         )
-        return posts
+        r.raise_for_status()
+        data = r.json()
+        posts = flatten_hashtag_posts(data)
+        if posts:
+            return posts
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return data.get("items", []) or data.get("data", {}).get("items", [])
+        return []
     except Exception as e:
-        print(f"  IG scraper hashtag ошибка (#{hashtag}): {e}")
+        print(f"  Apify hashtag ошибка (#{hashtag}): {e}")
         return []
 
 
 def hashtag_post_owner(post: dict) -> str:
-    """Извлекает username автора поста из ответа self-hosted Instagram scraper.
+    """Извлекает username автора поста из ответа Apify hashtag-scraper.
 
-    Поле может называться по-разному в зависимости от источника.
+    Поле может называться по-разному в зависимости от версии актора.
     Возвращает lowercase username без '@', или '' если не найден.
     """
     candidates = [
@@ -3745,9 +5033,9 @@ def make_hashtag_telegram_html(caption: str, hashtag: str) -> str:
 
 
 def step4_instagram_hashtags(published: set) -> set:
-    print("\n══════ ШАГ 4: Instagram Hashtags (self-hosted) ══════")
-    if not IG_COOKIES_JSON:
-        print("  IG_COOKIES_JSON не задан — пропускаем")
+    print("\n══════ ШАГ 4: Instagram Hashtags ══════")
+    if not APIFY_TOKEN:
+        print("  APIFY_TOKEN не задан — пропускаем")
         return published
     if not STEP4_HASHTAGS:
         print("  STEP4_HASHTAGS не задан — пропускаем")
@@ -3766,7 +5054,7 @@ def step4_instagram_hashtags(published: set) -> set:
             print("  Новых постов нет")
             continue
 
-        for post in posts[:IG_HASHTAG_RESULTS_LIMIT]:
+        for post in posts[:APIFY_HASHTAG_RESULTS_LIMIT]:
             if not is_allowed_account(post):
                 owner = hashtag_post_owner(post)
                 if owner:
@@ -3783,6 +5071,8 @@ def step4_instagram_hashtags(published: set) -> set:
                 print("  Пост без id/url — пропуск")
                 continue
 
+            owner = hashtag_post_owner(post)
+            source_label = f"@{owner}" if owner else f"ig-hashtag-#{hashtag}"
             ig_keys = instagram_extra_duplicate_keys(post)
             dup = find_duplicate(published, post_id=post_id, url=post_url, extra_keys=ig_keys)
             if dup:
@@ -3800,23 +5090,40 @@ def step4_instagram_hashtags(published: set) -> set:
                 continue
 
             raw_caption = clean_text(instagram_caption_from_apify_post(post))
-            dup = find_duplicate(published, post_id=post_id, url=post_url, text=raw_caption, media_items=media_items, extra_keys=ig_keys)
+            dup = find_duplicate(
+                published,
+                post_id=post_id,
+                url=post_url,
+                text=raw_caption,
+                source=source_label,
+                media_items=media_items,
+                extra_keys=ig_keys,
+            )
             if dup:
                 print(f"  Дубль ({dup[:80]}) — пропуск")
                 continue
 
-            if raw_caption and is_semantic_duplicate(raw_caption, source=f"ig-hashtag-#{hashtag}", post_id=post_id, url=post_url):
+            if raw_caption and is_semantic_duplicate(raw_caption, source=source_label, post_id=post_id, url=post_url):
                 continue
 
             translated = translate_deepl(raw_caption) if raw_caption else ""
-            full_text = ai_check_telegram_layout(make_hashtag_telegram_html(translated, hashtag))
+            edited = edit_openrouter(translated) if translated else ""
+            full_text = ai_check_telegram_layout(make_hashtag_telegram_html(edited, hashtag))
 
             print(f"  Публикуем ({len(media_items)} медиа): {post_id[:80]}")
             ok = send_to_telegram(media_items, full_text, step4_custom_sig=True)
             if ok:
-                mark_published(published, post_id=post_id, url=post_url, text=raw_caption, media_items=media_items, extra_keys=ig_keys)
+                mark_published(
+                    published,
+                    post_id=post_id,
+                    url=post_url,
+                    text=raw_caption,
+                    source=source_label,
+                    media_items=media_items,
+                    extra_keys=ig_keys,
+                )
                 save_published(published)
-                record_source_news(raw_caption, step=4, source=f"ig-hashtag-#{hashtag}", post_id=post_id, url=post_url)
+                record_source_news(raw_caption, step=4, source=source_label, post_id=post_id, url=post_url)
                 new_count += 1
 
     print(f"\n  Итого опубликовано: {new_count}")
