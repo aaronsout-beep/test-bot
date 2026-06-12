@@ -40,8 +40,11 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHANNEL_ID = os.environ["CHANNEL_ID"]
 BOT_NAME = os.environ.get("BOT_NAME", "NicoPazBot").strip()
 ALERT_CHANNEL_ID = os.environ.get("ALERT_CHANNEL_ID", "").strip()
-DEEPL_KEY = os.environ["DEEPL_KEY"]
+DEEPL_KEY = os.environ.get("DEEPL_KEY", "").strip()
 OPENROUTER_KEY = os.environ.get("OPENROUTER_KEY", "")
+YANDEX_API_KEY   = os.environ.get("YANDEX_API_KEY", "").strip()
+YANDEX_FOLDER_ID = os.environ.get("YANDEX_FOLDER_ID", "").strip()
+YANDEX_API_URL   = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
 OPENROUTER_MODEL = (
     os.environ.get("OPENROUTER_MODEL")
     or "meta-llama/llama-3.3-70b-instruct:free"
@@ -59,8 +62,10 @@ GEMINI_BASE_URL = os.environ.get(
 # Cross-posting after a successful Telegram post.
 VK_ACCESS_TOKEN = os.environ.get("VK_ACCESS_TOKEN", "").strip()
 VK_OWNER_ID = os.environ.get("VK_OWNER_ID", "").strip()
-VK_API_VERSION = os.environ.get("VK_API_VERSION", "5.199").strip()
+VK_DEFAULT_API_VERSION = "5.199"
+VK_API_VERSION = os.environ.get("VK_API_VERSION", "").strip() or VK_DEFAULT_API_VERSION
 VK_FROM_GROUP = os.environ.get("VK_FROM_GROUP", "1").strip()
+VK_CROSSPOST_DELAY_SECONDS = int(os.environ.get("VK_CROSSPOST_DELAY_MINUTES", "15"))
 
 MAX_TOKEN = os.environ.get("MAX_TOKEN", "").strip()
 MAX_CHAT_ID = os.environ.get("MAX_CHAT_ID", "").strip()
@@ -204,10 +209,6 @@ PUBLISHED_FILE = "published_ids.json"
 REQUIRE_PUBLISHED_CACHE = os.environ.get("REQUIRE_PUBLISHED_CACHE", "0").strip().lower() not in {
     "", "0", "false", "no", "off"
 }
-QUEUE_FILE = "queue.json"
-MAIN_POST_LIMIT = int((os.environ.get("MAIN_POST_LIMIT") or "2").strip())
-QUEUE_BATCH_SIZE = int((os.environ.get("QUEUE_BATCH_SIZE") or "2").strip())
-
 SOURCE_NEWS_FILE = "source_news_cache.json"
 SOURCE_NEWS_CACHE_DAYS = 2
 SOURCE_NEWS_CACHE_LIMIT = 500
@@ -1299,11 +1300,19 @@ def looks_like_speaker_heading(heading: str) -> bool:
 
 def render_colon_heading(heading: str) -> str:
     plain = html.unescape(strip_html_tags(heading or "")).strip()
+    if re.fullmatch(r"\d{1,2}", plain):
+        return f"{html.escape(plain, quote=False)}:"
     if "🗣" in plain or "🎙" in plain or looks_like_speaker_heading(heading):
         speaker_name = speaker_name_from_heading(heading)
         if speaker_name:
             return f"🎙️ <b>{html.escape(speaker_name, quote=False)}</b>:"
-    return f"<b>{html.escape(heading, quote=False)}</b>:"
+    if (
+        word_count(plain) <= 6
+        and not re.search(r"\d", plain)
+        and SECTION_COLON_HEADING_RE.search(plain)
+    ):
+        return f"<b>{html.escape(heading, quote=False)}</b>:"
+    return f"{html.escape(heading, quote=False)}:"
 
 
 def should_blockquote_quote(text: str, speaker_context: bool = False) -> bool:
@@ -1487,6 +1496,91 @@ def split_quoted_segments(line: str) -> list:
     return segments
 
 
+BROKEN_NUMERIC_COLON_RE = re.compile(
+    r"(\d{1,2}):\s*\n\s*(\d{1,2})(?!\d)",
+    re.MULTILINE,
+)
+BROKEN_NUMERIC_COLON_HTML_RE = re.compile(
+    r"(\d{1,2}):\s*(?:</b>)?\s*\n\s*(?:<b>)?\s*(\d{1,2})(?!\d)",
+    re.MULTILINE | re.IGNORECASE,
+)
+INLINE_LIST_MARKER_RE = re.compile(
+    r"(?<=\S)\s+(?=(?:[•·★⭐✅☑️✔]|\[\d+\]|\d+[.)])\s)",
+    re.UNICODE,
+)
+LIST_LINE_START_RE = re.compile(
+    r"^(?:[•·✅☑️✔⭐★]|\[\d+\]|\d+[.)])\s",
+    re.UNICODE,
+)
+SECTION_COLON_HEADING_RE = re.compile(
+    r"(?:в этом сезоне|итоги|статистика|результаты|возраст|игроки|тренеры|вратари)$",
+    re.I,
+)
+
+
+def is_numeric_colon_context(before: str, after: str) -> bool:
+    """True, если двоеточие — часть счёта/времени, а не заголовок секции."""
+    left = (before or "").strip()
+    right = (after or "").strip()
+    if not left:
+        return False
+    if re.fullmatch(r"\d{1,2}", left):
+        if not right:
+            return True
+        first_token = re.match(r"(\d{1,2})", right)
+        if first_token:
+            return True
+    if re.fullmatch(r"\d+", left) and re.match(r"\d+(?:\s|$|[,.])", right):
+        return True
+    if re.search(r"\d{1,2}$", left) and re.match(r"^\d{1,2}(?:\s|$|[,.])", right):
+        return True
+    return False
+
+
+def fix_broken_numeric_colons(text: str) -> str:
+    """Склеивает разорванные счёт/время вида «2:\\n1» или «19:\\n30»."""
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    prev = None
+    while prev != text:
+        prev = text
+        text = BROKEN_NUMERIC_COLON_HTML_RE.sub(r"\1:\2", text)
+        text = BROKEN_NUMERIC_COLON_RE.sub(r"\1:\2", text)
+    return text
+
+
+def _is_list_line(line: str) -> bool:
+    return bool(LIST_LINE_START_RE.match((line or "").strip()))
+
+
+def split_inline_lists(text: str) -> str:
+    """Разносит соседние пункты списка (•, ★, [20], 1)) по отдельным строкам."""
+    lines = (text or "").split("\n")
+    out: list[str] = []
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            if out and out[-1] != "":
+                out.append("")
+            continue
+        markers = len(re.findall(
+            r"(?:^|\s)(?:[•·★⭐✅☑️✔]|\[\d+\]|\d+[.)])\s",
+            line,
+        ))
+        if markers >= 2:
+            for part in INLINE_LIST_MARKER_RE.split(line):
+                part = part.strip()
+                if part:
+                    out.append(part)
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def split_inline_numbered_lists(text: str) -> str:
+    """Обратная совместимость."""
+    return split_inline_lists(text)
+
+
 def split_colon_heading(line: str) -> tuple[str, str]:
     if ":" not in line:
         return "", ""
@@ -1496,6 +1590,8 @@ def split_colon_heading(line: str) -> tuple[str, str]:
     after = after.strip()
 
     if not before:
+        return "", ""
+    if is_numeric_colon_context(before, after):
         return "", ""
     return before, after
 
@@ -1524,6 +1620,9 @@ def join_orphan_lines(text: str) -> str:
                 break
             if nxt.startswith("#"):
                 break
+            # Не склеивать соседние пункты списка.
+            if _is_list_line(line) or _is_list_line(nxt):
+                break
             # Avoid merging bullet/feature lists into neighbor sentences.
             if nxt.startswith(("✅", "☑", "✔")):
                 break
@@ -1537,6 +1636,11 @@ def join_orphan_lines(text: str) -> str:
             club_merged = merge_football_club_line(line, nxt)
             if club_merged:
                 line = club_merged
+                i += 1
+                continue
+
+            if re.search(r"\d:$", line) and re.match(r"^\d", nxt):
+                line = f"{line}{nxt}"
                 i += 1
                 continue
 
@@ -1646,6 +1750,7 @@ def ensure_hashtag_spacing(text: str) -> str:
 def preprocess_post_text(text: str) -> str:
     """Единая нормализация plain-текста до HTML и AI-верстки."""
     text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = fix_broken_numeric_colons(text)
     text = strip_unwanted_source_tags(text)
     text = strip_intro_labels(text)
     text = strip_noise_only_lines(text)
@@ -1654,6 +1759,8 @@ def preprocess_post_text(text: str) -> str:
     text = strip_extra_hashtags(text)
     text = normalize_source_brackets(text)
     text = join_orphan_lines(text)
+    text = fix_broken_numeric_colons(text)
+    text = split_inline_lists(text)
     text = merge_country_player_list_lines(text)
     text = normalize_paragraph_breaks(text)
     text = strip_intro_labels(text)
@@ -2300,6 +2407,87 @@ def translate_deepl(text: str) -> str:
         return text
 
 
+def translate_yandex(text: str) -> str:
+    """
+    Перевод через YandexGPT Pro — основной метод.
+    При недоступности Yandex API автоматически откатывается на DeepL.
+
+    YandexGPT используется вместо DeepL + edit_style_gemini:
+    перевод и стилистическая адаптация выполняются за один вызов.
+    """
+    if not text:
+        return text
+
+    if not YANDEX_API_KEY or not YANDEX_FOLDER_ID:
+        print("  YandexGPT недоступен: YANDEX_API_KEY/YANDEX_FOLDER_ID не заданы — fallback на DeepL")
+        return translate_deepl(text)
+
+    system_prompt = (
+        "Ты профессиональный переводчик футбольных новостей. "
+        "Переведи текст на русский язык. Строгие требования:\n"
+        "1. Имена игроков — транслитерация принятая в русских СМИ. "
+        "Обязательные написания (НЕЛЬЗЯ менять):\n"
+        "   Lamine Yamal → Ламин Ямаль (не «Ямал»)\n"
+        "   Vinicius / Vinícius → Винисиус (не «Виниций»)\n"
+        "   Jude Bellingham → Джуд Беллингем (не «Беллингхэм»)\n"
+        "   Marcus Rashford → Маркус Рэшфорд (не «Рашфорд»)\n"
+        "   Arda Güler → Арда Гюлер (не «Гулер»)\n"
+        "   Kenan Yıldız → Кенан Йылдыз\n"
+        "   Kendry Páez → Кендри Паэс\n"
+        "   Guillermo Mora / Gilberto Mora → Гильберто Мора\n"
+        "   Lo Celso → Ло Чельсо\n"
+        "   Héctor Fort → Эктор Форт\n"
+        "Для всех остальных имён — транслитерация по испанской/португальской/английской фонетике.\n"
+        "КРИТИЧНО: Все имена и фамилии — ТОЛЬКО с заглавной буквы. "
+        "Строчные имена НЕДОПУСТИМЫ ни при каких условиях.\n"
+        "2. Названия стран и клубов — с заглавной буквы: "
+        "España → Испания, France → Франция, Real Madrid → «Реал Мадрид», "
+        "Barcelona → «Барселона».\n"
+        "3. Первое слово каждого предложения — с заглавной буквы.\n"
+        "4. Текст должен звучать живо и естественно по-русски, "
+        "как в популярном спортивном Telegram-канале. "
+        "Без канцелярита, без дословного калькирования.\n"
+        "5. Счёт матча, время, дробные числа — всегда слитно без переноса строки: "
+        "3:1, 19:30, 0,25.\n"
+        "6. Все эмодзи оставляй на своих местах без изменений.\n"
+        "7. Верни только переведённый текст, без пояснений и комментариев."
+    )
+
+    try:
+        r = requests.post(
+            YANDEX_API_URL,
+            headers={
+                "Authorization": f"Api-Key {YANDEX_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "modelUri": f"gpt://{YANDEX_FOLDER_ID}/yandexgpt/latest",
+                "completionOptions": {
+                    "stream": False,
+                    "temperature": 0.1,
+                    "maxTokens": 2000,
+                },
+                "messages": [
+                    {"role": "system", "text": system_prompt},
+                    {"role": "user",   "text": text},
+                ],
+            },
+            timeout=30,
+        )
+        r.raise_for_status()
+        result = r.json()["result"]["alternatives"][0]["message"]["text"].strip()
+        if not result:
+            raise ValueError("Пустой ответ от YandexGPT")
+        return result
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "?"
+        print(f"  YandexGPT перевод HTTP {status}: {e} — fallback на DeepL")
+        return translate_deepl(text)
+    except Exception as e:
+        print(f"  YandexGPT перевод ошибка: {e} — fallback на DeepL")
+        return translate_deepl(text)
+
+
 def parse_gemini_editor_response(content: str) -> str:
     content = (content or "").strip()
     content = re.sub(r"^```(?:text)?\s*", "", content, flags=re.I)
@@ -2800,20 +2988,32 @@ def edit_style_gemini(text: str) -> str:
         return text
 
     prompt = (
-        "Ты аккуратный русскоязычный редактор спортивного Telegram-канала.\n"
-        "Нужно сделать текст естественным по-русски, но НЕЛЬЗЯ менять смысл.\n\n"
+        "Ты аккуратный русскоязычный редактор футбольного Telegram-канала.\n"
+        "Нужно отредактировать текст, чтобы он звучал естественно по-русски, но НЕЛЬЗЯ менять смысл.\n\n"
+        
         "Строгие запреты:\n"
         "1) Не добавляй факты, вопросы, ответы, цитаты, имена, клубы, источники и числа.\n"
-        "2) Не заменяй имена и термины, уже исправленные по глоссарию; можно менять только их падеж.\n"
+        "2) Не заменяй имена и термины на другие, но ОБЯЗАТЕЛЬНО исправляй их склонение по правилам русского языка.\n"
         "3) Не переписывай пост целиком и не меняй порядок абзацев.\n"
         "4) Не используй HTML, Markdown, ссылки или пояснения.\n\n"
+        
+        "Обязательно исправляй:\n"
+        "- Заглавную букву в начале предложений\n"
+        "- Склонение имён после предлогов (например: «у», «с», «для»)\n"
+        "- Очевидные грамматические ошибки, даже если они связаны с именами\n\n"
+        
         "Разрешены только короткие локальные замены неестественных фрагментов: "
         "падежи, согласование, порядок слов, пробелы, пунктуация, капитализация.\n"
+        "Можно исправлять фрагменты внутри предложения, если это необходимо для грамотности.\n\n"
+        
         "Примеры допустимого типа правки: «новый 10-й» → «новая «десятка»», "
-        "«В возрасте Кендри Паэс уже» → «В свои годы Кендри Паэс уже».\n\n"
+        "«В возрасте Кендри Паэс уже» → «В свои годы Кендри Паэс уже», "
+        "«у Кендри Паэс» → «У Кендри Паэса».\n\n"
+        
         "Верни строго JSON без Markdown:\n"
         "{\"replacements\":[{\"from\":\"точный фрагмент из исходного текста\",\"to\":\"естественный вариант\"}]}\n"
         "Если текст уже нормальный или для улучшения нужен новый смысл, верни {\"replacements\":[]}.\n\n"
+        
         "ТЕКСТ:\n"
         f"{text}"
     )
@@ -2871,14 +3071,17 @@ def edit_style_gemini(text: str) -> str:
 
 
 def edit_translation_text(text: str) -> str:
+    """
+    Постобработка после перевода DeepL.
+    Цепочка: локальные замены → edit_gemini (глоссарий) → edit_style_gemini (стиль) → локальные замены.
+    """
     text = apply_local_translation_fixes(text)
     glossary_checked = edit_gemini(text)
-    glossary_checked = apply_local_translation_fixes(glossary_checked)
-    styled = edit_style_gemini(glossary_checked)
-    return apply_local_translation_fixes(styled)
+    style_checked = edit_style_gemini(glossary_checked)
+    return apply_local_translation_fixes(style_checked)
 
 
-# Обратная совместимость: старое имя функции → двухэтапная редактура.
+# Обратная совместимость: старое имя функции.
 edit_openrouter = edit_translation_text
 
 
@@ -3005,7 +3208,8 @@ def plain_layout_text(text: str) -> str:
     text = re.sub(r"</(?:p|blockquote)\s*>", "\n", text, flags=re.I)
     text = strip_html_tags(text)
     text = html.unescape(text)
-    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
@@ -3041,8 +3245,14 @@ def protected_formatting_preserved(original: str, candidate: str) -> bool:
     original_headings = []
     for match in re.finditer(r"<b>(.*?)</b>:\s*\n", original or "", flags=re.I | re.S):
         heading = plain_layout_text(match.group(1))
-        if heading:
-            original_headings.append(heading)
+        if not heading:
+            continue
+        # Не защищать разорванное время/счёт и произвольные не-спикерские заголовки.
+        if re.search(r"\d{1,2}$", heading.strip()):
+            continue
+        if not looks_like_speaker_heading(heading):
+            continue
+        original_headings.append(heading)
 
     for heading in original_headings:
         pattern = (
@@ -3056,7 +3266,114 @@ def protected_formatting_preserved(original: str, candidate: str) -> bool:
     return True
 
 
-def local_layout_repair(text: str) -> str:
+def _apply_safe_plain_repairs(text: str) -> str:
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    lines_input = text.splitlines()
+    merged_lines: list[str] = []
+    i = 0
+    while i < len(lines_input):
+        line = lines_input[i].strip()
+        # Склеиваем строку «• текст» со следующей строкой «✅» если она одиночная галочка
+        if (
+            line
+            and re.match(r"^[•·]\s+\S", line)
+            and i + 1 < len(lines_input)
+            and lines_input[i + 1].strip() in {"✅", "☑️", "✔"}
+        ):
+            merged_lines.append(line + " " + lines_input[i + 1].strip())
+            i += 2
+            continue
+        merged_lines.append(lines_input[i])
+        i += 1
+
+    repaired: list[str] = []
+    for raw_line in merged_lines:
+        line = raw_line.strip()
+        if not line:
+            if repaired and repaired[-1] != "":
+                repaired.append("")
+            continue
+        line = re.sub(r"^[.·]\s+(?=[^\w\s]|$)", "", line, flags=re.UNICODE)
+        parts = []
+        if "✅" in line:
+            positions = [m.start() for m in re.finditer("✅", line)]
+            if len(positions) > 1 or (len(positions) == 1 and positions[0] > 0):
+                if positions and positions[0] > 0:
+                    head = line[: positions[0]].strip()
+                    if head:
+                        parts.append(head)
+                for idx, pos in enumerate(positions):
+                    end = positions[idx + 1] if idx + 1 < len(positions) else len(line)
+                    seg = line[pos:end].strip()
+                    if seg:
+                        parts.append(seg)
+        if not parts:
+            parts = [line]
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            if looks_like_country_player_item(part):
+                left, _, right = re.split(r"(—|–)", part, maxsplit=1)
+                player = extract_quote_text(right)
+                if player:
+                    repaired.append(f"{left.strip()} — {player}")
+                    continue
+            repaired.append(part)
+
+    return ensure_hashtag_spacing(normalize_angle_quotes("\n".join(repaired).strip()))
+
+
+def safe_plain_layout_fixes(text: str) -> str:
+    """Безопасные правки plain-текста — без HTML-тегов."""
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = fix_broken_numeric_colons(text)
+    text = strip_html_tags(text)
+    text = preprocess_post_text(text)
+    return _apply_safe_plain_repairs(text)
+
+
+def _layout_structurally_broken(text: str) -> bool:
+    """True, если в тексте остались типичные структурные баги верстки."""
+    return bool(
+        re.search(
+            r"\d{1,2}:\s*(?:</b>)?\s*\n\s*(?:<b>)?\s*\d",
+            text or "",
+            flags=re.I,
+        )
+        or re.search(r"(?<=\S)\s+[•·★⭐✅☑️✔]\s", text or "")
+        or re.search(r"(?<=\S)\s+(?:\[\d+\]|\d+[.)])\s", text or "")
+    )
+
+
+def safe_html_layout_fixes(text: str) -> str:
+    """Безопасные правки с сохранением разрешённых HTML-тегов."""
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = fix_broken_numeric_colons(text)
+    if re.search(r"<(?:b|blockquote)\b", text, flags=re.I):
+        text = sanitize_telegram_layout_html(text)
+        if not telegram_html_tags_balanced(text):
+            return safe_plain_layout_fixes(text)
+        text = normalize_posting_text(text)
+        text = fix_broken_numeric_colons(text)
+        text = re.sub(r"[ \t]+\n", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return ensure_hashtag_spacing(text.strip())
+    return safe_plain_layout_fixes(text)
+
+
+def safe_layout_fixes(text: str) -> str:
+    """Обратная совместимость: plain-правки без HTML."""
+    return safe_plain_layout_fixes(text)
+
+
+def local_layout_repair(text: str, *, conservative: bool = False) -> str:
+    if conservative:
+        return safe_layout_fixes(text)
+
     text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
     plain = strip_html_tags(text)
     plain = preprocess_post_text(plain)
@@ -3152,10 +3469,13 @@ def local_layout_repair(text: str) -> str:
                 and not re.search(r"https?://", line_part)
             ):
                 heading, body = split_colon_heading(strip_html_tags(line_part))
-                if heading:
+                if heading and (
+                    looks_like_speaker_heading(heading)
+                    or "🎙" in heading
+                    or "🗣" in heading
+                ):
                     rendered_heading = render_colon_heading(heading)
                     repaired.append(rendered_heading)
-                    # Start blockquote for speaker answer when the heading is alone.
                     if not body and looks_like_speaker_heading(heading):
                         speaker_answer_mode = True
                         speaker_answer_buf = []
@@ -3227,19 +3547,25 @@ def ai_check_telegram_layout(full_text: str) -> str:
     # Сохраняем оригинал до любых изменений — используется как fallback
     # если и local_layout_repair, и все AI-проверки провалились.
     original_text = normalize_posting_text(full_text)
+    original_text = safe_plain_layout_fixes(original_text)
 
     locally_repaired = local_layout_repair(original_text)
     locally_repaired = normalize_posting_text(locally_repaired)
+    pre_rag_text = locally_repaired
     rag_candidate = rag_check_telegram_layout(locally_repaired)
-    if rag_candidate != locally_repaired:
+    rag_changed = rag_candidate != pre_rag_text
+    if rag_changed:
         locally_repaired = normalize_posting_text(rag_candidate)
 
     if not GEMINI_API_KEY or not LAYOUT_AI_MODEL:
         print("  Gemini-проверка верстки пропущена: GEMINI_API_KEY не задан")
-        return locally_repaired
+        return safe_html_layout_fixes(locally_repaired)
     if len(locally_repaired) > LAYOUT_AI_MAX_CHARS:
         print("  Gemini-проверка верстки пропущена: текст слишком длинный")
-        return locally_repaired
+        return safe_html_layout_fixes(locally_repaired)
+    if rag_changed and not _layout_structurally_broken(locally_repaired):
+        print("  Gemini-проверка верстки пропущена: RAG уже поправил верстку")
+        return safe_html_layout_fixes(locally_repaired)
 
     prompt = (
         "Поправь форматирование для телеграм канала. Нельзя добавлять новые слова, "
@@ -3274,6 +3600,8 @@ def ai_check_telegram_layout(full_text: str) -> str:
         "Хэштег подписи не трогать.\n"
         "11) Удалять вводные метки в начале строки: «подтверждено:», «❗️подтверждено:», "
         "«‼️последние новости:», «последние новости:» и аналогичные — оставлять только сам текст новости.\n"
+        "12) Счёт матча или время вида «X:\nY» (цифра, двоеточие, перенос строки, цифра) — "
+        "всегда склеивать в «X:Y» без переноса. Пример: «2:\n1» → «2:1», «19:\n30» → «19:30».\n"
         "Разрешенные HTML-теги: <b>, </b>, <blockquote>, </blockquote>. "
         "Не используй Markdown, ссылки и другие теги.\n\n"
         f"ТЕКСТ:\n{locally_repaired}"
@@ -3283,11 +3611,10 @@ def ai_check_telegram_layout(full_text: str) -> str:
         content = gemini_layout_text(prompt)
         candidate_raw = parse_layout_ai_response(content)
         candidate = sanitize_telegram_layout_html(candidate_raw)
-        candidate = local_layout_repair(candidate)
         candidate = normalize_posting_text(candidate)
 
         if not candidate:
-            return locally_repaired
+            return safe_html_layout_fixes(locally_repaired)
         if not telegram_html_tags_balanced(candidate):
             print("  Gemini-верстка отклонена: HTML-теги не сбалансированы")
             save_hard_case(
@@ -3296,7 +3623,7 @@ def ai_check_telegram_layout(full_text: str) -> str:
                 original=locally_repaired,
                 candidate=candidate,
             )
-            return locally_repaired
+            return safe_html_layout_fixes(locally_repaired)
         if not protected_formatting_preserved(locally_repaired, candidate):
             print("  Gemini-верстка отклонена: удалены обязательные quote/переносы")
             save_hard_case(
@@ -3310,8 +3637,8 @@ def ai_check_telegram_layout(full_text: str) -> str:
             # а откатываемся к оригиналу до local_layout_repair.
             if "<blockquote>" in locally_repaired and "<blockquote>" not in original_text:
                 print("  Откат к оригиналу (local_layout_repair добавил лишние blockquote)")
-                return original_text
-            return locally_repaired
+                return safe_html_layout_fixes(original_text)
+            return safe_html_layout_fixes(locally_repaired)
         if not content_preserved(locally_repaired, candidate):
             print("  Gemini-верстка отклонена: текст изменился слишком сильно")
             save_hard_case(
@@ -3320,7 +3647,7 @@ def ai_check_telegram_layout(full_text: str) -> str:
                 original=locally_repaired,
                 candidate=candidate,
             )
-            return locally_repaired
+            return safe_html_layout_fixes(locally_repaired)
         # Double-check: if local repair has interview answers (blockquotes) but Gemini removed them — revert.
         if "<blockquote>" in locally_repaired and "<blockquote>" not in candidate:
             print("  Gemini-верстка отклонена: потеряно blockquote после спикера")
@@ -3330,7 +3657,7 @@ def ai_check_telegram_layout(full_text: str) -> str:
                 original=locally_repaired,
                 candidate=candidate,
             )
-            return locally_repaired
+            return safe_html_layout_fixes(locally_repaired)
         if candidate != locally_repaired:
             print("  Gemini-верстка поправлена")
             # Сохраняем пару bad→good в кандидаты для ревью.
@@ -3339,7 +3666,7 @@ def ai_check_telegram_layout(full_text: str) -> str:
             _save_layout_candidate(bad=locally_repaired, good=candidate, source="gemini")
         else:
             print("  Gemini-верстка проверена")
-        return candidate
+        return safe_html_layout_fixes(candidate)
     except Exception as e:
         print(f"  Gemini-проверка верстки недоступна: {e}")
         # При полном провале Gemini возвращаем locally_repaired.
@@ -3347,8 +3674,8 @@ def ai_check_telegram_layout(full_text: str) -> str:
         # откатываемся к оригиналу до local_layout_repair.
         if "<blockquote>" in locally_repaired and "<blockquote>" not in original_text:
             print("  Откат к оригиналу (local_layout_repair добавил лишние blockquote)")
-            return original_text
-        return locally_repaired
+            return safe_html_layout_fixes(original_text)
+        return safe_html_layout_fixes(locally_repaired)
 
 
 def rag_check_telegram_layout(text: str) -> str:
@@ -3360,7 +3687,7 @@ def rag_check_telegram_layout(text: str) -> str:
 
     examples = load_examples()
     if not examples:
-        print("  RAG-проверка верстки пропущена: нет примеров в format_model/examples.jsonl")
+        print("  RAG-проверка верстки пропущена: нет примеров в examples.jsonl")
         return text
 
     selected = select_similar_examples(text, examples)
@@ -3407,8 +3734,8 @@ def rag_check_telegram_layout(text: str) -> str:
 
     fixed_raw = result.get("fixed_text", "")
     fixed_text = sanitize_telegram_layout_html(fixed_raw)
-    fixed_text = local_layout_repair(fixed_text)
     fixed_text = normalize_posting_text(fixed_text)
+    fixed_text = safe_html_layout_fixes(fixed_text)
     if not fixed_text:
         save_hard_case(
             stage="rag_layout",
@@ -3494,6 +3821,10 @@ def _auto_tag_layout(text: str) -> str:
         return "interview_qa"
     if re.search(r"[🎙🗣]", text):
         return "speaker_quote"
+    if re.search(r"\d:\s*\n\s*\d", text):
+        return "broken_score"
+    if re.search(r"(?:^|\s)\[\d+\]", text, re.M):
+        return "numbered_list"
     if re.search(r"[✅☑️•·]\s", text) or re.search(r"^\d+[.)]\s", text, re.M):
         return "stats_list"
     if re.search(r"\d:\s*\n\s*\d", text):
@@ -3619,24 +3950,49 @@ def split_caption(full_text: str, has_media: bool) -> tuple:
 
 
 def plain_text_for_crosspost(full_text: str) -> str:
+    """
+    Подготовка текста для кросс-поста (ВК, MAX).
+    Удаляет Telegram-подпись целиком и гарантированно добавляет
+    только SIGNATURE_HASHTAG в конец один раз.
+    """
     text = full_text or ""
-    text = re.sub(
-        r"\n\n#NicoPaz\s*\|\s*<a\s+href=[\"'][^\"']+[\"']>Follow us</a>\s*$",
-        CROSSPOST_SIGNATURE,
-        text,
-        flags=re.I,
-    )
-    text = text.replace(SIGNATURE, CROSSPOST_SIGNATURE)
-    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
-    text = re.sub(r"</p\s*>", "\n", text, flags=re.I)
-    text = strip_html_tags(text)
-    text = html.unescape(text)
-    text = text.replace("Follow us", "")
-    text = re.sub(r"[ \t]+\n", "\n", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
 
+    # 1) Убираем полную телеграм-подпись, если она есть в конце текста
+    if SIGNATURE and text.rstrip().endswith(SIGNATURE.strip()):
+        text = text[: text.rstrip().rfind(SIGNATURE.strip())].rstrip()
 
+    # 2) Запасная замена, если подпись приехала в слегка другом виде
+    if _SIG_HASHTAG:
+        text = re.sub(
+            r"\n?\n?#" + re.escape(_SIG_HASHTAG) + r"\s*\|\s*.*$",
+            "",
+            text,
+            flags=re.I | re.S,
+        )
+        text = re.sub(
+            r"\n?\n?#" + re.escape(_SIG_HASHTAG) + r"\s*$",
+            "",
+            text,
+            flags=re.I | re.S,
+        )
+
+    # 3) Чистим хвосты и лишние пробелы
+    text = re.sub(r"\s+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+
+    # 4) Гарантированно добавляем только один хэштег в конец
+    signature_tag = f"#{_SIG_HASHTAG}" if _SIG_HASHTAG else "#NicoPaz"
+    lines = [line.rstrip() for line in text.splitlines()]
+    lines = [line for line in lines if line.strip()]
+
+    while lines and lines[-1].strip() == signature_tag:
+        lines.pop()
+
+    if lines:
+        lines.append("")
+    lines.append(signature_tag)
+
+    return "\n".join(lines).strip()
 def split_text(text: str, limit: int) -> list:
     text = text.strip()
     if not text:
@@ -3656,7 +4012,8 @@ def split_text(text: str, limit: int) -> list:
 
 
 def post_to_vk(full_text: str) -> bool:
-    if not VK_ACCESS_TOKEN or not VK_OWNER_ID:
+    if not VK_ACCESS_TOKEN or not VK_OWNER_ID or not VK_API_VERSION:
+        print(" VK пропущен: не заданы VK_ACCESS_TOKEN / VK_OWNER_ID / VK_API_VERSION")
         return False
 
     text = plain_text_for_crosspost(full_text)
@@ -3732,6 +4089,18 @@ def post_to_max(full_text: str) -> bool:
     return ok
 
 
+def text_contains_signature_hashtag(text: str) -> bool:
+    """
+    Проверяет наличие #SIGNATURE_HASHTAG в тексте поста.
+    Если SIGNATURE_HASHTAG не задан — фильтр отключён.
+    """
+    if not _SIG_HASHTAG:
+        return True
+
+    plain = strip_html_tags(html.unescape(text or ""))
+    return bool(re.search(r"(?<!\w)#" + re.escape(_SIG_HASHTAG) + r"(?!\w)", plain, flags=re.I))
+
+
 def crosspost_after_telegram(full_text: str):
     vk_enabled = bool(VK_ACCESS_TOKEN and VK_OWNER_ID)
     max_enabled = bool(MAX_TOKEN and (MAX_CHAT_ID or MAX_USER_ID))
@@ -3739,11 +4108,20 @@ def crosspost_after_telegram(full_text: str):
     if not vk_enabled and not max_enabled:
         return
 
+    crosspost_text = plain_text_for_crosspost(full_text)
+
+    if not text_contains_signature_hashtag(crosspost_text):
+        tag = f"#{_SIG_HASHTAG}" if _SIG_HASHTAG else "SIGNATURE_HASHTAG"
+        print(f"  Кросспостинг пропущен: {tag} не найден в тексте поста.")
+        return
+
     print("  Кросспостинг после Telegram...")
     if vk_enabled:
-        post_to_vk(full_text)
+        print(f"  Задержка перед ВК: {VK_CROSSPOST_DELAY_SECONDS} сек...")
+        time.sleep(VK_CROSSPOST_DELAY_SECONDS)
+        post_to_vk(crosspost_text)
     if max_enabled:
-        post_to_max(full_text)
+        post_to_max(crosspost_text)
 
 
 def media_extension(media_type: str, content_type: str, url: str) -> str:
@@ -3943,6 +4321,7 @@ def send_to_telegram(
     media_items: list,
     full_text: str,
     step4_custom_sig: bool = False,
+    content_prefix: str = "",
 ):
     """Отправить пост в Telegram.
 
@@ -3992,6 +4371,15 @@ def send_to_telegram(
         final_text = full_text
     else:
         final_text = ai_check_telegram_layout(full_text)
+
+    prefix = (content_prefix or "").strip()
+    if prefix:
+        prefix_html = html.escape(prefix.replace("@", "-"), quote=False)
+        if final_text:
+            final_text = f"<b>{prefix_html}</b>\n{final_text}"
+        else:
+            final_text = f"<b>{prefix_html}</b>"
+
     caption, overflow = split_caption(final_text, True)
 
     sent_ok = True
@@ -4655,157 +5043,6 @@ def step3_should_use_nitter_fallback(scweet_tweets: list) -> bool:
     return False
 
 
-def load_queue() -> list:
-    """Загрузить очередь из queue.json. Возвращает список dict."""
-    path = Path(QUEUE_FILE)
-    if not path.exists():
-        return []
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, list) else []
-    except Exception as e:
-        print(f"  Не удалось прочитать {QUEUE_FILE}: {e}")
-        return []
-
-
-def save_queue(queue: list):
-    """Сохранить очередь в queue.json."""
-    with open(QUEUE_FILE, "w", encoding="utf-8") as f:
-        json.dump(queue, f, ensure_ascii=False, indent=2)
-
-
-def enqueue_post(
-    published: set,
-    *,
-    step: int,
-    post_id: str = "",
-    post_url: str = "",
-    raw_text: str = "",
-    translated: str = "",
-    edited: str = "",
-    full_text: str = "",
-    media_items: list | None = None,
-    source: str = "",
-    extra_keys: list | set | None = None,
-    step4_custom_sig: bool = False,
-):
-    """
-    Добавить пост в очередь и сразу пометить его как «уже отработан» в published.
-    Если full_text передан — шаг 5 применит только финальную проверку верстки.
-    Если не передан — шаг 5 заново прогонит полный pipeline.
-    """
-    mark_published(
-        published,
-        post_id=post_id,
-        url=post_url,
-        text=raw_text,
-        source=source,
-        media_items=media_items or [],
-        extra_keys=extra_keys,
-    )
-    save_published(published)
-
-    entry = {
-        "queued_at": datetime.now(timezone.utc).isoformat(),
-        "step": step,
-        "post_id": post_id,
-        "post_url": post_url,
-        "source": source,
-        "raw_text": raw_text,
-        "translated": translated,
-        "edited": edited,
-        "full_text": full_text,
-        "media_items": media_items or [],
-        "extra_keys": list(extra_keys or []),
-        "step4_custom_sig": step4_custom_sig,
-    }
-    queue = load_queue()
-    queue.append(entry)
-    save_queue(queue)
-    print(f"  → Пост добавлен в очередь (в очереди: {len(queue)}): {post_id[:60] or post_url[:60]}")
-
-
-def step5_publish_queue(published: set) -> set:
-    """
-    Шаг 5 — запускается планировщиком каждые 30 минут.
-    Публикует до QUEUE_BATCH_SIZE постов из очереди.
-    """
-    print("\n══════ ШАГ 5: Публикация из очереди ══════")
-
-    queue = load_queue()
-    if not queue:
-        print("  Очередь пуста — нечего публиковать")
-        return published
-
-    print(f"  Постов в очереди: {len(queue)}")
-
-    batch     = queue[:QUEUE_BATCH_SIZE]
-    remaining = queue[QUEUE_BATCH_SIZE:]
-
-    published_count = 0
-    failed_entries  = []
-
-    for entry in batch:
-        post_id     = entry.get("post_id", "")
-        post_url    = entry.get("post_url", "")
-        raw_text    = entry.get("raw_text", "")
-        translated  = entry.get("translated", "")
-        edited_text = entry.get("edited", "")
-        full_text   = entry.get("full_text", "")
-        media_items = entry.get("media_items", [])
-        source      = entry.get("source", "")
-        extra_keys  = set(entry.get("extra_keys", []))
-        step_num    = entry.get("step", 0)
-        step4_sig   = entry.get("step4_custom_sig", False)
-
-        print(f"\n  Публикуем из очереди: {post_id[:60] or post_url[:60]}")
-
-        if not full_text:
-            if not translated and raw_text:
-                translated = translate_deepl(raw_text)
-            if not edited_text and translated:
-                edited_text = edit_openrouter(translated)
-            text_for_html = edited_text or translated or raw_text
-            if step_num == 2:
-                full_text = make_instagram_telegram_html(text_for_html)
-            elif step_num == 4:
-                full_text = make_telegram_html(text_for_html, bold_first_line=False)
-                step4_sig = False
-            else:
-                full_text = make_telegram_html(text_for_html, bold_first_line=False)
-
-        if not step4_sig:
-            full_text = ai_check_telegram_layout(full_text)
-
-        print(f"  Отправка ({len(media_items)} медиа): {post_id[:60]}")
-        ok = send_to_telegram(media_items, full_text, step4_custom_sig=step4_sig)
-
-        if ok:
-            mark_published(
-                published,
-                post_id=post_id,
-                url=post_url,
-                text=raw_text,
-                source=source,
-                media_items=media_items,
-                extra_keys=extra_keys,
-            )
-            save_published(published)
-            if raw_text:
-                record_source_news(raw_text, step=step_num, source=source, post_id=post_id, url=post_url)
-            published_count += 1
-        elif ok is False:
-            print("  Временная ошибка Telegram — возвращаем пост в очередь")
-            failed_entries.append(entry)
-        else:
-            print("  Медиа недоступны — пост удалён из очереди без публикации")
-
-    save_queue(failed_entries + remaining)
-    print(f"\n  Итого опубликовано: {published_count}, осталось в очереди: {len(failed_entries + remaining)}")
-    return published
-
-
 def step1_twitter_keywords(published: set) -> set:
     print("\n══════ ШАГ 1: Twitter по ключевым словам (Scweet) ══════")
     if not STEP1_KEYWORDS:
@@ -4853,30 +5090,14 @@ def step1_twitter_keywords(published: set) -> set:
 
         translated = translate_deepl(raw)
         edited = edit_openrouter(translated)
-        full_text = make_telegram_html(edited, bold_first_line=False)
 
-        if new_count < MAIN_POST_LIMIT:
-            print(f"  Публикуем ({len(media_items)} медиа): {post_id[:80]}")
-            ok = send_to_telegram(media_items, full_text)
-            if ok:
-                mark_published(published, post_id=post_id, url=post_url, text=raw, source=source_label, media_items=media_items)
-                save_published(published)
-                record_source_news(raw, step=1, source=source_label, post_id=post_id, url=post_url)
-                new_count += 1
-        else:
-            print(f"  Лимит {MAIN_POST_LIMIT} достигнут — в очередь: {post_id[:60]}")
-            enqueue_post(
-                published,
-                step=1,
-                post_id=post_id,
-                post_url=post_url,
-                raw_text=raw,
-                translated=translated,
-                edited=edited,
-                full_text=full_text,
-                media_items=media_items,
-                source=source_label,
-            )
+        print(f"  Публикуем ({len(media_items)} медиа): {post_id[:80]}")
+        ok = send_to_telegram(media_items, edited)
+        if ok:
+            mark_published(published, post_id=post_id, url=post_url, text=raw, source=source_label, media_items=media_items)
+            save_published(published)
+            record_source_news(raw, step=1, source=source_label, post_id=post_id, url=post_url)
+            new_count += 1
 
     print(f"\n  Итого опубликовано: {new_count}")
     return published
@@ -4944,41 +5165,28 @@ def step2_instagram(published: set) -> set:
         if raw_caption:
             translated = translate_deepl(raw_caption)
             edited = edit_openrouter(translated)
-            full_text = make_instagram_telegram_html(edited)
         else:
-            full_text = make_instagram_telegram_html("")
+            edited = ""
 
-        if new_count < MAIN_POST_LIMIT:
-            print(f"  Публикуем ({len(media_items)} медиа): {post_id}")
-            ok = send_to_telegram(media_items, full_text)
-            if ok:
-                mark_published(
-                    published,
-                    post_id=post_id,
-                    url=post_url,
-                    text=raw_caption,
-                    source=source_label,
-                    media_items=media_items,
-                    extra_keys=ig_keys,
-                )
-                save_published(published)
-                record_source_news(raw_caption, step=2, source=source_label, post_id=post_id, url=post_url)
-                new_count += 1
-        else:
-            print(f"  Лимит {MAIN_POST_LIMIT} достигнут — в очередь: {post_id[:60]}")
-            enqueue_post(
+        print(f"  Публикуем ({len(media_items)} медиа): {post_id}")
+        ok = send_to_telegram(
+            media_items,
+            edited,
+            content_prefix=INSTAGRAM_PREFIX,
+        )
+        if ok:
+            mark_published(
                 published,
-                step=2,
                 post_id=post_id,
-                post_url=post_url,
-                raw_text=raw_caption,
-                translated=translated,
-                edited=edited,
-                full_text=full_text,
-                media_items=media_items,
+                url=post_url,
+                text=raw_caption,
                 source=source_label,
+                media_items=media_items,
                 extra_keys=ig_keys,
             )
+            save_published(published)
+            record_source_news(raw_caption, step=2, source=source_label, post_id=post_id, url=post_url)
+            new_count += 1
 
     print(f"\n  Итого опубликовано: {new_count}")
     return published
@@ -5039,30 +5247,14 @@ def step3_twitter_accounts(published: set) -> set:
 
         translated = translate_deepl(raw)
         edited = edit_openrouter(translated)
-        full_text = make_telegram_html(edited, bold_first_line=False)
 
-        if new_count < MAIN_POST_LIMIT:
-            print(f"  Публикуем ({len(media_items)} медиа): {post_id[:80]}")
-            ok = send_to_telegram(media_items, full_text)
-            if ok:
-                mark_published(published, post_id=post_id, url=post_url, text=raw, source=f"@{source}", media_items=media_items)
-                save_published(published)
-                record_source_news(raw, step=3, source=f"@{source}", post_id=post_id, url=post_url)
-                new_count += 1
-        else:
-            print(f"  Лимит {MAIN_POST_LIMIT} достигнут — в очередь: {post_id[:60]}")
-            enqueue_post(
-                published,
-                step=3,
-                post_id=post_id,
-                post_url=post_url,
-                raw_text=raw,
-                translated=translated,
-                edited=edited,
-                full_text=full_text,
-                media_items=media_items,
-                source=f"@{source}",
-            )
+        print(f"  Публикуем ({len(media_items)} медиа): {post_id[:80]}")
+        ok = send_to_telegram(media_items, edited)
+        if ok:
+            mark_published(published, post_id=post_id, url=post_url, text=raw, source=f"@{source}", media_items=media_items)
+            save_published(published)
+            record_source_news(raw, step=3, source=f"@{source}", post_id=post_id, url=post_url)
+            new_count += 1
 
     print(f"\n  Итого опубликовано: {new_count}")
     return published
@@ -5206,7 +5398,12 @@ def is_allowed_account(post: dict) -> bool:
     return owner in STEP4_ALLOWED_ACCOUNTS
 
 
-def make_hashtag_telegram_html(caption: str, hashtag: str) -> str:
+def make_hashtag_telegram_html(
+    caption: str,
+    hashtag: str,
+    *,
+    body_html: str | None = None,
+) -> str:
     """Формирует HTML-текст поста с подписью шага 4."""
     caption = strip_html_tags(caption or "").replace("@", "-").strip()
 
@@ -5217,8 +5414,14 @@ def make_hashtag_telegram_html(caption: str, hashtag: str) -> str:
     else:
         header = f"<b>#{html.escape(hashtag, quote=False)}</b>"
 
-    if caption:
+    if body_html is not None:
+        rendered = (body_html or "").strip()
+    elif caption:
         rendered = make_telegram_html(caption, bold_first_line=False)
+    else:
+        rendered = ""
+
+    if rendered:
         body = f"{header}\n{rendered}"
     else:
         body = header
@@ -5304,46 +5507,30 @@ def step4_instagram_hashtags(published: set) -> set:
 
             translated = translate_deepl(raw_caption) if raw_caption else ""
             edited = edit_openrouter(translated) if translated else ""
-            full_text = ai_check_telegram_layout(make_hashtag_telegram_html(edited, hashtag))
+            layout_body = ai_check_telegram_layout(edited) if edited else ""
+            full_text = make_hashtag_telegram_html(edited, hashtag, body_html=layout_body)
 
-            if new_count < MAIN_POST_LIMIT:
-                print(f"  Публикуем ({len(media_items)} медиа): {post_id[:80]}")
-                ok = send_to_telegram(media_items, full_text, step4_custom_sig=True)
-                if ok:
-                    mark_published(
-                        published,
-                        post_id=post_id,
-                        url=post_url,
-                        text=raw_caption,
-                        source=source_label,
-                        media_items=media_items,
-                        extra_keys=ig_keys,
-                    )
-                    save_published(published)
-                    record_source_news(raw_caption, step=4, source=source_label, post_id=post_id, url=post_url)
-                    new_count += 1
-            else:
-                print(f"  Лимит {MAIN_POST_LIMIT} достигнут — в очередь: {post_id[:60]}")
-                enqueue_post(
+            print(f"  Публикуем ({len(media_items)} медиа): {post_id[:80]}")
+            ok = send_to_telegram(media_items, full_text, step4_custom_sig=True)
+            if ok:
+                mark_published(
                     published,
-                    step=4,
                     post_id=post_id,
-                    post_url=post_url,
-                    raw_text=raw_caption,
-                    translated=translated,
-                    edited=edited,
-                    full_text=full_text,
-                    media_items=media_items,
+                    url=post_url,
+                    text=raw_caption,
                     source=source_label,
+                    media_items=media_items,
                     extra_keys=ig_keys,
-                    step4_custom_sig=True,
                 )
+                save_published(published)
+                record_source_news(raw_caption, step=4, source=source_label, post_id=post_id, url=post_url)
+                new_count += 1
 
     print(f"\n  Итого опубликовано: {new_count}")
     return published
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--step", type=int, required=True, choices=[1, 2, 3, 4, 5])
+    parser.add_argument("--step", type=int, required=True, choices=[1, 2, 3, 4])
     args = parser.parse_args()
 
     print(f"▶ Шаг {args.step} | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
@@ -5366,8 +5553,6 @@ def main():
         step3_twitter_accounts(published)
     elif args.step == 4:
         step4_instagram_hashtags(published)
-    elif args.step == 5:
-        step5_publish_queue(published)
 
     ensure_state_files(published)
     print("\n✓ Готово.")
