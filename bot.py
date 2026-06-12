@@ -4011,85 +4011,111 @@ def split_text(text: str, limit: int) -> list:
     return parts
 
 
+def _vk_group_id() -> str:
+    """Возвращает group_id (без минуса) если VK_OWNER_ID — группа, иначе пустую строку."""
+    oid = VK_OWNER_ID.strip()
+    if oid.startswith("-"):
+        return oid.lstrip("-")
+    return ""
+
+
 def _vk_upload_photo(path: Path) -> str | None:
-    """Загружает фото в VK и возвращает строку вложения 'photo{owner_id}_{photo_id}' или None."""
-    try:
-        # 1) Получаем адрес сервера для загрузки на стену
-        r = requests.post(
-            "https://api.vk.com/method/photos.getWallUploadServer",
-            data={
+    """Загружает фото в VK и возвращает строку вложения 'photo{owner_id}_{photo_id}' или None.
+    
+    Пробует сначала с group_id (user token), при ошибке 27 (group token) — без group_id.
+    """
+    group_id = _vk_group_id()
+
+    def _try_upload(use_group_id: bool) -> str | None:
+        try:
+            # 1) Получаем адрес сервера для загрузки на стену
+            params1 = {"access_token": VK_ACCESS_TOKEN, "v": VK_API_VERSION}
+            if use_group_id and group_id:
+                params1["group_id"] = group_id
+            r = requests.post(
+                "https://api.vk.com/method/photos.getWallUploadServer",
+                data=params1, timeout=15,
+            ).json()
+            if "error" in r:
+                err = r["error"]
+                if err.get("error_code") == 27 and use_group_id:
+                    print("  VK: group token — пробуем загрузку без group_id")
+                    return _try_upload(use_group_id=False)
+                print(f"  VK getWallUploadServer ошибка: {err}")
+                return None
+            upload_url = r["response"]["upload_url"]
+
+            # 2) Загружаем файл
+            with open(path, "rb") as f:
+                up = requests.post(upload_url, files={"photo": f}, timeout=60).json()
+
+            # 3) Сохраняем фото
+            params3 = {
                 "access_token": VK_ACCESS_TOKEN,
                 "v": VK_API_VERSION,
-                "group_id": VK_OWNER_ID.lstrip("-"),
-            },
-            timeout=15,
-        ).json()
-        if "error" in r:
-            print(f"  VK getWallUploadServer ошибка: {r['error']}")
-            return None
-        upload_url = r["response"]["upload_url"]
-
-        # 2) Загружаем файл
-        with open(path, "rb") as f:
-            up = requests.post(upload_url, files={"photo": f}, timeout=60).json()
-
-        # 3) Сохраняем фото
-        save_r = requests.post(
-            "https://api.vk.com/method/photos.saveWallPhoto",
-            data={
-                "access_token": VK_ACCESS_TOKEN,
-                "v": VK_API_VERSION,
-                "group_id": VK_OWNER_ID.lstrip("-"),
                 "photo": up.get("photo", ""),
                 "server": up.get("server", ""),
                 "hash": up.get("hash", ""),
-            },
-            timeout=15,
-        ).json()
-        if "error" in save_r:
-            print(f"  VK saveWallPhoto ошибка: {save_r['error']}")
+            }
+            if use_group_id and group_id:
+                params3["group_id"] = group_id
+            save_r = requests.post(
+                "https://api.vk.com/method/photos.saveWallPhoto",
+                data=params3, timeout=15,
+            ).json()
+            if "error" in save_r:
+                print(f"  VK saveWallPhoto ошибка: {save_r['error']}")
+                return None
+            photo = save_r["response"][0]
+            return f"photo{photo['owner_id']}_{photo['id']}"
+        except Exception as e:
+            print(f"  VK upload photo ошибка: {e}")
             return None
-        photo = save_r["response"][0]
-        return f"photo{photo['owner_id']}_{photo['id']}"
-    except Exception as e:
-        print(f"  VK upload photo ошибка: {e}")
-        return None
+
+    return _try_upload(use_group_id=bool(group_id))
 
 
 def _vk_upload_video(path: Path) -> str | None:
     """Загружает видео в VK и возвращает строку вложения 'video{owner_id}_{video_id}' или None."""
-    try:
-        # 1) Получаем адрес для загрузки
-        save_r = requests.post(
-            "https://api.vk.com/method/video.save",
-            data={
+    group_id = _vk_group_id()
+
+    def _try_upload(use_group_id: bool) -> str | None:
+        try:
+            params = {
                 "access_token": VK_ACCESS_TOKEN,
                 "v": VK_API_VERSION,
-                "group_id": VK_OWNER_ID.lstrip("-"),
                 "wallpost": 0,
                 "no_comments": 1,
-            },
-            timeout=15,
-        ).json()
-        if "error" in save_r:
-            print(f"  VK video.save ошибка: {save_r['error']}")
-            return None
-        resp = save_r["response"]
-        upload_url = resp["upload_url"]
-        owner_id = resp["owner_id"]
-        video_id = resp["video_id"]
+            }
+            if use_group_id and group_id:
+                params["group_id"] = group_id
+            save_r = requests.post(
+                "https://api.vk.com/method/video.save",
+                data=params, timeout=15,
+            ).json()
+            if "error" in save_r:
+                err = save_r["error"]
+                if err.get("error_code") == 27 and use_group_id:
+                    print("  VK: group token — пробуем загрузку видео без group_id")
+                    return _try_upload(use_group_id=False)
+                print(f"  VK video.save ошибка: {err}")
+                return None
+            resp = save_r["response"]
+            upload_url = resp["upload_url"]
+            owner_id = resp["owner_id"]
+            video_id = resp["video_id"]
 
-        # 2) Загружаем файл
-        with open(path, "rb") as f:
-            up_r = requests.post(upload_url, files={"video_file": f}, timeout=180)
-        if up_r.status_code >= 400:
-            print(f"  VK video upload HTTP {up_r.status_code}")
+            with open(path, "rb") as f:
+                up_r = requests.post(upload_url, files={"video_file": f}, timeout=180)
+            if up_r.status_code >= 400:
+                print(f"  VK video upload HTTP {up_r.status_code}")
+                return None
+            return f"video{owner_id}_{video_id}"
+        except Exception as e:
+            print(f"  VK upload video ошибка: {e}")
             return None
 
-        return f"video{owner_id}_{video_id}"
-    except Exception as e:
-        print(f"  VK upload video ошибка: {e}")
-        return None
+    return _try_upload(use_group_id=bool(group_id))
 
 
 def post_to_vk(full_text: str, downloaded: list | None = None) -> bool:
@@ -4967,8 +4993,21 @@ def fetch_scweet_tweets(
     if account_filters:
         print(f"  Scweet from_users: {len(account_filters)} account(s)")
 
+    import concurrent.futures
+    SCWEET_TIMEOUT = 90  # секунд — после этого считаем Scweet завис
+
+    def _run_with_timeout(fn, *args, **kwargs):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(fn, *args, **kwargs)
+            try:
+                return fut.result(timeout=SCWEET_TIMEOUT)
+            except concurrent.futures.TimeoutError:
+                print(f"  Scweet search зависла после {SCWEET_TIMEOUT}с — прерываем")
+                return None
+
     try:
-        tweets = s.search(
+        tweets = _run_with_timeout(
+            s.search,
             search_query,
             since=since,
             until=until,
@@ -4978,6 +5017,8 @@ def fetch_scweet_tweets(
             tweet_type="exclude_retweets",
             save=False,
         )
+        if tweets is None:
+            return []
     except TypeError as e:
         fallback_parts = [keyword_query]
         if account_filters:
@@ -4985,17 +5026,16 @@ def fetch_scweet_tweets(
         fallback_parts.extend(["filter:media", "-filter:retweets", "-filter:replies"])
         fallback_query = " ".join(part for part in fallback_parts if part).strip()
         print(f"  Scweet structured params недоступны ({e}) — fallback query: {fallback_query[:120]}")
-        try:
-            tweets = s.search(
-                fallback_query,
-                since=since,
-                until=until,
-                display_type="Latest",
-                limit=limit,
-                save=False,
-            )
-        except Exception as fallback_error:
-            print(f"  Scweet search error: {fallback_error}")
+        tweets = _run_with_timeout(
+            s.search,
+            fallback_query,
+            since=since,
+            until=until,
+            display_type="Latest",
+            limit=limit,
+            save=False,
+        )
+        if tweets is None:
             return []
     except Exception as e:
         print(f"  Scweet search error: {e}")
