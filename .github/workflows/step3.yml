@@ -1,4 +1,4 @@
-name: Step 1 - Twitter Keywords
+name: Step 3 - Twitter Accounts
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: step1-${{ github.repository }}
+  group: step3-${{ github.repository }}
   cancel-in-progress: false
 
 env:
@@ -25,24 +25,27 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      # Восстанавливаем состояние из кэша предыдущего run.
+      # restore-keys без run_id гарантирует что найдётся любой предыдущий кэш.
       - name: Restore state
+        id: restore
         uses: actions/cache/restore@v4
         with:
           path: |
             published_ids.json
             source_news_cache.json
             ig_user_id_cache.json
-          key: step1-state-${{ github.run_id }}
+          key: step3-state-${{ github.run_id }}
           restore-keys: |
-            step1-state-
             step3-state-
+            step1-state-
             step2-state-
             step4-state-
 
       - name: Show state
         run: |
           if [ -f published_ids.json ]; then
-            echo "✅ published_ids.json: $(wc -l < published_ids.json) строк"
+            echo "✅ published_ids.json восстановлен: $(wc -l < published_ids.json) строк"
           else
             echo "⚠️  published_ids.json не найден (первый запуск)"
           fi
@@ -56,25 +59,21 @@ jobs:
           OPENROUTER_MODEL:   ${{ secrets.OPENROUTER_MODEL }}
           GEMINI_API_KEY:     ${{ secrets.GEMINI_API_KEY }}
           FORMAT_RAG_ENABLED: "1"
-          STEP1_KEYWORDS:     ${{ secrets.STEP1_KEYWORDS }}
-          STEP1_ACCOUNTS:     ${{ secrets.STEP1_ACCOUNTS }}
+          STEP3_ACCOUNTS:     ${{ secrets.STEP3_ACCOUNTS }}
           SCWEET_AUTH_TOKEN:  ${{ secrets.SCWEET_AUTH_TOKEN }}
           SCWEET_PROXY:       ${{ secrets.SCWEET_PROXY }}
-          STEP1_LIMIT:        ${{ vars.STEP1_LIMIT || '50' }}
-          VK_ACCESS_TOKEN:    ${{ secrets.VK_ACCESS_TOKEN }}
-          VK_OWNER_ID:        ${{ secrets.VK_OWNER_ID }}
-          VK_API_VERSION:     ${{ secrets.VK_API_VERSION }}
-          VK_FROM_GROUP:      ${{ secrets.VK_FROM_GROUP }}
-          VK_CROSSPOST_DELAY_MINUTES:  ${{ vars.VK_CROSSPOST_DELAY_MINUTES || '1' }}
-          MAX_TOKEN:          ${{ secrets.MAX_TOKEN }}
-          MAX_CHAT_ID:        ${{ secrets.MAX_CHAT_ID }}
-          MAX_USER_ID:        ${{ secrets.MAX_USER_ID }}
+          STEP3_LIMIT:        ${{ vars.STEP3_LIMIT || '20' }}
           ALERT_CHANNEL_ID:   ${{ secrets.ALERT_CHANNEL_ID }}
           BOT_NAME:           ${{ vars.BOT_NAME || 'NicoPazBot' }}
           SIGNATURE_HASHTAG:  ${{ secrets.SIGNATURE_HASHTAG }}
           SIGNATURE_URL:      ${{ secrets.SIGNATURE_URL }}
           SIGNATURE_URL_TEXT: ${{ secrets.SIGNATURE_URL_TEXT }}
-        run: python bot.py --step 1
+          VK_ACCESS_TOKEN:    ${{ secrets.VK_ACCESS_TOKEN }}
+          VK_OWNER_ID:        ${{ secrets.VK_OWNER_ID }}
+          VK_API_VERSION:     ${{ secrets.VK_API_VERSION }}
+          VK_FROM_GROUP:      ${{ secrets.VK_FROM_GROUP }}
+          VK_CROSSPOST_DELAY_MINUTES:  ${{ vars.VK_CROSSPOST_DELAY_MINUTES || '1' }}
+        run: python bot.py --step 3
 
       - name: Save state
         if: always()
@@ -84,4 +83,4 @@ jobs:
             published_ids.json
             source_news_cache.json
             ig_user_id_cache.json
-          key: step1-state-${{ github.run_id }}
+          key: step3-state-${{ github.run_id }}
