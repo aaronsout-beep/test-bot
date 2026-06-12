@@ -4011,7 +4011,94 @@ def split_text(text: str, limit: int) -> list:
     return parts
 
 
-def post_to_vk(full_text: str) -> bool:
+def _vk_upload_photo(path: Path) -> str | None:
+    """Загружает фото в VK и возвращает строку вложения 'photo{owner_id}_{photo_id}' или None."""
+    try:
+        # 1) Получаем адрес сервера для загрузки на стену
+        r = requests.post(
+            "https://api.vk.com/method/photos.getWallUploadServer",
+            data={
+                "access_token": VK_ACCESS_TOKEN,
+                "v": VK_API_VERSION,
+                "group_id": VK_OWNER_ID.lstrip("-"),
+            },
+            timeout=15,
+        ).json()
+        if "error" in r:
+            print(f"  VK getWallUploadServer ошибка: {r['error']}")
+            return None
+        upload_url = r["response"]["upload_url"]
+
+        # 2) Загружаем файл
+        with open(path, "rb") as f:
+            up = requests.post(upload_url, files={"photo": f}, timeout=60).json()
+
+        # 3) Сохраняем фото
+        save_r = requests.post(
+            "https://api.vk.com/method/photos.saveWallPhoto",
+            data={
+                "access_token": VK_ACCESS_TOKEN,
+                "v": VK_API_VERSION,
+                "group_id": VK_OWNER_ID.lstrip("-"),
+                "photo": up.get("photo", ""),
+                "server": up.get("server", ""),
+                "hash": up.get("hash", ""),
+            },
+            timeout=15,
+        ).json()
+        if "error" in save_r:
+            print(f"  VK saveWallPhoto ошибка: {save_r['error']}")
+            return None
+        photo = save_r["response"][0]
+        return f"photo{photo['owner_id']}_{photo['id']}"
+    except Exception as e:
+        print(f"  VK upload photo ошибка: {e}")
+        return None
+
+
+def _vk_upload_video(path: Path) -> str | None:
+    """Загружает видео в VK и возвращает строку вложения 'video{owner_id}_{video_id}' или None."""
+    try:
+        # 1) Получаем адрес для загрузки
+        save_r = requests.post(
+            "https://api.vk.com/method/video.save",
+            data={
+                "access_token": VK_ACCESS_TOKEN,
+                "v": VK_API_VERSION,
+                "group_id": VK_OWNER_ID.lstrip("-"),
+                "wallpost": 0,
+                "no_comments": 1,
+            },
+            timeout=15,
+        ).json()
+        if "error" in save_r:
+            print(f"  VK video.save ошибка: {save_r['error']}")
+            return None
+        resp = save_r["response"]
+        upload_url = resp["upload_url"]
+        owner_id = resp["owner_id"]
+        video_id = resp["video_id"]
+
+        # 2) Загружаем файл
+        with open(path, "rb") as f:
+            up_r = requests.post(upload_url, files={"video_file": f}, timeout=180)
+        if up_r.status_code >= 400:
+            print(f"  VK video upload HTTP {up_r.status_code}")
+            return None
+
+        return f"video{owner_id}_{video_id}"
+    except Exception as e:
+        print(f"  VK upload video ошибка: {e}")
+        return None
+
+
+def post_to_vk(full_text: str, downloaded: list | None = None) -> bool:
+    """Публикует пост в VK.
+
+    downloaded — список dict с ключами 'path' (Path) и 'type' ('photo'/'video'),
+    уже скачанных для Telegram. Если передан, медиафайлы загружаются в VK и
+    прикрепляются к посту.
+    """
     if not VK_ACCESS_TOKEN or not VK_OWNER_ID or not VK_API_VERSION:
         print(" VK пропущен: не заданы VK_ACCESS_TOKEN / VK_OWNER_ID / VK_API_VERSION")
         return False
@@ -4020,16 +4107,37 @@ def post_to_vk(full_text: str) -> bool:
     if not text:
         return False
 
+    # Загружаем медиафайлы в VK
+    attachments = []
+    for item in (downloaded or []):
+        path = item.get("path")
+        media_type = item.get("type", "photo")
+        if not path or not Path(path).exists():
+            continue
+        if media_type == "video":
+            attach = _vk_upload_video(Path(path))
+        else:
+            attach = _vk_upload_photo(Path(path))
+        if attach:
+            attachments.append(attach)
+            print(f"  VK вложение загружено: {attach}")
+        else:
+            print(f"  VK не удалось загрузить: {path}")
+
+    post_data = {
+        "access_token": VK_ACCESS_TOKEN,
+        "v": VK_API_VERSION,
+        "owner_id": VK_OWNER_ID,
+        "from_group": VK_FROM_GROUP,
+        "message": text,
+    }
+    if attachments:
+        post_data["attachments"] = ",".join(attachments)
+
     try:
         r = requests.post(
             "https://api.vk.com/method/wall.post",
-            data={
-                "access_token": VK_ACCESS_TOKEN,
-                "v": VK_API_VERSION,
-                "owner_id": VK_OWNER_ID,
-                "from_group": VK_FROM_GROUP,
-                "message": text,
-            },
+            data=post_data,
             timeout=25,
         )
         res = r.json()
@@ -4101,7 +4209,12 @@ def text_contains_signature_hashtag(text: str) -> bool:
     return bool(re.search(r"(?<!\w)#" + re.escape(_SIG_HASHTAG) + r"(?!\w)", plain, flags=re.I))
 
 
-def crosspost_after_telegram(full_text: str):
+def crosspost_after_telegram(full_text: str, downloaded: list | None = None):
+    """Кросспостинг в ВК и MAX после успешной публикации в Telegram.
+
+    downloaded — список dict с ключами 'path' и 'type', уже скачанных медиафайлов.
+    Передаётся в post_to_vk для прикрепления фото/видео к посту ВК.
+    """
     vk_enabled = bool(VK_ACCESS_TOKEN and VK_OWNER_ID)
     max_enabled = bool(MAX_TOKEN and (MAX_CHAT_ID or MAX_USER_ID))
 
@@ -4119,7 +4232,7 @@ def crosspost_after_telegram(full_text: str):
     if vk_enabled:
         print(f"  Задержка перед ВК: {VK_CROSSPOST_DELAY_SECONDS} сек...")
         time.sleep(VK_CROSSPOST_DELAY_SECONDS)
-        post_to_vk(crosspost_text)
+        post_to_vk(crosspost_text, downloaded=downloaded)
     if max_enabled:
         post_to_max(crosspost_text)
 
@@ -4410,7 +4523,7 @@ def send_to_telegram(
         )
 
     if sent_ok:
-        crosspost_after_telegram(final_text)
+        crosspost_after_telegram(final_text, downloaded=downloaded)
 
     shutil.rmtree(MEDIA_DIR, ignore_errors=True)
     return sent_ok
