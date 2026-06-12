@@ -65,12 +65,7 @@ VK_OWNER_ID = os.environ.get("VK_OWNER_ID", "").strip()
 VK_DEFAULT_API_VERSION = "5.199"
 VK_API_VERSION = os.environ.get("VK_API_VERSION", "").strip() or VK_DEFAULT_API_VERSION
 VK_FROM_GROUP = os.environ.get("VK_FROM_GROUP", "1").strip()
-# Задержка в секундах перед публикацией в ВК (переменная VK_CROSSPOST_DELAY_SECONDS, устаревший алиас VK_CROSSPOST_DELAY_MINUTES)
-VK_CROSSPOST_DELAY_SECONDS = int(
-    os.environ.get("VK_CROSSPOST_DELAY_SECONDS")
-    or os.environ.get("VK_CROSSPOST_DELAY_MINUTES")
-    or "0"
-)
+VK_CROSSPOST_DELAY_SECONDS = int((os.environ.get("VK_CROSSPOST_DELAY_SECONDS") or "0").strip())
 
 MAX_TOKEN = os.environ.get("MAX_TOKEN", "").strip()
 MAX_CHAT_ID = os.environ.get("MAX_CHAT_ID", "").strip()
@@ -4114,10 +4109,14 @@ def post_to_vk(full_text: str, downloaded: list | None = None) -> bool:
 
     # Загружаем медиафайлы в VK
     attachments = []
-    for item in (downloaded or []):
+    dl_list = downloaded or []
+    print(f"  VK: получено {len(dl_list)} медиафайлов для загрузки")
+    for item in dl_list:
         path = item.get("path")
         media_type = item.get("type", "photo")
-        if not path or not Path(path).exists():
+        exists = Path(path).exists() if path else False
+        print(f"  VK: файл {path} | exists={exists} | type={media_type}")
+        if not path or not exists:
             continue
         if media_type == "video":
             attach = _vk_upload_video(Path(path))
@@ -4235,8 +4234,11 @@ def crosspost_after_telegram(full_text: str, downloaded: list | None = None):
 
     print("  Кросспостинг после Telegram...")
     if vk_enabled:
-        print(f"  Задержка перед ВК: {VK_CROSSPOST_DELAY_SECONDS} сек...")
-        time.sleep(VK_CROSSPOST_DELAY_SECONDS)
+        media_count = len([d for d in (downloaded or []) if d.get("path") and Path(d["path"]).exists()])
+        print(f"  ВК: медиафайлов для загрузки: {media_count} из {len(downloaded or [])}")
+        if VK_CROSSPOST_DELAY_SECONDS:
+            print(f"  Задержка перед ВК: {VK_CROSSPOST_DELAY_SECONDS} сек...")
+            time.sleep(VK_CROSSPOST_DELAY_SECONDS)
         post_to_vk(crosspost_text, downloaded=downloaded)
     if max_enabled:
         post_to_max(crosspost_text)
