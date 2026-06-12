@@ -65,7 +65,12 @@ VK_OWNER_ID = os.environ.get("VK_OWNER_ID", "").strip()
 VK_DEFAULT_API_VERSION = "5.199"
 VK_API_VERSION = os.environ.get("VK_API_VERSION", "").strip() or VK_DEFAULT_API_VERSION
 VK_FROM_GROUP = os.environ.get("VK_FROM_GROUP", "1").strip()
-VK_CROSSPOST_DELAY_SECONDS = int(os.environ.get("VK_CROSSPOST_DELAY_MINUTES", "15"))
+# Задержка в секундах перед публикацией в ВК (переменная VK_CROSSPOST_DELAY_SECONDS, устаревший алиас VK_CROSSPOST_DELAY_MINUTES)
+VK_CROSSPOST_DELAY_SECONDS = int(
+    os.environ.get("VK_CROSSPOST_DELAY_SECONDS")
+    or os.environ.get("VK_CROSSPOST_DELAY_MINUTES")
+    or "0"
+)
 
 MAX_TOKEN = os.environ.get("MAX_TOKEN", "").strip()
 MAX_CHAT_ID = os.environ.get("MAX_CHAT_ID", "").strip()
