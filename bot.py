@@ -4021,33 +4021,40 @@ def _vk_group_id() -> str:
 
 def _vk_upload_photo(path: Path) -> str | None:
     """Загружает фото в VK, используя ключ доступа сообщества."""
-    group_id = _vk_group_id()  # вернёт число без минуса, например "223355840"
+    group_id = _vk_group_id()
+    print(f"  VK: загрузка фото {path.name}, group_id={group_id or 'не указан'}")
 
     try:
-        # Шаг 1: Получаем upload URL (БЕЗ group_id в параметрах!)
+        # Шаг 1: Получаем upload URL
         params = {
             "access_token": VK_ACCESS_TOKEN,
             "v": VK_API_VERSION,
         }
-        # Не передаём group_id в getUploadServer для группового ключа!
         
+        print(f"  VK: запрос photos.getWallUploadServer...")
         r1 = requests.post(
             "https://api.vk.com/method/photos.getWallUploadServer",
             data=params,
             timeout=15,
         ).json()
+        
+        print(f"  VK: ответ getWallUploadServer: {r1}")
 
         if "error" in r1:
-            print(f" VK getWallUploadServer ошибка: {r1['error']}")
+            print(f"  ❌ VK getWallUploadServer ошибка: {r1['error']}")
             return None
 
         upload_url = r1["response"]["upload_url"]
+        print(f"  VK: upload URL получен: {upload_url[:80]}...")
 
         # Шаг 2: Загружаем файл
+        print(f"  VK: загрузка файла на сервер...")
         with open(path, "rb") as f:
             up = requests.post(upload_url, files={"photo": f}, timeout=60).json()
+        
+        print(f"  VK: ответ после загрузки: {up}")
 
-        # Шаг 3: Сохраняем на стену (указываем group_id здесь)
+        # Шаг 3: Сохраняем на стену
         save_params = {
             "access_token": VK_ACCESS_TOKEN,
             "v": VK_API_VERSION,
@@ -4057,48 +4064,56 @@ def _vk_upload_photo(path: Path) -> str | None:
         }
         if group_id:
             save_params["group_id"] = group_id
-
+        
+        print(f"  VK: сохранение фото на стену, group_id={group_id}")
         save_r = requests.post(
             "https://api.vk.com/method/photos.saveWallPhoto",
             data=save_params,
             timeout=15,
         ).json()
+        
+        print(f"  VK: ответ saveWallPhoto: {save_r}")
 
         if "error" in save_r:
-            print(f" VK saveWallPhoto ошибка: {save_r['error']}")
+            print(f"  ❌ VK saveWallPhoto ошибка: {save_r['error']}")
             return None
 
         resp = save_r["response"]
         if not resp:
-            print(" VK saveWallPhoto: пустой response")
+            print("  ❌ VK saveWallPhoto: пустой response")
             return None
 
-        # Ответ может быть списком или словарём
+        # Обработка ответа
         if isinstance(resp, dict):
             photo = resp
         elif isinstance(resp, list) and resp:
             photo = resp[0]
         else:
-            print(f" VK saveWallPhoto: неожиданный формат: {type(resp)}")
+            print(f"  ❌ VK saveWallPhoto: неожиданный формат: {type(resp)}")
             return None
 
         owner_id = photo.get("owner_id")
         photo_id = photo.get("id")
 
         if owner_id is None or photo_id is None:
-            print(f" VK saveWallPhoto: нет owner_id/id в ответе: {photo}")
+            print(f"  ❌ VK saveWallPhoto: нет owner_id/id в ответе: {photo}")
             return None
 
-        return f"photo{owner_id}_{photo_id}"
+        result = f"photo{owner_id}_{photo_id}"
+        print(f"  ✅ VK фото загружено: {result}")
+        return result
 
     except Exception as e:
-        print(f" VK upload photo ошибка: {e}")
+        print(f"  ❌ VK upload photo ошибка: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
 def _vk_upload_video(path: Path) -> str | None:
     """Загружает видео в VK, используя ключ доступа сообщества."""
     group_id = _vk_group_id()
+    print(f"  VK: загрузка видео {path.name}, group_id={group_id or 'не указан'}")
 
     try:
         params = {
@@ -4109,33 +4124,43 @@ def _vk_upload_video(path: Path) -> str | None:
         if group_id:
             params["group_id"] = group_id
 
+        print(f"  VK: запрос video.save...")
         save_r = requests.post(
             "https://api.vk.com/method/video.save",
             data=params,
             timeout=15,
         ).json()
+        
+        print(f"  VK: ответ video.save: {save_r}")
 
         if "error" in save_r:
             err = save_r["error"]
-            print(f"  VK video.save ошибка: {err}")
+            print(f"  ❌ VK video.save ошибка: {err}")
             return None
 
         resp = save_r["response"]
         upload_url = resp["upload_url"]
         owner_id = resp["owner_id"]
         video_id = resp["video_id"]
+        
+        print(f"  VK: upload URL получен, owner_id={owner_id}, video_id={video_id}")
 
+        print(f"  VK: загрузка видео на сервер...")
         with open(path, "rb") as f:
             up_r = requests.post(upload_url, files={"video_file": f}, timeout=180)
 
         if up_r.status_code >= 400:
-            print(f"  VK video upload HTTP {up_r.status_code}")
+            print(f"  ❌ VK video upload HTTP {up_r.status_code}")
             return None
 
-        return f"video{owner_id}_{video_id}"
+        result = f"video{owner_id}_{video_id}"
+        print(f"  ✅ VK видео загружено: {result}")
+        return result
 
     except Exception as e:
-        print(f"  VK upload video ошибка: {e}")
+        print(f"  ❌ VK upload video ошибка: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
