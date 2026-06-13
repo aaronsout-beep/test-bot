@@ -4126,11 +4126,14 @@ def post_to_vk(full_text: str, downloaded: list | None = None) -> bool:
     прикрепляются к посту.
     """
     if not VK_ACCESS_TOKEN or not VK_OWNER_ID or not VK_API_VERSION:
-        print(" VK пропущен: не заданы VK_ACCESS_TOKEN / VK_OWNER_ID / VK_API_VERSION")
+        print(
+            " VK пропущен: не заданы VK_ACCESS_TOKEN / VK_OWNER_ID / VK_API_VERSION"
+        )
         return False
 
     text = plain_text_for_crosspost(full_text)
     if not text:
+        print(" VK пропущен: пустой текст после подготовки")
         return False
 
     attachments = []
@@ -4139,13 +4142,19 @@ def post_to_vk(full_text: str, downloaded: list | None = None) -> bool:
 
     for item in dl_list:
         path = item.get("path")
-        media_type = item.get("type", "photo")
-        exists = Path(path).exists() if path else False
-        print(f"  VK: файл {path} | exists={exists} | type={media_type}")
-        if not path or not exists:
+        media_type = str(item.get("type", "photo")).lower().strip()
+
+        if not path:
+            print("  VK: пропуск медиа без path")
             continue
 
         path_obj = Path(path)
+        exists = path_obj.exists()
+        print(f"  VK: файл {path_obj} | exists={exists} | type={media_type}")
+
+        if not exists:
+            continue
+
         if media_type == "video":
             attach = _vk_upload_video(path_obj)
         else:
@@ -4155,7 +4164,7 @@ def post_to_vk(full_text: str, downloaded: list | None = None) -> bool:
             attachments.append(attach)
             print(f"  VK вложение загружено: {attach}")
         else:
-            print(f"  VK не удалось загрузить: {path}")
+            print(f"  VK не удалось загрузить: {path_obj}")
 
     post_data = {
         "access_token": VK_ACCESS_TOKEN,
@@ -4167,6 +4176,9 @@ def post_to_vk(full_text: str, downloaded: list | None = None) -> bool:
 
     if attachments:
         post_data["attachments"] = ",".join(attachments)
+        print(f"  VK: attachments={post_data['attachments']}")
+    else:
+        print("  VK: вложений нет, отправляется только текст")
 
     try:
         r = requests.post(
