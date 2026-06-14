@@ -4465,123 +4465,146 @@ def send_media_group(downloaded: list, caption: str) -> bool:
 
 
 
-def _html_to_rich_paragraphs(text: str) -> list:
-    """Конвертирует HTML-абзац в список RichBlockParagraph с inline-entities."""
+# ── Вспомогательные функции для Rich API ─────────────────────────────────────
+
+def _upload_file_id(item: dict) -> str | None:
+    """
+    Загружает файл в Telegram и возвращает file_id.
+    Используется для получения file_id перед вызовом sendRichMessage.
+    """
+    path = item["path"]
+    media_type = item["type"]
+    method = "sendVideo" if media_type == "video" else "sendPhoto"
+    field  = "video"    if media_type == "video" else "photo"
+    try:
+        with open(path, "rb") as f:
+            res = requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
+                data={"chat_id": CHANNEL_ID, "disable_notification": True},
+                files={field: f},
+                timeout=90,
+            ).json()
+        if not res.get("ok"):
+            print(f"  _upload_file_id: ошибка для {path.name}: {res.get('description')}")
+            return None
+        msg = res["result"]
+        if media_type == "video":
+            return msg["video"]["file_id"]
+        return msg["photo"][-1]["file_id"]
+    except Exception as e:
+        print(f"  _upload_file_id: исключение {path.name}: {e}")
+        return None
+
+
+def _html_to_rich_paragraphs(html_text: str) -> list:
+    """
+    Конвертирует HTML-текст в список RichBlockParagraph с inline-entities.
+    Каждый абзац (\n\n) — отдельный блок.
+    """
+    import html as _html
     blocks = []
-    paragraphs = re.split(r"\n\n+", text.strip())
-    for para in paragraphs:
+    tag_map = {
+        "b": "bold", "strong": "bold",
+        "i": "italic", "em": "italic",
+        "u": "underline",
+        "s": "strikethrough", "del": "strikethrough",
+        "code": "code", "pre": "pre",
+    }
+    for para in re.split(r"\n\n+", (html_text or "").strip()):
         para = para.strip()
         if not para:
             continue
-        tag_map = {
-            "b": "bold", "strong": "bold",
-            "i": "italic", "em": "italic",
-            "u": "underline",
-            "s": "strikethrough", "del": "strikethrough",
-            "code": "code", "pre": "pre",
-        }
-        entities = []
-        text_buf = []
-        stack = []
-        src = para.replace("\n", "\n")
+        entities, text_buf, stack = [], [], []
+        src = para
         i = 0
         while i < len(src):
-            if src[i] == "<":
-                end = src.find(">", i)
-                if end == -1:
-                    text_buf.append(src[i]); i += 1; continue
-                tag_raw = src[i+1:end]; i = end + 1
-                if tag_raw.startswith("/"):
-                    tag_name = tag_raw[1:].strip().lower()
-                    for j in range(len(stack)-1, -1, -1):
-                        if stack[j][0] == tag_name:
-                            start_offset, _, etype, extra = stack.pop(j)
-                            length = len("".join(text_buf)) - start_offset
-                            if length > 0:
-                                ent = {"type": etype, "offset": start_offset, "length": length}
-                                if extra: ent.update(extra)
-                                entities.append(ent)
-                            break
-                else:
-                    parts2 = tag_raw.split(None, 1)
-                    tag_name = parts2[0].lower()
-                    attrs = parts2[1] if len(parts2) > 1 else ""
-                    if tag_name == "a":
-                        href_m = re.search(r'href=["\']([^"\']+)["\']', attrs)
-                        href = href_m.group(1) if href_m else ""
-                        stack.append((len("".join(text_buf)), tag_name, "text_link", {"url": href}))
-                    elif tag_name in tag_map:
-                        stack.append((len("".join(text_buf)), tag_name, tag_map[tag_name], {}))
-            else:
+            if src[i] != "<":
                 if src[i] == "&":
-                    end2 = src.find(";", i)
-                    if end2 != -1:
-                        text_buf.append(__import__("html").unescape(src[i:end2+1]))
-                        i = end2 + 1; continue
-                text_buf.append(src[i]); i += 1
+                    end = src.find(";", i)
+                    if end != -1:
+                        text_buf.append(_html.unescape(src[i:end+1]))
+                        i = end + 1
+                        continue
+                text_buf.append(src[i]); i += 1; continue
+            end = src.find(">", i)
+            if end == -1:
+                text_buf.append(src[i]); i += 1; continue
+            tag_raw = src[i+1:end]; i = end + 1
+            if tag_raw.startswith("/"):
+                tag_name = tag_raw[1:].strip().lower()
+                for j in range(len(stack)-1, -1, -1):
+                    if stack[j][0] == tag_name:
+                        s_off, _, etype, extra = stack.pop(j)
+                        ln = len("".join(text_buf)) - s_off
+                        if ln > 0:
+                            ent = {"type": etype, "offset": s_off, "length": ln}
+                            if extra: ent.update(extra)
+                            entities.append(ent)
+                        break
+            else:
+                parts2 = tag_raw.split(None, 1)
+                tn = parts2[0].lower()
+                attrs = parts2[1] if len(parts2) > 1 else ""
+                if tn == "a":
+                    m = re.search(r'href=["\'"]([^"\'">]+)["\'"]?', attrs)
+                    stack.append((len("".join(text_buf)), tn, "text_link",
+                                  {"url": m.group(1)} if m else {}))
+                elif tn in tag_map:
+                    stack.append((len("".join(text_buf)), tn, tag_map[tn], {}))
         plain = "".join(text_buf)
-        block = {"type": "paragraph", "text": {"text": plain}}
-        if entities: block["text"]["entities"] = entities
-        blocks.append(block)
+        blk = {"type": "paragraph", "text": {"text": plain}}
+        if entities:
+            blk["text"]["entities"] = entities
+        blocks.append(blk)
     return blocks
 
 
-# ── RichBlockTable: детектор и конвертер ─────────────────────────────────────
-
 def _detect_table_block(lines: list) -> tuple:
     """
-    Определяет тип списка:
-      "ranking" — строки начинаются с числа  (ТОП-листы, рейтинги)
-      "value"   — строки вида «Имя + число+единица»  (стоимости, статистика)
-      ""        — обычный список, таблица не нужна
-
-    Порог: ≥ 3 строк и ≥ 75% строк соответствуют паттерну.
+    Определяет подходит ли список для RichBlockTable.
+      "ranking" — строки начинаются с числа (ТОП-листы, рейтинги)
+      "value"   — строки заканчиваются числом + единица (стоимости, статистика)
+      ""        — обычный список
+    Порог: ≥ 3 строк и ≥ 75% соответствуют паттерну.
     """
     if len(lines) < 3:
         return False, ""
-
     ranking_re = re.compile(r"^\s*\d{1,3}[\s.)\-]")
     value_re   = re.compile(
-        r".{4,}\s+(\d[\d\s,.]*)\s*(млн|тыс|mil|mln|евро|euro|€|\$|%|к|k|г\.|лет)\b",
+        r".{4,}\s+(\d[\d\s,.]*)"
+        r"\s*(млн|тыс|mil|mln|евро|euro|€|\$|%|к|k|г\.|лет)\b",
         re.IGNORECASE | re.UNICODE,
     )
-
-    ranking_hits = sum(1 for l in lines if ranking_re.match(l))
-    value_hits   = sum(1 for l in lines if value_re.search(l))
-
-    if ranking_hits / len(lines) >= 0.75:
+    n = len(lines)
+    if sum(1 for l in lines if ranking_re.match(l)) / n >= 0.75:
         return True, "ranking"
-    if value_hits   / len(lines) >= 0.75:
+    if sum(1 for l in lines if value_re.search(l)) / n >= 0.75:
         return True, "value"
     return False, ""
 
 
 def _lines_to_rich_table(lines: list, table_type: str) -> dict:
-    """
-    Строит RichBlockTable из списка строк.
-      ranking → «#» | «Игрок»
-      value   → «Игрок» | «Стоимость»
-    """
-    def cell(t: str) -> dict:
-        return {"type": "paragraph", "text": {"text": t}}
+    """Строит RichBlockTable: ranking → «# / Игрок», value → «Игрок / Стоимость»."""
+    def cell(t): return {"type": "paragraph", "text": {"text": t}}
 
     if table_type == "ranking":
         row_re = re.compile(r"^(\d[\d\s]{0,5})\s+(.+)$")
         header = ["#", "Игрок"]
         rows = []
-        for line in lines:
-            m = row_re.match(line.strip())
-            rows.append([m.group(1).strip(), m.group(2).strip()] if m else ["", line.strip()])
+        for l in lines:
+            m = row_re.match(l.strip())
+            rows.append([m.group(1).strip(), m.group(2).strip()] if m else ["", l.strip()])
     else:
-        value_re = re.compile(
-            r"^(.*?)\s+(\d[\d\s,.]*\s*(?:млн|тыс|mil|mln|евро|euro|€|\$|%|к|k)\b.*)$",
+        val_re = re.compile(
+            r"^(.*?)\s+(\d[\d\s,.]*\s*"
+            r"(?:млн|тыс|mil|mln|евро|euro|€|\$|%|к|k)\b.*)$",
             re.IGNORECASE | re.UNICODE,
         )
         header = ["Игрок", "Стоимость"]
         rows = []
-        for line in lines:
-            m = value_re.match(line.strip())
-            rows.append([m.group(1).strip(), m.group(2).strip()] if m else [line.strip(), ""])
+        for l in lines:
+            m = val_re.match(l.strip())
+            rows.append([m.group(1).strip(), m.group(2).strip()] if m else [l.strip(), ""])
 
     table_rows = [{"type": "row", "is_header": True, "cells": [cell(h) for h in header]}]
     for r in rows:
@@ -4589,24 +4612,23 @@ def _lines_to_rich_table(lines: list, table_type: str) -> dict:
     return {"type": "table", "rows": table_rows}
 
 
-def _html_to_rich_blocks(text: str) -> list:
+def _html_to_rich_text_blocks(html_text: str) -> list:
     """
-    Конвертирует HTML-текст в список Rich-блоков:
-      - список ranking/value  → RichBlockTable
-      - обычный список        → RichBlockParagraph по строке
-      - прозаический абзац   → RichBlockParagraph с inline-entities
+    Конвертирует HTML-текст в Rich-блоки:
+      - рейтинговый список   → RichBlockTable (ranking)
+      - список с ценами      → RichBlockTable (value)
+      - маркированный список → RichBlockList
+      - обычный абзац        → RichBlockParagraph
     """
     blocks = []
     list_marker_re = re.compile(r"^[\-•·–]\s+|^\d{1,3}[\s.)\-]")
 
-    for para in re.split(r"\n\n+", text.strip()):
+    for para in re.split(r"\n\n+", (html_text or "").strip()):
         para = para.strip()
         if not para:
             continue
 
         lines = [l.strip() for l in para.splitlines() if l.strip()]
-
-        # Список: ≥ 2 строк и ≥ 60% с маркером
         is_list = (
             len(lines) >= 2
             and sum(1 for l in lines if list_marker_re.match(l)) >= len(lines) * 0.6
@@ -4616,10 +4638,17 @@ def _html_to_rich_blocks(text: str) -> list:
             clean = [re.sub(r"^[\-•·–]\s+", "", l) for l in lines]
             is_table, ttype = _detect_table_block(clean)
             if is_table:
+                # RichBlockTable для рейтингов и стоимостей
                 blocks.append(_lines_to_rich_table(clean, ttype))
             else:
-                for line in lines:
-                    blocks.append({"type": "paragraph", "text": {"text": line}})
+                # RichBlockList для обычных маркированных списков
+                items = []
+                for line in clean:
+                    items.append({
+                        "type": "list_item",
+                        "content": [{"type": "paragraph", "text": {"text": line}}],
+                    })
+                blocks.append({"type": "list", "style": "unordered", "items": items})
             continue
 
         # Прозаический абзац
@@ -4628,106 +4657,62 @@ def _html_to_rich_blocks(text: str) -> list:
     return blocks
 
 
-def _upload_for_file_id(item: dict) -> str | None:
-    """Получает file_id для медиафайла через технический чат (ALERT_CHANNEL_ID).
-
-    sendRichMessage принимает только file_id, не бинарный файл.
-    Загружаем в ALERT_CHANNEL_ID (служебный), а не в CHANNEL_ID (публичный),
-    чтобы файлы не появлялись в канале отдельными постами.
-    Если ALERT_CHANNEL_ID не задан — падаем: нельзя публиковать в основной канал
-    без подписи как технические сообщения.
+def send_rich_post(downloaded: list, full_text: str) -> bool:
     """
-    upload_target = ALERT_CHANNEL_ID or CHANNEL_ID
-    path = item["path"]
-    media_type = item["type"]
-    method = "sendVideo" if media_type == "video" else "sendPhoto"
-    field  = "video"    if media_type == "video" else "photo"
-    try:
-        with open(path, "rb") as f:
-            res = requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
-                data={
-                    "chat_id": str(upload_target),
-                    "disable_notification": "true",
-                },
-                files={field: f},
-                timeout=90,
-            ).json()
-        if not res.get("ok"):
-            print(f"  _upload_for_file_id: ошибка {path.name}: {res.get('description')}")
-            return None
-        msg = res["result"]
-        return msg["video"]["file_id"] if media_type == "video" else msg["photo"][-1]["file_id"]
-    except Exception as e:
-        print(f"  _upload_for_file_id: исключение {path.name}: {e}")
-        return None
+    Публикует пост через sendRichMessage (Bot API 10.1+).
 
+    Структура контента:
+      • 1 фото             → RichBlockPhoto
+      • 2+ фото            → RichBlockCollage
+      • видео (любое кол-во) → RichBlockVideo (по одному)
+      • текст              → RichBlockParagraph / RichBlockList / RichBlockTable
 
-def _build_media_rich_blocks(photo_ids: list, video_ids: list) -> list:
-    """Строит медиа-блоки для sendRichMessage (Bot API 10.1).
-
-      1 фото  → RichBlockPhoto  : {"type": "photo",   "photo": file_id}
-      2+ фото → RichBlockCollage: {"type": "collage",  "photos": [file_id, ...]}
-      видео   → RichBlockVideo  : {"type": "video",    "video": file_id}
+    full_text уже содержит переведённый текст и SIGNATURE.
     """
-    blocks = []
-    if len(photo_ids) == 1:
-        blocks.append({"type": "photo", "photo": photo_ids[0]})
-    elif len(photo_ids) >= 2:
-        blocks.append({"type": "collage", "photos": photo_ids})
-    for vid_id in video_ids:
-        blocks.append({"type": "video", "video": vid_id})
-    return blocks
+    # Разделяем фото и видео
+    photos = [item for item in downloaded if item["type"] == "photo"]
+    videos = [item for item in downloaded if item["type"] == "video"]
 
+    content_blocks = []
 
-def send_rich_message(downloaded: list, full_text: str) -> bool:
-    """Отправляет пост через sendRichMessage (Bot API 10.1).
+    # ── Фото-блок ─────────────────────────────────────────────────────────────
+    if photos:
+        file_ids = []
+        for item in photos[:TELEGRAM_MEDIA_GROUP_LIMIT]:
+            fid = _upload_file_id(item)
+            if fid:
+                file_ids.append(fid)
 
-    Медиа загружаются в ALERT_CHANNEL_ID (служебный) для получения file_id,
-    и НЕ появляются в публичном канале как отдельные посты.
+        if not file_ids:
+            print("  send_rich_post: не удалось загрузить ни одного фото")
+            return False
 
-      1 фото  → RichBlockPhoto
-      2+ фото → RichBlockCollage (все фото в одном блоке)
-      видео   → RichBlockVideo   (по одному блоку на файл)
-
-    Текст конвертируется в RichBlockParagraph/RichBlockTable.
-    Итоговый пост отправляется одним вызовом sendRichMessage в CHANNEL_ID.
-    """
-    photo_ids: list[str] = []
-    video_ids: list[str] = []
-
-    for item in downloaded[:TELEGRAM_MEDIA_GROUP_LIMIT]:
-        file_id = _upload_for_file_id(item)
-        if file_id is None:
-            print(f"  send_rich_message: нет file_id для {item['path'].name} — пропуск")
-            continue
-        if item["type"] == "video":
-            video_ids.append(file_id)
+        if len(file_ids) == 1:
+            # RichBlockPhoto
+            content_blocks.append({"type": "photo", "photo": file_ids[0]})
         else:
-            photo_ids.append(file_id)
+            # RichBlockCollage
+            content_blocks.append({
+                "type": "collage",
+                "photos": file_ids,
+            })
 
-    media_blocks = _build_media_rich_blocks(photo_ids, video_ids)
-    if not media_blocks:
-        print("  send_rich_message: нет медиа — не отправляем")
+    # ── Видео-блоки ───────────────────────────────────────────────────────────
+    for item in videos[:TELEGRAM_MEDIA_GROUP_LIMIT]:
+        fid = _upload_file_id(item)
+        if fid:
+            content_blocks.append({"type": "video", "video": fid})
+
+    if not content_blocks:
+        print("  send_rich_post: нет медиа после загрузки")
         return False
 
-    text_blocks = _html_to_rich_blocks(full_text)
-    all_blocks  = media_blocks + text_blocks
+    # ── Текстовые блоки ───────────────────────────────────────────────────────
+    content_blocks.extend(_html_to_rich_text_blocks(full_text))
 
-    if len(photo_ids) >= 2:
-        media_label = f"RichBlockCollage({len(photo_ids)} фото)"
-    elif photo_ids:
-        media_label = "RichBlockPhoto"
-    else:
-        media_label = ""
-    if video_ids:
-        media_label += (", " if media_label else "") + f"RichBlockVideo x{len(video_ids)}"
-    print(f"  send_rich_message: {media_label}, {len(text_blocks)} текстовых блоков")
-
-    res = tg("sendRichMessage", {
-        "chat_id": CHANNEL_ID,
-        "content": json.dumps(all_blocks),
-    })
+    res = tg("sendRichMessage", {"chat_id": CHANNEL_ID, "content": content_blocks})
+    if not res.get("ok"):
+        print(f"  sendRichMessage ошибка: {res.get('description')}")
     return res.get("ok", False)
 
 def send_to_telegram(
@@ -4793,10 +4778,41 @@ def send_to_telegram(
         else:
             final_text = f"<b>{prefix_html}</b>"
 
-    # Всегда sendRichMessage (Bot API 10.1):
-    #   медиа загружаются тихо в ALERT_CHANNEL_ID для file_id,
-    #   финальный пост с коллажем/фото + текстом — одним вызовом в CHANNEL_ID.
-    sent_ok = send_rich_message(downloaded, final_text)
+    # sendRichMessage: 1 фото → RichBlockPhoto, 2+ → RichBlockCollage
+    # Видео и смешанные медиа-посты тоже идут через Rich API.
+    # Текст (переведённый + SIGNATURE) включается в тот же пост блоками.
+    has_only_videos = all(item["type"] == "video" for item in downloaded)
+    caption, overflow = split_caption(final_text, True)
+
+    # Видео-посты без фото с коротким текстом → старый sendVideo (caption в одном посте)
+    # Всё остальное → sendRichMessage
+    use_rich = not (has_only_videos and not overflow)
+
+    if use_rich:
+        sent_ok = send_rich_post(downloaded, final_text)
+    else:
+        # Только видео + короткий текст → обычный sendVideo с caption
+        sent_ok = True
+        chunks = [
+            downloaded[i:i + TELEGRAM_MEDIA_GROUP_LIMIT]
+            for i in range(0, len(downloaded), TELEGRAM_MEDIA_GROUP_LIMIT)
+        ]
+        for chunk_index, chunk in enumerate(chunks):
+            chunk_caption = caption if chunk_index == 0 else ""
+            if len(chunk) == 1:
+                chunk_ok = send_single_media(chunk[0], chunk_caption)
+            else:
+                chunk_ok = send_media_group(chunk, chunk_caption)
+            if not chunk_ok:
+                sent_ok = False
+                print("  Медиа не отправилось — текстом не отправляем")
+                break
+            if chunk_index < len(chunks) - 1:
+                time.sleep(1.5)
+        if overflow and sent_ok:
+            time.sleep(1.5)
+            tg("sendMessage",
+               {"chat_id": CHANNEL_ID, "text": overflow, "parse_mode": "HTML"})
 
     if sent_ok:
         crosspost_after_telegram(final_text, downloaded=downloaded)
