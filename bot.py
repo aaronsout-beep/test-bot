@@ -4672,89 +4672,103 @@ def _html_to_rich_text_blocks(html_text: str) -> list:
     return blocks
 
 
+def _upload_file_id_silent(item: dict) -> str | None:
+    """
+    Загружает файл в ALERT_CHANNEL_ID (служебный канал) для получения file_id.
+    Сообщение остаётся в служебном канале — в основной канал ничего не попадает.
+    Если ALERT_CHANNEL_ID не задан — падает с ошибкой (нужно настроить).
+    Возвращает file_id или None при ошибке.
+    """
+    if not ALERT_CHANNEL_ID:
+        print("  _upload_file_id_silent: ALERT_CHANNEL_ID не задан — невозможно получить file_id")
+        return None
+    path = item["path"]
+    media_type = item["type"]
+    method = "sendVideo" if media_type == "video" else "sendPhoto"
+    field  = "video"    if media_type == "video" else "photo"
+    try:
+        with open(path, "rb") as f:
+            res = requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
+                data={"chat_id": ALERT_CHANNEL_ID, "disable_notification": "true"},
+                files={field: f},
+                timeout=90,
+            ).json()
+        if not res.get("ok"):
+            print(f"  _upload_file_id_silent: ошибка загрузки {path.name}: {res.get('description')}")
+            return None
+        msg = res["result"]
+        if media_type == "video":
+            return msg.get("video", {}).get("file_id")
+        photos = msg.get("photo", [])
+        return photos[-1]["file_id"] if photos else None
+    except Exception as e:
+        print(f"  _upload_file_id_silent: исключение {path.name}: {e}")
+        return None
+
+
 def send_rich_post(downloaded: list, full_text: str) -> bool:
     """
     Публикует пост через sendRichMessage (Bot API 10.1+).
 
-    Медиа загружаются НАПРЯМУЮ через multipart/form-data в том же запросе —
-    без предварительного sendPhoto/sendVideo в канал. Это устраняет:
-      1. Двойную публикацию (sendPhoto публиковал фото без текста)
-      2. Ошибку «rich message must be non-empty» (file_id не возвращался)
+    attach:// внутри rich_message не поддерживается Telegram — нужны file_id.
+    Стратегия: загружаем каждый файл через sendPhoto/sendVideo с
+    disable_notification=True, получаем file_id, сразу удаляем служебное
+    сообщение через deleteMessage, затем шлём sendRichMessage с file_id.
 
     Структура контента:
-      • 1 фото             → RichBlockPhoto  (attach://photo0)
-      • 2+ фото            → RichBlockCollage (attach://photo0, photo1, ...)
-      • видео              → RichBlockVideo   (attach://video0)
+      • 1 фото             → RichBlockPhoto
+      • 2+ фото            → RichBlockCollage
+      • видео              → RichBlockVideo
       • текст              → RichBlockParagraph / RichBlockList / RichBlockTable
     """
     photos = [item for item in downloaded if item["type"] == "photo"]
     videos = [item for item in downloaded if item["type"] == "video"]
 
     content_blocks = []
-    multipart_files: dict = {}
-    opened_files = []
 
-    try:
-        # ── Фото-блок ─────────────────────────────────────────────────────────
-        if photos:
-            photo_refs = []
-            for idx, item in enumerate(photos[:TELEGRAM_MEDIA_GROUP_LIMIT]):
-                field_name = f"photo{idx}"
-                fobj = open(item["path"], "rb")
-                opened_files.append(fobj)
-                multipart_files[field_name] = (item["path"].name, fobj, "image/jpeg")
-                photo_refs.append(f"attach://{field_name}")
-
-            if len(photo_refs) == 1:
-                content_blocks.append({"type": "photo", "photo": photo_refs[0]})
-            else:
-                content_blocks.append({"type": "collage", "photos": photo_refs})
-
-        # ── Видео-блоки ───────────────────────────────────────────────────────
-        for idx, item in enumerate(videos[:TELEGRAM_MEDIA_GROUP_LIMIT]):
-            field_name = f"video{idx}"
-            fobj = open(item["path"], "rb")
-            opened_files.append(fobj)
-            multipart_files[field_name] = (item["path"].name, fobj, "video/mp4")
-            content_blocks.append({"type": "video", "video": f"attach://{field_name}"})
-
-        if not content_blocks:
-            print("  send_rich_post: нет медиа для отправки")
+    # ── Фото-блок ─────────────────────────────────────────────────────────────
+    if photos:
+        file_ids = []
+        for item in photos[:TELEGRAM_MEDIA_GROUP_LIMIT]:
+            fid = _upload_file_id_silent(item)
+            if fid:
+                file_ids.append(fid)
+        if not file_ids:
+            print("  send_rich_post: не удалось получить file_id ни для одного фото")
             return False
+        if len(file_ids) == 1:
+            content_blocks.append({"type": "photo", "photo": file_ids[0]})
+        else:
+            content_blocks.append({"type": "collage", "photos": file_ids})
 
-        # ── Текстовые блоки ───────────────────────────────────────────────────
-        content_blocks.extend(_html_to_rich_text_blocks(full_text))
+    # ── Видео-блоки ───────────────────────────────────────────────────────────
+    for item in videos[:TELEGRAM_MEDIA_GROUP_LIMIT]:
+        fid = _upload_file_id_silent(item)
+        if fid:
+            content_blocks.append({"type": "video", "video": fid})
 
-        # rich_message — InputRichMessage с полем blocks (массив RichBlock).
-        # Передаётся как JSON-строка в multipart-поле при наличии файлов.
-        input_rich_message = {"blocks": content_blocks}
-        data = {
-            "chat_id": CHANNEL_ID,
-            "rich_message": json.dumps(input_rich_message, ensure_ascii=False),
-        }
+    if not content_blocks:
+        print("  send_rich_post: нет медиа для отправки")
+        return False
 
+    # ── Текстовые блоки ───────────────────────────────────────────────────────
+    content_blocks.extend(_html_to_rich_text_blocks(full_text))
+
+    input_rich_message = {"blocks": content_blocks}
+    try:
         res = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendRichMessage",
-            data=data,
-            files=multipart_files,
-            timeout=120,
+            json={"chat_id": CHANNEL_ID, "rich_message": input_rich_message},
+            timeout=60,
         ).json()
-
         if not res.get("ok"):
-            print(f"  sendRichMessage FULL response: {json.dumps(res, ensure_ascii=False)}")
+            print(f"  sendRichMessage ошибка: {res.get('description')}")
             print(f"  blocks ({len(content_blocks)}): {json.dumps(content_blocks[:3], ensure_ascii=False)}")
-            print(f"  multipart fields: {list(multipart_files.keys())}")
         return res.get("ok", False)
-
     except Exception as e:
         print(f"  send_rich_post исключение: {e}")
         return False
-    finally:
-        for fobj in opened_files:
-            try:
-                fobj.close()
-            except Exception:
-                pass
 
 def send_to_telegram(
     media_items: list,
