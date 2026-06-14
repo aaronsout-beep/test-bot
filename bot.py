@@ -4707,55 +4707,120 @@ def _upload_file_id_silent(item: dict) -> str | None:
         return None
 
 
+def _build_rich_message_html(full_text: str, photo_file_ids: list, video_file_ids: list) -> str:
+    """
+    Собирает HTML-строку для поля rich_message.html согласно Bot API 10.1.
+
+    Медиа вставляется через тег <tg-collage> (2+ фото), <img> (1 фото),
+    <video> (видео). Все медиа-блоки — отдельными блоками, не внутри <p>.
+    Текст передаётся как есть: он уже содержит валидный Telegram HTML
+    (<b>, <i>, <a href="...">, <code> и т.д.).
+
+    ВАЖНО: Media blocks support only HTTP and HTTPS URLs — поэтому сюда
+    передаются НЕ file_id, а публичные HTTPS-URL (после загрузки на хостинг)
+    или временные https://api.telegram.org/file/bot{TOKEN}/{path} URL.
+    """
+    parts = []
+
+    # Текст поста — в начале
+    if full_text and full_text.strip():
+        parts.append(full_text.strip())
+
+    # Фото: 1 фото → <img>, 2+ фото → <tg-collage>
+    if len(photo_file_ids) == 1:
+        parts.append(f'<img src="{photo_file_ids[0]}"/>')
+    elif len(photo_file_ids) > 1:
+        imgs = "".join(f'<img src="{fid}"/>' for fid in photo_file_ids)
+        parts.append(f"<tg-collage>{imgs}</tg-collage>")
+
+    # Видео — каждое отдельным блоком
+    for fid in video_file_ids:
+        parts.append(f'<video src="{fid}"></video>')
+
+    return "\n".join(parts)
+
+
+def _get_public_url(item: dict) -> str | None:
+    """
+    Загружает файл в ALERT_CHANNEL_ID, получает file_id,
+    затем через getFile получает временный HTTPS-URL файла от Telegram.
+
+    Этот URL действителен ~1 час — достаточно для немедленной отправки
+    в sendRichMessage. Файл на стороне Telegram при этом не удаляется.
+
+    Возвращает HTTPS-URL или None при ошибке.
+    """
+    fid = _upload_file_id_silent(item)
+    if not fid:
+        return None
+    try:
+        res = requests.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/getFile",
+            params={"file_id": fid},
+            timeout=30,
+        ).json()
+        if not res.get("ok"):
+            print(f"  getFile ошибка: {res.get('description')}")
+            return None
+        file_path = res["result"].get("file_path", "")
+        if not file_path:
+            print("  getFile: пустой file_path")
+            return None
+        return f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+    except Exception as e:
+        print(f"  _get_public_url исключение: {e}")
+        return None
+
+
 def send_rich_post(downloaded: list, full_text: str) -> bool:
     """
     Публикует пост через sendRichMessage (Bot API 10.1+).
 
-    attach:// внутри rich_message не поддерживается Telegram — нужны file_id.
-    Стратегия: загружаем каждый файл через sendPhoto/sendVideo с
-    disable_notification=True, получаем file_id, сразу удаляем служебное
-    сообщение через deleteMessage, затем шлём sendRichMessage с file_id.
+    Стратегия получения медиа-URL:
+      1. Загружаем файл в ALERT_CHANNEL_ID (sendPhoto/sendVideo,
+         disable_notification=True) → получаем file_id.
+      2. Через getFile получаем временный HTTPS-URL файла
+         (https://api.telegram.org/file/bot{TOKEN}/{path}).
+      3. Передаём этот URL в тег <img src="..."> / <video src="...">
+         внутри html-поля InputRichMessage.
 
-    Структура контента:
-      • 1 фото             → RichBlockPhoto
-      • 2+ фото            → RichBlockCollage
-      • видео              → RichBlockVideo
-      • текст              → RichBlockParagraph / RichBlockList / RichBlockTable
+    Telegram скачивает файл по URL в момент обработки sendRichMessage,
+    поэтому URL должен быть доступен только в момент отправки запроса.
+    После успешного ответа от API исходные файлы можно удалять.
+
+    Примечание: поле rich_message принимает {"html": "..."} или
+    {"markdown": "..."} — НЕ {"blocks": [...]}. Это задокументировано
+    в Bot API 10.1 в разделе InputRichMessage.
     """
     photos = [item for item in downloaded if item["type"] == "photo"]
     videos = [item for item in downloaded if item["type"] == "video"]
 
-    content_blocks = []
+    # ── Получаем публичные URL для всех медиафайлов ───────────────────────────
+    photo_urls = []
+    for item in photos[:TELEGRAM_MEDIA_GROUP_LIMIT]:
+        url = _get_public_url(item)
+        if url:
+            photo_urls.append(url)
 
-    # ── Фото-блок ─────────────────────────────────────────────────────────────
-    if photos:
-        file_ids = []
-        for item in photos[:TELEGRAM_MEDIA_GROUP_LIMIT]:
-            fid = _upload_file_id_silent(item)
-            if fid:
-                file_ids.append(fid)
-        if not file_ids:
-            print("  send_rich_post: не удалось получить file_id ни для одного фото")
-            return False
-        if len(file_ids) == 1:
-            content_blocks.append({"type": "photo", "photo": file_ids[0]})
-        else:
-            content_blocks.append({"type": "collage", "photos": file_ids})
-
-    # ── Видео-блоки ───────────────────────────────────────────────────────────
+    video_urls = []
     for item in videos[:TELEGRAM_MEDIA_GROUP_LIMIT]:
-        fid = _upload_file_id_silent(item)
-        if fid:
-            content_blocks.append({"type": "video", "video": fid})
+        url = _get_public_url(item)
+        if url:
+            video_urls.append(url)
 
-    if not content_blocks:
-        print("  send_rich_post: нет медиа для отправки")
+    if not photo_urls and not video_urls:
+        print("  send_rich_post: не удалось получить URL ни для одного медиафайла")
         return False
 
-    # ── Текстовые блоки ───────────────────────────────────────────────────────
-    content_blocks.extend(_html_to_rich_text_blocks(full_text))
+    # ── Строим HTML для rich_message ──────────────────────────────────────────
+    html_body = _build_rich_message_html(full_text, photo_urls, video_urls)
 
-    input_rich_message = {"blocks": content_blocks}
+    if not html_body.strip():
+        print("  send_rich_post: пустой html_body — отмена")
+        return False
+
+    input_rich_message = {"html": html_body}
+
     try:
         res = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendRichMessage",
@@ -4764,7 +4829,8 @@ def send_rich_post(downloaded: list, full_text: str) -> bool:
         ).json()
         if not res.get("ok"):
             print(f"  sendRichMessage ошибка: {res.get('description')}")
-            print(f"  blocks ({len(content_blocks)}): {json.dumps(content_blocks[:3], ensure_ascii=False)}")
+            preview = html_body[:300].replace("\n", "\\n")
+            print(f"  html_body preview: {preview}")
         return res.get("ok", False)
     except Exception as e:
         print(f"  send_rich_post исключение: {e}")
