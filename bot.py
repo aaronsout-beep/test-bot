@@ -66,6 +66,7 @@ VK_DEFAULT_API_VERSION = "5.199"
 VK_API_VERSION = os.environ.get("VK_API_VERSION", "").strip() or VK_DEFAULT_API_VERSION
 VK_FROM_GROUP = os.environ.get("VK_FROM_GROUP", "1").strip()
 VK_CROSSPOST_DELAY_SECONDS = int((os.environ.get("VK_CROSSPOST_DELAY_SECONDS") or "0").strip())
+POST_DELAY_SECONDS = int((os.environ.get("POST_DELAY_SECONDS") or "3").strip())
 
 MAX_TOKEN = os.environ.get("MAX_TOKEN", "").strip()
 MAX_CHAT_ID = os.environ.get("MAX_CHAT_ID", "").strip()
@@ -4469,18 +4470,32 @@ def send_media_group(downloaded: list, caption: str) -> bool:
 
 def _upload_file_id(item: dict) -> str | None:
     """
-    Загружает файл в Telegram и возвращает file_id.
-    Используется для получения file_id перед вызовом sendRichMessage.
+    Загружает файл в Telegram через sendPhoto/sendVideo в приватный чат бота
+    (chat_id = bot user id) только для получения file_id — без публикации в канал.
+
+    ВАЖНО: этот метод НЕ используется в send_rich_post. Оставлен как запасной
+    вариант для других нужд. send_rich_post грузит файлы напрямую через multipart.
     """
     path = item["path"]
     media_type = item["type"]
     method = "sendVideo" if media_type == "video" else "sendPhoto"
     field  = "video"    if media_type == "video" else "photo"
+    # Получаем id самого бота для отправки в личный чат (не в канал)
+    try:
+        me = requests.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/getMe", timeout=10
+        ).json()
+        bot_id = me.get("result", {}).get("id")
+    except Exception:
+        bot_id = None
+    if not bot_id:
+        print(f"  _upload_file_id: не удалось получить id бота")
+        return None
     try:
         with open(path, "rb") as f:
             res = requests.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
-                data={"chat_id": CHANNEL_ID, "disable_notification": True},
+                data={"chat_id": bot_id, "disable_notification": True},
                 files={field: f},
                 timeout=90,
             ).json()
@@ -4661,59 +4676,81 @@ def send_rich_post(downloaded: list, full_text: str) -> bool:
     """
     Публикует пост через sendRichMessage (Bot API 10.1+).
 
-    Структура контента:
-      • 1 фото             → RichBlockPhoto
-      • 2+ фото            → RichBlockCollage
-      • видео (любое кол-во) → RichBlockVideo (по одному)
-      • текст              → RichBlockParagraph / RichBlockList / RichBlockTable
+    Медиа загружаются НАПРЯМУЮ через multipart/form-data в том же запросе —
+    без предварительного sendPhoto/sendVideo в канал. Это устраняет:
+      1. Двойную публикацию (sendPhoto публиковал фото без текста)
+      2. Ошибку «rich message must be non-empty» (file_id не возвращался)
 
-    full_text уже содержит переведённый текст и SIGNATURE.
+    Структура контента:
+      • 1 фото             → RichBlockPhoto  (attach://photo0)
+      • 2+ фото            → RichBlockCollage (attach://photo0, photo1, ...)
+      • видео              → RichBlockVideo   (attach://video0)
+      • текст              → RichBlockParagraph / RichBlockList / RichBlockTable
     """
-    # Разделяем фото и видео
     photos = [item for item in downloaded if item["type"] == "photo"]
     videos = [item for item in downloaded if item["type"] == "video"]
 
     content_blocks = []
+    multipart_files: dict = {}
+    opened_files = []
 
-    # ── Фото-блок ─────────────────────────────────────────────────────────────
-    if photos:
-        file_ids = []
-        for item in photos[:TELEGRAM_MEDIA_GROUP_LIMIT]:
-            fid = _upload_file_id(item)
-            if fid:
-                file_ids.append(fid)
+    try:
+        # ── Фото-блок ─────────────────────────────────────────────────────────
+        if photos:
+            photo_refs = []
+            for idx, item in enumerate(photos[:TELEGRAM_MEDIA_GROUP_LIMIT]):
+                field_name = f"photo{idx}"
+                fobj = open(item["path"], "rb")
+                opened_files.append(fobj)
+                multipart_files[field_name] = (item["path"].name, fobj, "image/jpeg")
+                photo_refs.append(f"attach://{field_name}")
 
-        if not file_ids:
-            print("  send_rich_post: не удалось загрузить ни одного фото")
+            if len(photo_refs) == 1:
+                content_blocks.append({"type": "photo", "photo": photo_refs[0]})
+            else:
+                content_blocks.append({"type": "collage", "photos": photo_refs})
+
+        # ── Видео-блоки ───────────────────────────────────────────────────────
+        for idx, item in enumerate(videos[:TELEGRAM_MEDIA_GROUP_LIMIT]):
+            field_name = f"video{idx}"
+            fobj = open(item["path"], "rb")
+            opened_files.append(fobj)
+            multipart_files[field_name] = (item["path"].name, fobj, "video/mp4")
+            content_blocks.append({"type": "video", "video": f"attach://{field_name}"})
+
+        if not content_blocks:
+            print("  send_rich_post: нет медиа для отправки")
             return False
 
-        if len(file_ids) == 1:
-            # RichBlockPhoto
-            content_blocks.append({"type": "photo", "photo": file_ids[0]})
-        else:
-            # RichBlockCollage
-            content_blocks.append({
-                "type": "collage",
-                "photos": file_ids,
-            })
+        # ── Текстовые блоки ───────────────────────────────────────────────────
+        content_blocks.extend(_html_to_rich_text_blocks(full_text))
 
-    # ── Видео-блоки ───────────────────────────────────────────────────────────
-    for item in videos[:TELEGRAM_MEDIA_GROUP_LIMIT]:
-        fid = _upload_file_id(item)
-        if fid:
-            content_blocks.append({"type": "video", "video": fid})
+        # content передаётся как JSON-строка в multipart-поле
+        data = {
+            "chat_id": CHANNEL_ID,
+            "content": json.dumps(content_blocks, ensure_ascii=False),
+        }
 
-    if not content_blocks:
-        print("  send_rich_post: нет медиа после загрузки")
+        res = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendRichMessage",
+            data=data,
+            files=multipart_files,
+            timeout=120,
+        ).json()
+
+        if not res.get("ok"):
+            print(f"  sendRichMessage ошибка: {res.get('description')}")
+        return res.get("ok", False)
+
+    except Exception as e:
+        print(f"  send_rich_post исключение: {e}")
         return False
-
-    # ── Текстовые блоки ───────────────────────────────────────────────────────
-    content_blocks.extend(_html_to_rich_text_blocks(full_text))
-
-    res = tg("sendRichMessage", {"chat_id": CHANNEL_ID, "content": content_blocks})
-    if not res.get("ok"):
-        print(f"  sendRichMessage ошибка: {res.get('description')}")
-    return res.get("ok", False)
+    finally:
+        for fobj in opened_files:
+            try:
+                fobj.close()
+            except Exception:
+                pass
 
 def send_to_telegram(
     media_items: list,
@@ -4818,6 +4855,8 @@ def send_to_telegram(
         crosspost_after_telegram(final_text, downloaded=downloaded)
 
     shutil.rmtree(MEDIA_DIR, ignore_errors=True)
+    if POST_DELAY_SECONDS > 0:
+        time.sleep(POST_DELAY_SECONDS)
     return sent_ok
 
 
