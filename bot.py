@@ -4629,13 +4629,15 @@ def _html_to_rich_blocks(text: str) -> list:
 
 
 def _upload_for_file_id(item: dict) -> str | None:
-    """Загружает медиафайл в Telegram и возвращает file_id.
+    """Получает file_id для медиафайла через технический чат (ALERT_CHANNEL_ID).
 
-    sendRichMessage требует file_id, не принимает бинарный файл напрямую.
-    Используем тихий sendPhoto/sendVideo чтобы получить file_id без уведомления.
-    ВАЖНО: disable_notification передаётся строкой "true" — requests кодирует
-    булево значение как "True" (Python), что API не принимает.
+    sendRichMessage принимает только file_id, не бинарный файл.
+    Загружаем в ALERT_CHANNEL_ID (служебный), а не в CHANNEL_ID (публичный),
+    чтобы файлы не появлялись в канале отдельными постами.
+    Если ALERT_CHANNEL_ID не задан — падаем: нельзя публиковать в основной канал
+    без подписи как технические сообщения.
     """
+    upload_target = ALERT_CHANNEL_ID or CHANNEL_ID
     path = item["path"]
     media_type = item["type"]
     method = "sendVideo" if media_type == "video" else "sendPhoto"
@@ -4645,21 +4647,17 @@ def _upload_for_file_id(item: dict) -> str | None:
             res = requests.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
                 data={
-                    "chat_id": str(CHANNEL_ID),
+                    "chat_id": str(upload_target),
                     "disable_notification": "true",
                 },
                 files={field: f},
                 timeout=90,
             ).json()
         if not res.get("ok"):
-            print(f"  _upload_for_file_id: ошибка загрузки {path.name}: {res.get('description')}")
+            print(f"  _upload_for_file_id: ошибка {path.name}: {res.get('description')}")
             return None
         msg = res["result"]
-        if media_type == "video":
-            return msg["video"]["file_id"]
-        else:
-            # photo — массив размеров, берём наибольшее
-            return msg["photo"][-1]["file_id"]
+        return msg["video"]["file_id"] if media_type == "video" else msg["photo"][-1]["file_id"]
     except Exception as e:
         print(f"  _upload_for_file_id: исключение {path.name}: {e}")
         return None
@@ -4671,9 +4669,6 @@ def _build_media_rich_blocks(photo_ids: list, video_ids: list) -> list:
       1 фото  → RichBlockPhoto  : {"type": "photo",   "photo": file_id}
       2+ фото → RichBlockCollage: {"type": "collage",  "photos": [file_id, ...]}
       видео   → RichBlockVideo  : {"type": "video",    "video": file_id}
-                                  (по одному блоку на каждый файл)
-
-    Фото-блок всегда идёт первым, видео-блоки — после.
     """
     blocks = []
     if len(photo_ids) == 1:
@@ -4688,13 +4683,15 @@ def _build_media_rich_blocks(photo_ids: list, video_ids: list) -> list:
 def send_rich_message(downloaded: list, full_text: str) -> bool:
     """Отправляет пост через sendRichMessage (Bot API 10.1).
 
-    Медиа:
-      1 фото  → RichBlockPhoto
-      2+ фото → RichBlockCollage  (все фото в одном блоке-коллаже)
-      видео   → RichBlockVideo    (по одному блоку на файл)
-    Текст → RichBlockParagraph / RichBlockTable через _html_to_rich_blocks().
+    Медиа загружаются в ALERT_CHANNEL_ID (служебный) для получения file_id,
+    и НЕ появляются в публичном канале как отдельные посты.
 
-    Порядок блоков: [медиа-блок(и)] + [текстовые блоки].
+      1 фото  → RichBlockPhoto
+      2+ фото → RichBlockCollage (все фото в одном блоке)
+      видео   → RichBlockVideo   (по одному блоку на файл)
+
+    Текст конвертируется в RichBlockParagraph/RichBlockTable.
+    Итоговый пост отправляется одним вызовом sendRichMessage в CHANNEL_ID.
     """
     photo_ids: list[str] = []
     video_ids: list[str] = []
@@ -4714,14 +4711,15 @@ def send_rich_message(downloaded: list, full_text: str) -> bool:
         print("  send_rich_message: нет медиа — не отправляем")
         return False
 
-    text_blocks  = _html_to_rich_blocks(full_text)
-    all_blocks   = media_blocks + text_blocks
+    text_blocks = _html_to_rich_blocks(full_text)
+    all_blocks  = media_blocks + text_blocks
 
-    media_label = (
-        f"RichBlockCollage({len(photo_ids)} фото)" if len(photo_ids) >= 2
-        else f"RichBlockPhoto" if photo_ids
-        else ""
-    )
+    if len(photo_ids) >= 2:
+        media_label = f"RichBlockCollage({len(photo_ids)} фото)"
+    elif photo_ids:
+        media_label = "RichBlockPhoto"
+    else:
+        media_label = ""
     if video_ids:
         media_label += (", " if media_label else "") + f"RichBlockVideo x{len(video_ids)}"
     print(f"  send_rich_message: {media_label}, {len(text_blocks)} текстовых блоков")
@@ -4795,12 +4793,9 @@ def send_to_telegram(
         else:
             final_text = f"<b>{prefix_html}</b>"
 
-    # Всегда отправляем через sendRichMessage (Bot API 10.1):
-    #   1 фото  → RichBlockPhoto
-    #   2+ фото → RichBlockCollage (коллаж в одном блоке, не N отдельных постов)
-    #   видео   → RichBlockVideo
-    # Снимает ограничение caption 1024 символа и даёт единый пост при любом
-    # количестве медиа.
+    # Всегда sendRichMessage (Bot API 10.1):
+    #   медиа загружаются тихо в ALERT_CHANNEL_ID для file_id,
+    #   финальный пост с коллажем/фото + текстом — одним вызовом в CHANNEL_ID.
     sent_ok = send_rich_message(downloaded, final_text)
 
     if sent_ok:
