@@ -4725,10 +4725,12 @@ def send_rich_post(downloaded: list, full_text: str) -> bool:
         # ── Текстовые блоки ───────────────────────────────────────────────────
         content_blocks.extend(_html_to_rich_text_blocks(full_text))
 
-        # content передаётся как JSON-строка в multipart-поле
+        # rich_message — InputRichMessage с полем blocks (массив RichBlock).
+        # Передаётся как JSON-строка в multipart-поле при наличии файлов.
+        input_rich_message = {"blocks": content_blocks}
         data = {
             "chat_id": CHANNEL_ID,
-            "content": json.dumps(content_blocks, ensure_ascii=False),
+            "rich_message": json.dumps(input_rich_message, ensure_ascii=False),
         }
 
         res = requests.post(
@@ -4739,7 +4741,9 @@ def send_rich_post(downloaded: list, full_text: str) -> bool:
         ).json()
 
         if not res.get("ok"):
-            print(f"  sendRichMessage ошибка: {res.get('description')}")
+            print(f"  sendRichMessage FULL response: {json.dumps(res, ensure_ascii=False)}")
+            print(f"  blocks ({len(content_blocks)}): {json.dumps(content_blocks[:3], ensure_ascii=False)}")
+            print(f"  multipart fields: {list(multipart_files.keys())}")
         return res.get("ok", False)
 
     except Exception as e:
