@@ -73,6 +73,9 @@ jobs:
           VK_API_VERSION:     ${{ secrets.VK_API_VERSION }}
           VK_FROM_GROUP:      ${{ secrets.VK_FROM_GROUP }}
           VK_CROSSPOST_DELAY_MINUTES:  ${{ vars.VK_CROSSPOST_DELAY_MINUTES || '1' }}
+          CLOUDINARY_CLOUD_NAME:   ${{ secrets.CLOUDINARY_CLOUD_NAME }}
+          CLOUDINARY_API_KEY:      ${{ secrets.CLOUDINARY_API_KEY }}
+          CLOUDINARY_API_SECRET:   ${{ secrets.CLOUDINARY_API_SECRET }}
         run: python bot.py --step 3
 
       - name: Save state

@@ -92,9 +92,12 @@ jobs:
           MAX_USER_ID:                        ${{ secrets.MAX_USER_ID }}
           ALERT_CHANNEL_ID:                   ${{ secrets.ALERT_CHANNEL_ID }}
           BOT_NAME:                           ${{ vars.BOT_NAME || 'NicoPazBot' }}
-          SIGNATURE_HASHTAG:                  ${{ secrets.SIGNATURE_HASHTAG }}
-          SIGNATURE_URL:                      ${{ secrets.SIGNATURE_URL }}
-          SIGNATURE_URL_TEXT:                 ${{ secrets.SIGNATURE_URL_TEXT }}
+          SIGNATURE_HASHTAG:     ${{ secrets.SIGNATURE_HASHTAG }}
+          SIGNATURE_URL:         ${{ secrets.SIGNATURE_URL }}
+          SIGNATURE_URL_TEXT:    ${{ secrets.SIGNATURE_URL_TEXT }}
+          CLOUDINARY_CLOUD_NAME:   ${{ secrets.CLOUDINARY_CLOUD_NAME }}
+          CLOUDINARY_API_KEY:      ${{ secrets.CLOUDINARY_API_KEY }}
+          CLOUDINARY_API_SECRET:   ${{ secrets.CLOUDINARY_API_SECRET }}
         run: python bot.py --step 2
 
       - name: Save state

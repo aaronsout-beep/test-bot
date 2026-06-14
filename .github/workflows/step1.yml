@@ -49,31 +49,34 @@ jobs:
 
       - name: Run bot
         env:
-          BOT_TOKEN:          ${{ secrets.BOT_TOKEN }}
-          CHANNEL_ID:         ${{ secrets.CHANNEL_ID }}
-          DEEPL_KEY:          ${{ secrets.DEEPL_KEY }}
-          OPENROUTER_KEY:     ${{ secrets.OPENROUTER_KEY }}
-          OPENROUTER_MODEL:   ${{ secrets.OPENROUTER_MODEL }}
-          GEMINI_API_KEY:     ${{ secrets.GEMINI_API_KEY }}
-          FORMAT_RAG_ENABLED: "1"
-          STEP1_KEYWORDS:     ${{ secrets.STEP1_KEYWORDS }}
-          STEP1_ACCOUNTS:     ${{ secrets.STEP1_ACCOUNTS }}
-          SCWEET_AUTH_TOKEN:  ${{ secrets.SCWEET_AUTH_TOKEN }}
-          SCWEET_PROXY:       ${{ secrets.SCWEET_PROXY }}
-          STEP1_LIMIT:        ${{ vars.STEP1_LIMIT || '50' }}
-          VK_ACCESS_TOKEN:    ${{ secrets.VK_ACCESS_TOKEN }}
-          VK_OWNER_ID:        ${{ secrets.VK_OWNER_ID }}
-          VK_API_VERSION:     ${{ secrets.VK_API_VERSION }}
-          VK_FROM_GROUP:      ${{ secrets.VK_FROM_GROUP }}
-          VK_CROSSPOST_DELAY_MINUTES:  ${{ vars.VK_CROSSPOST_DELAY_MINUTES || '1' }}
-          MAX_TOKEN:          ${{ secrets.MAX_TOKEN }}
-          MAX_CHAT_ID:        ${{ secrets.MAX_CHAT_ID }}
-          MAX_USER_ID:        ${{ secrets.MAX_USER_ID }}
-          ALERT_CHANNEL_ID:   ${{ secrets.ALERT_CHANNEL_ID }}
-          BOT_NAME:           ${{ vars.BOT_NAME || 'NicoPazBot' }}
-          SIGNATURE_HASHTAG:  ${{ secrets.SIGNATURE_HASHTAG }}
-          SIGNATURE_URL:      ${{ secrets.SIGNATURE_URL }}
-          SIGNATURE_URL_TEXT: ${{ secrets.SIGNATURE_URL_TEXT }}
+          BOT_TOKEN:               ${{ secrets.BOT_TOKEN }}
+          CHANNEL_ID:              ${{ secrets.CHANNEL_ID }}
+          DEEPL_KEY:               ${{ secrets.DEEPL_KEY }}
+          OPENROUTER_KEY:          ${{ secrets.OPENROUTER_KEY }}
+          OPENROUTER_MODEL:        ${{ secrets.OPENROUTER_MODEL }}
+          GEMINI_API_KEY:          ${{ secrets.GEMINI_API_KEY }}
+          FORMAT_RAG_ENABLED:      "1"
+          STEP1_KEYWORDS:          ${{ secrets.STEP1_KEYWORDS }}
+          STEP1_ACCOUNTS:          ${{ secrets.STEP1_ACCOUNTS }}
+          SCWEET_AUTH_TOKEN:       ${{ secrets.SCWEET_AUTH_TOKEN }}
+          SCWEET_PROXY:            ${{ secrets.SCWEET_PROXY }}
+          STEP1_LIMIT:             ${{ vars.STEP1_LIMIT || '50' }}
+          VK_ACCESS_TOKEN:         ${{ secrets.VK_ACCESS_TOKEN }}
+          VK_OWNER_ID:             ${{ secrets.VK_OWNER_ID }}
+          VK_API_VERSION:          ${{ secrets.VK_API_VERSION }}
+          VK_FROM_GROUP:           ${{ secrets.VK_FROM_GROUP }}
+          VK_CROSSPOST_DELAY_MINUTES: ${{ vars.VK_CROSSPOST_DELAY_MINUTES || '1' }}
+          MAX_TOKEN:               ${{ secrets.MAX_TOKEN }}
+          MAX_CHAT_ID:             ${{ secrets.MAX_CHAT_ID }}
+          MAX_USER_ID:             ${{ secrets.MAX_USER_ID }}
+          ALERT_CHANNEL_ID:        ${{ secrets.ALERT_CHANNEL_ID }}
+          BOT_NAME:                ${{ vars.BOT_NAME || 'NicoPazBot' }}
+          SIGNATURE_HASHTAG:       ${{ secrets.SIGNATURE_HASHTAG }}
+          SIGNATURE_URL:           ${{ secrets.SIGNATURE_URL }}
+          SIGNATURE_URL_TEXT:      ${{ secrets.SIGNATURE_URL_TEXT }}
+          CLOUDINARY_CLOUD_NAME:   ${{ secrets.CLOUDINARY_CLOUD_NAME }}
+          CLOUDINARY_API_KEY:      ${{ secrets.CLOUDINARY_API_KEY }}
+          CLOUDINARY_API_SECRET:   ${{ secrets.CLOUDINARY_API_SECRET }}
         run: python bot.py --step 1
 
       - name: Save state
