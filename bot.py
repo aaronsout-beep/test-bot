@@ -44,10 +44,13 @@ DEEPL_KEY = os.environ.get("DEEPL_KEY", "").strip()
 OPENROUTER_KEY = os.environ.get("OPENROUTER_KEY", "")
 YANDEX_API_KEY   = os.environ.get("YANDEX_API_KEY", "").strip()
 YANDEX_FOLDER_ID = os.environ.get("YANDEX_FOLDER_ID", "").strip()
-YANDEX_API_URL   = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+# Qwen3 235B FP8 доступна только через новый OpenAI-совместимый эндпоинт AI
+# Studio (/v1/chat/completions), а не через старый foundationModels/v1/completion —
+# тот отвечает 404 "unknown model", т.к. ничего не знает про эту marketplace-модель.
+YANDEX_API_URL   = "https://ai.api.cloud.yandex.net/v1/chat/completions"
 # Основная модель для перевода, редактуры, проверки глоссария и RAG-верстки —
-# Qwen3 235B, доступная через Yandex Foundation Models API.
-YANDEX_QWEN_MODEL = (os.environ.get("YANDEX_QWEN_MODEL") or "qwen3-235b-a22b/latest").strip()
+# Qwen3 235B FP8, доступная через Yandex AI Studio.
+YANDEX_QWEN_MODEL = (os.environ.get("YANDEX_QWEN_MODEL") or "qwen3-235b-a22b-fp8/latest").strip()
 # Fallback-модель для этапов редактуры/глоссария/RAG на случай перегрузки Qwen3 (429/503).
 YANDEX_EDIT_FALLBACK_MODEL = (os.environ.get("YANDEX_EDIT_FALLBACK_MODEL") or "yandexgpt/latest").strip()
 OPENROUTER_MODEL = (
@@ -227,7 +230,7 @@ SOURCE_DUPLICATE_TEXT_MIN_CHARS = int((os.environ.get("SOURCE_DUPLICATE_TEXT_MIN
 # Основная модель финальной AI-проверки верстки (ai_check_telegram_layout) —
 # Qwen3 235B через Yandex Foundation Models API. LAYOUT_AI_MODEL (Gemini)
 # используется только как fallback, если Qwen3 недоступен/вернул ошибку.
-LAYOUT_AI_QWEN_MODEL = (os.environ.get("LAYOUT_AI_QWEN_MODEL") or "qwen3-235b-a22b/latest").strip()
+LAYOUT_AI_QWEN_MODEL = (os.environ.get("LAYOUT_AI_QWEN_MODEL") or "qwen3-235b-a22b-fp8/latest").strip()
 LAYOUT_AI_MODEL = os.environ.get(
     "LAYOUT_AI_MODEL",
     "gemini-2.5-flash-lite",
@@ -239,8 +242,8 @@ STYLE_EDIT_ENABLED = os.environ.get("STYLE_EDIT_ENABLED", "1").strip().lower() n
 }
 # Редактура и проверка глоссария теперь выполняются через Qwen3 235B (Yandex),
 # а не через Gemini. Модели можно переопределить через .env при необходимости.
-STYLE_EDIT_MODEL = (os.environ.get("STYLE_EDIT_MODEL") or "qwen3-235b-a22b/latest").strip()
-GLOSSARY_EDIT_MODEL = (os.environ.get("GLOSSARY_EDIT_MODEL") or "qwen3-235b-a22b/latest").strip()
+STYLE_EDIT_MODEL = (os.environ.get("STYLE_EDIT_MODEL") or "qwen3-235b-a22b-fp8/latest").strip()
+GLOSSARY_EDIT_MODEL = (os.environ.get("GLOSSARY_EDIT_MODEL") or "qwen3-235b-a22b-fp8/latest").strip()
 STYLE_EDIT_MAX_CHARS = int(os.environ.get("STYLE_EDIT_MAX_CHARS", "1800"))
 STYLE_EDIT_TIMEOUT = int(os.environ.get("STYLE_EDIT_TIMEOUT", "18"))
 FORMAT_RAG_ENABLED = os.environ.get("FORMAT_RAG_ENABLED", "1").strip().lower() not in {
@@ -250,7 +253,7 @@ FORMAT_RAG_ENABLED = os.environ.get("FORMAT_RAG_ENABLED", "1").strip().lower() n
 # был OPENROUTER_MODEL — этот вариант больше не используется.
 FORMAT_RAG_MODEL = (
     os.environ.get("FORMAT_RAG_MODEL")
-    or "qwen3-235b-a22b/latest"
+    or "qwen3-235b-a22b-fp8/latest"
 ).strip()
 MEDIA_DIR = Path("media_tmp")
 REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; NicoPazBot/1.0)"}
@@ -2685,23 +2688,22 @@ def translate_yandex(text: str) -> str | None:
             headers={
                 "Authorization": f"Api-Key {YANDEX_API_KEY}",
                 "Content-Type": "application/json",
+                "OpenAI-Project": YANDEX_FOLDER_ID,
             },
             json={
-                "modelUri": f"gpt://{YANDEX_FOLDER_ID}/{YANDEX_QWEN_MODEL}",
-                "completionOptions": {
-                    "stream": False,
-                    "temperature": 0.1,
-                    "maxTokens": 2000,
-                },
+                "model": f"gpt://{YANDEX_FOLDER_ID}/{YANDEX_QWEN_MODEL}",
+                "stream": False,
+                "temperature": 0.1,
+                "max_tokens": 2000,
                 "messages": [
-                    {"role": "system", "text": _YANDEX_TRANSLATION_SYSTEM_PROMPT},
-                    {"role": "user",   "text": text},
+                    {"role": "system", "content": _YANDEX_TRANSLATION_SYSTEM_PROMPT},
+                    {"role": "user",   "content": text},
                 ],
             },
             timeout=30,
         )
         r.raise_for_status()
-        result = r.json()["result"]["alternatives"][0]["message"]["text"].strip()
+        result = r.json()["choices"][0]["message"]["content"].strip()
         if not result:
             raise ValueError("Пустой ответ от Qwen3")
         if not _looks_translated_to_russian(text, result):
@@ -2839,6 +2841,23 @@ def gemini_text_completion(
     raise last_exc  # type: ignore[misc]
 
 
+def _to_openai_messages(messages: list[dict]) -> list[dict]:
+    """Конвертирует сообщения формата Yandex Foundation Models
+    ({"role":.., "text":..}) в формат OpenAI-совместимого API
+    ({"role":.., "content":..}), используемого /v1/chat/completions.
+
+    Позволяет не переписывать все места вызова yandex_qwen_completion —
+    они по-прежнему передают messages с ключом "text".
+    """
+    converted = []
+    for m in messages:
+        if "content" in m:
+            converted.append(m)
+        else:
+            converted.append({"role": m.get("role"), "content": m.get("text", "")})
+    return converted
+
+
 def yandex_qwen_completion(
     messages: list[dict],
     max_tokens: int,
@@ -2847,7 +2866,8 @@ def yandex_qwen_completion(
     json_object: bool = False,
     model: str | None = None,
 ) -> str:
-    """Вызов Qwen3 235B через Yandex Foundation Models API.
+    """Вызов Qwen3 235B FP8 через новый OpenAI-совместимый эндпоинт Yandex AI
+    Studio (/v1/chat/completions).
 
     Используется для редактуры, проверки глоссария и RAG-верстки (раньше эти
     этапы шли через Gemini). При 429/503 автоматически пробует
@@ -2861,32 +2881,33 @@ def yandex_qwen_completion(
     if YANDEX_EDIT_FALLBACK_MODEL and YANDEX_EDIT_FALLBACK_MODEL != primary_model:
         models_to_try.append(YANDEX_EDIT_FALLBACK_MODEL)
 
+    openai_messages = _to_openai_messages(messages)
+
     last_exc: Exception | None = None
     for attempt_model in models_to_try:
         body = {
-            "modelUri": f"gpt://{YANDEX_FOLDER_ID}/{attempt_model}",
-            "completionOptions": {
-                "stream": False,
-                "temperature": temperature,
-                "maxTokens": max_tokens,
-            },
-            "messages": messages,
+            "model": f"gpt://{YANDEX_FOLDER_ID}/{attempt_model}",
+            "stream": False,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "messages": openai_messages,
         }
         if json_object:
-            body["json_object"] = True
+            body["response_format"] = {"type": "json_object"}
         try:
             r = requests.post(
                 YANDEX_API_URL,
                 headers={
                     "Authorization": f"Api-Key {YANDEX_API_KEY}",
                     "Content-Type": "application/json",
+                    "OpenAI-Project": YANDEX_FOLDER_ID,
                 },
                 json=body,
                 timeout=timeout,
             )
             r.raise_for_status()
             data = r.json()
-            result = data["result"]["alternatives"][0]["message"]["text"].strip()
+            result = data["choices"][0]["message"]["content"].strip()
             if attempt_model != primary_model:
                 print(f"  Qwen3 (Yandex) fallback: использована модель {attempt_model}")
             return result
