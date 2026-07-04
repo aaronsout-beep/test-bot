@@ -25,6 +25,9 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
       # Восстанавливаем состояние из кэша предыдущего run.
       # restore-keys без run_id гарантирует что найдётся любой предыдущий кэш.
       - name: Restore state
@@ -73,9 +76,8 @@ jobs:
           VK_API_VERSION:     ${{ secrets.VK_API_VERSION }}
           VK_FROM_GROUP:      ${{ secrets.VK_FROM_GROUP }}
           VK_CROSSPOST_DELAY_MINUTES:  ${{ vars.VK_CROSSPOST_DELAY_MINUTES || '1' }}
-          CLOUDINARY_CLOUD_NAME:   ${{ secrets.CLOUDINARY_CLOUD_NAME }}
-          CLOUDINARY_API_KEY:      ${{ secrets.CLOUDINARY_API_KEY }}
-          CLOUDINARY_API_SECRET:   ${{ secrets.CLOUDINARY_API_SECRET }}
+          YANDEX_API_KEY:    ${{ secrets.YANDEX_API_KEY }}
+          YANDEX_FOLDER_ID:  ${{ secrets.YANDEX_FOLDER_ID }}
         run: python bot.py --step 3
 
       - name: Save state

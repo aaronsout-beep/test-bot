@@ -24,6 +24,9 @@ jobs:
           python-version: '3.11'
 
       - run: pip install -r requirements.txt
+      
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
       - name: Restore state
         id: restore
@@ -93,6 +96,8 @@ jobs:
           SIGNATURE_HASHTAG:     ${{ secrets.SIGNATURE_HASHTAG }}
           SIGNATURE_URL:         ${{ secrets.SIGNATURE_URL }}
           SIGNATURE_URL_TEXT:    ${{ secrets.SIGNATURE_URL_TEXT }}
+          YANDEX_API_KEY:    ${{ secrets.YANDEX_API_KEY }}
+          YANDEX_FOLDER_ID:  ${{ secrets.YANDEX_FOLDER_ID }}
         run: python bot.py --step 4
 
       - name: Save state
