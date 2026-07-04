@@ -47,7 +47,7 @@ YANDEX_FOLDER_ID = os.environ.get("YANDEX_FOLDER_ID", "").strip()
 YANDEX_API_URL   = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
 # Основная модель для перевода, редактуры, проверки глоссария и RAG-верстки —
 # Qwen3 235B, доступная через Yandex Foundation Models API.
-YANDEX_QWEN_MODEL = (os.environ.get("YANDEX_QWEN_MODEL") or "qwen3-235b-a22b-fp8/latest").strip()
+YANDEX_QWEN_MODEL = (os.environ.get("YANDEX_QWEN_MODEL") or "qwen3-235b-a22b/latest").strip()
 # Fallback-модель для этапов редактуры/глоссария/RAG на случай перегрузки Qwen3 (429/503).
 YANDEX_EDIT_FALLBACK_MODEL = (os.environ.get("YANDEX_EDIT_FALLBACK_MODEL") or "yandexgpt/latest").strip()
 OPENROUTER_MODEL = (
@@ -227,7 +227,7 @@ SOURCE_DUPLICATE_TEXT_MIN_CHARS = int((os.environ.get("SOURCE_DUPLICATE_TEXT_MIN
 # Основная модель финальной AI-проверки верстки (ai_check_telegram_layout) —
 # Qwen3 235B через Yandex Foundation Models API. LAYOUT_AI_MODEL (Gemini)
 # используется только как fallback, если Qwen3 недоступен/вернул ошибку.
-LAYOUT_AI_QWEN_MODEL = (os.environ.get("LAYOUT_AI_QWEN_MODEL") or "qwen3-235b-a22b-fp8/latest").strip()
+LAYOUT_AI_QWEN_MODEL = (os.environ.get("LAYOUT_AI_QWEN_MODEL") or "qwen3-235b-a22b/latest").strip()
 LAYOUT_AI_MODEL = os.environ.get(
     "LAYOUT_AI_MODEL",
     "gemini-2.5-flash-lite",
@@ -239,8 +239,8 @@ STYLE_EDIT_ENABLED = os.environ.get("STYLE_EDIT_ENABLED", "1").strip().lower() n
 }
 # Редактура и проверка глоссария теперь выполняются через Qwen3 235B (Yandex),
 # а не через Gemini. Модели можно переопределить через .env при необходимости.
-STYLE_EDIT_MODEL = (os.environ.get("STYLE_EDIT_MODEL") or "qwen3-235b-a22b-fp8/latest").strip()
-GLOSSARY_EDIT_MODEL = (os.environ.get("GLOSSARY_EDIT_MODEL") or "qwen3-235b-a22b-fp8/latest").strip()
+STYLE_EDIT_MODEL = (os.environ.get("STYLE_EDIT_MODEL") or "qwen3-235b-a22b/latest").strip()
+GLOSSARY_EDIT_MODEL = (os.environ.get("GLOSSARY_EDIT_MODEL") or "qwen3-235b-a22b/latest").strip()
 STYLE_EDIT_MAX_CHARS = int(os.environ.get("STYLE_EDIT_MAX_CHARS", "1800"))
 STYLE_EDIT_TIMEOUT = int(os.environ.get("STYLE_EDIT_TIMEOUT", "18"))
 FORMAT_RAG_ENABLED = os.environ.get("FORMAT_RAG_ENABLED", "1").strip().lower() not in {
@@ -250,7 +250,7 @@ FORMAT_RAG_ENABLED = os.environ.get("FORMAT_RAG_ENABLED", "1").strip().lower() n
 # был OPENROUTER_MODEL — этот вариант больше не используется.
 FORMAT_RAG_MODEL = (
     os.environ.get("FORMAT_RAG_MODEL")
-    or "qwen3-235b-a22b-fp8/latest"
+    or "qwen3-235b-a22b/latest"
 ).strip()
 MEDIA_DIR = Path("media_tmp")
 REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; NicoPazBot/1.0)"}
@@ -907,7 +907,11 @@ def openrouter_semantic_duplicate(text: str, candidates: list) -> bool:
             data = _qwen_semantic_duplicate_check(prompt)
         except requests.HTTPError as e:
             status = e.response.status_code if e.response is not None else "?"
-            print(f"  Qwen3 (Yandex) проверка дублей недоступна: HTTP {status} — пробуем Gemini")
+            body_snippet = _http_error_body_snippet(e)
+            print(
+                f"  Qwen3 (Yandex) проверка дублей недоступна: HTTP {status} — пробуем Gemini"
+                + (f" | тело: {body_snippet}" if body_snippet else "")
+            )
         except Exception as e:
             print(f"  Qwen3 (Yandex) проверка дублей недоступна: {e} — пробуем Gemini")
 
@@ -2648,6 +2652,24 @@ _YANDEX_TRANSLATION_SYSTEM_PROMPT = (
 )
 
 
+def _http_error_body_snippet(e: "requests.HTTPError", limit: int = 300) -> str:
+    """Возвращает первые `limit` символов тела ответа с ошибкой (если есть).
+
+    Используется для диагностики HTTP 4xx/5xx от Yandex Foundation Models —
+    сам код статуса часто не объясняет причину (неверный modelUri, нет прав
+    на фолдер, неподдерживаемый параметр и т.п.), а тело ответа обычно
+    содержит понятное сообщение.
+    """
+    try:
+        if e.response is None:
+            return ""
+        body = e.response.text or ""
+        body = body.strip().replace("\n", " ")
+        return body[:limit]
+    except Exception:
+        return ""
+
+
 def translate_yandex(text: str) -> str | None:
     """Перевод через Qwen3 235B (Yandex Foundation Models). Возвращает None при любой ошибке."""
     if not text:
@@ -2687,7 +2709,8 @@ def translate_yandex(text: str) -> str | None:
         return result
     except requests.HTTPError as e:
         status = e.response.status_code if e.response is not None else "?"
-        print(f"  Qwen3 (Yandex) перевод HTTP {status}: {e}")
+        body_snippet = _http_error_body_snippet(e)
+        print(f"  Qwen3 (Yandex) перевод HTTP {status}: {e}" + (f" | тело: {body_snippet}" if body_snippet else ""))
         return None
     except Exception as e:
         print(f"  Qwen3 (Yandex) перевод ошибка: {e}")
@@ -2869,10 +2892,13 @@ def yandex_qwen_completion(
             return result
         except requests.HTTPError as e:
             status = e.response.status_code if e.response is not None else 0
+            body_snippet = _http_error_body_snippet(e)
+            body_suffix = f" | тело: {body_snippet}" if body_snippet else ""
             if status in (429, 503) and attempt_model != models_to_try[-1]:
-                print(f"  Qwen3 (Yandex) {attempt_model} → {status}, пробуем fallback...")
+                print(f"  Qwen3 (Yandex) {attempt_model} → {status}, пробуем fallback...{body_suffix}")
                 last_exc = e
                 continue
+            print(f"  Qwen3 (Yandex) {attempt_model} → HTTP {status}{body_suffix}")
             raise
         except Exception:
             raise
@@ -4122,7 +4148,11 @@ def rag_check_telegram_layout(text: str) -> str:
         result = parse_checker_json(content)
     except requests.HTTPError as e:
         status = e.response.status_code if e.response is not None else "?"
-        print(f"  RAG-проверка верстки недоступна: HTTP {status} от Qwen3 (Yandex)")
+        body_snippet = _http_error_body_snippet(e)
+        print(
+            f"  RAG-проверка верстки недоступна: HTTP {status} от Qwen3 (Yandex)"
+            + (f" | тело: {body_snippet}" if body_snippet else "")
+        )
         return text
     except Exception as e:
         print(f"  RAG-проверка верстки недоступна: {e}")
