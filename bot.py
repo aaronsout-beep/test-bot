@@ -5521,6 +5521,9 @@ def _vk_web_cookie_expires(cookie: dict):
     return -1
 
 
+_VK_WEB_ALLOWED_COOKIE_DOMAINS = ("vk.com", "vk.ru")
+
+
 def _vk_web_cookies_to_storage_state(data):
     if isinstance(data, dict) and isinstance(data.get("cookies"), list):
         if isinstance(data.get("origins"), list):
@@ -5529,8 +5532,15 @@ def _vk_web_cookies_to_storage_state(data):
     elif isinstance(data, list):
         raw_cookies = data
     else:
+        print(
+            "  VK web: VK_WEB_COOKIES_JSON/_B64 распознан как JSON, но это не список "
+            "cookie-объектов и не Playwright storage_state (dict с 'cookies'+'origins')."
+        )
         return None
 
+    total = len(raw_cookies)
+    skipped_no_name_or_domain = 0
+    skipped_domain = 0
     cookies = []
     for raw in raw_cookies:
         if not isinstance(raw, dict):
@@ -5539,8 +5549,10 @@ def _vk_web_cookies_to_storage_state(data):
         value = str(raw.get("value") or "")
         domain = str(raw.get("domain") or raw.get("host") or "").strip()
         if not name or not domain:
+            skipped_no_name_or_domain += 1
             continue
-        if "vk.com" not in domain.lower():
+        if not any(allowed in domain.lower() for allowed in _VK_WEB_ALLOWED_COOKIE_DOMAINS):
+            skipped_domain += 1
             continue
         cookie = {
             "name": name,
@@ -5555,6 +5567,10 @@ def _vk_web_cookies_to_storage_state(data):
         cookies.append(cookie)
 
     if not cookies:
+        print(
+            f"  VK web: из {total} cookie-записей не удалось собрать ни одной валидной "
+            f"(без имени/домена: {skipped_no_name_or_domain}, домен не vk.com/vk.ru: {skipped_domain})"
+        )
         return None
     return {"cookies": cookies, "origins": []}
 
@@ -5738,6 +5754,7 @@ def post_to_vk_web(full_text: str, downloaded: list | None = None) -> bool:
         print(
             "  VK web пропущен: нет авторизованной сессии. "
             "Задайте VK_WEB_STORAGE_STATE_B64, VK_WEB_STORAGE_STATE_JSON "
+            "VK_WEB_COOKIES_B64, VK_WEB_COOKIES_JSON "
             "или файл VK_WEB_STORAGE_STATE_FILE."
         )
         return False
