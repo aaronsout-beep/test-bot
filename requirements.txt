@@ -1,3 +1,4 @@
 requests
 scweet
 curl_cffi
+playwright
