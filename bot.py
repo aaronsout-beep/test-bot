@@ -5759,6 +5759,21 @@ def post_to_vk_web(full_text: str, downloaded: list | None = None) -> bool:
         )
         return False
 
+    if isinstance(storage_state, dict):
+        _loaded_cookies = storage_state.get("cookies") or []
+        _cookie_names = {str(c.get("name") or "") for c in _loaded_cookies if isinstance(c, dict)}
+        _cookie_domains = sorted({str(c.get("domain") or "") for c in _loaded_cookies if isinstance(c, dict)})
+        _session_like = {n for n in _cookie_names if any(k in n.lower() for k in ("sid", "lhk", "nsid"))}
+        print(
+            f"  VK web: загружено {len(_loaded_cookies)} cookie, домены: {_cookie_domains}, "
+            f"похожие на сессионные: {sorted(_session_like) or 'НЕ НАЙДЕНЫ'}"
+        )
+        if not _session_like:
+            print(
+                "  VK web: внимание — среди куки нет ничего похожего на remixsid/remixlhk/remixnsid, "
+                "скорее всего сессия для VK анонимна, отсюда и редиректы"
+            )
+
     text = plain_text_for_crosspost(full_text)
     if not text:
         return False
