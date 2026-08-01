@@ -6063,6 +6063,7 @@ def post_to_odnoklassniki(full_text: str, downloaded: list | None = None) -> boo
 
 
 
+def text_contains_signature_hashtag(text: str) -> bool:
     """
     Проверяет наличие #SIGNATURE_HASHTAG в тексте поста.
     Если SIGNATURE_HASHTAG не задан — фильтр отключён.
