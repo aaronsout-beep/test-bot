@@ -24,6 +24,10 @@ jobs:
           python-version: '3.11'
 
       - run: pip install -r requirements.txt
+
+      - name: Install Playwright browser
+        if: ${{ vars.VK_CROSSPOST_MODE == 'browser' || vars.VK_CROSSPOST_MODE == 'web' }}
+        run: python -m playwright install --with-deps chromium
       
       - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
@@ -88,6 +92,14 @@ jobs:
           VK_API_VERSION:     ${{ secrets.VK_API_VERSION }}
           VK_FROM_GROUP:      ${{ secrets.VK_FROM_GROUP }}
           VK_CROSSPOST_DELAY_MINUTES:  ${{ vars.VK_CROSSPOST_DELAY_MINUTES || '1' }}
+          VK_CROSSPOST_MODE:  ${{ vars.VK_CROSSPOST_MODE || 'api' }}
+          VK_WEB_TARGET_URL:  ${{ secrets.VK_WEB_TARGET_URL || vars.VK_WEB_TARGET_URL }}
+          VK_WEB_STORAGE_STATE_B64:  ${{ secrets.VK_WEB_STORAGE_STATE_B64 }}
+          VK_WEB_STORAGE_STATE_JSON: ${{ secrets.VK_WEB_STORAGE_STATE_JSON }}
+          VK_WEB_COOKIES_B64:  ${{ secrets.VK_WEB_COOKIES_B64 }}
+          VK_WEB_COOKIES_JSON: ${{ secrets.VK_WEB_COOKIES_JSON }}
+          VK_WEB_HEADLESS:    ${{ vars.VK_WEB_HEADLESS || '1' }}
+          VK_WEB_TIMEOUT_SECONDS: ${{ vars.VK_WEB_TIMEOUT_SECONDS || '90' }}
           MAX_TOKEN:             ${{ secrets.MAX_TOKEN }}
           MAX_CHAT_ID:           ${{ secrets.MAX_CHAT_ID }}
           MAX_USER_ID:           ${{ secrets.MAX_USER_ID }}
@@ -98,6 +110,8 @@ jobs:
           SIGNATURE_URL_TEXT:    ${{ secrets.SIGNATURE_URL_TEXT }}
           YANDEX_API_KEY:    ${{ secrets.YANDEX_API_KEY }}
           YANDEX_FOLDER_ID:  ${{ secrets.YANDEX_FOLDER_ID }}
+          USAGE_LOG_URL:   ${{ secrets.USAGE_LOG_URL }}
+          USAGE_LOG_TOKEN: ${{ secrets.USAGE_LOG_TOKEN }}
         run: python bot.py --step 4
 
       - name: Save state
