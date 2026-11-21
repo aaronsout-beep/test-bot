@@ -9701,16 +9701,172 @@ def fetch_nitter_accounts_tweets(accounts: list, limit: int = 20) -> list:
     return sort_twitter_items_newest_first(results)
 
 
-def step3_should_use_nitter_fallback(scweet_tweets: list) -> bool:
+
+def fxtwitter_status_media(status: dict) -> list:
+    """Преобразует открытые вложения FxTwitter к формату бота."""
+    media = status.get("media") or {}
+    if not isinstance(media, dict):
+        return []
+
+    entries = media.get("all") or media.get("photos") or media.get("videos") or []
+    result = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        kind = str(entry.get("type") or "photo").lower()
+        url = str(entry.get("url") or "").strip()
+        if kind in ("video", "gif"):
+            formats = entry.get("formats") or []
+            mp4s = [
+                item for item in formats
+                if isinstance(item, dict)
+                and (str(item.get("container") or "").lower() == "mp4"
+                     or re.search(r"\.mp4(?:[?#]|$)", str(item.get("url") or ""), re.I))
+                and item.get("url")
+            ]
+            if mp4s:
+                def _bitrate(item):
+                    try:
+                        return int(item.get("bitrate") or 0)
+                    except (TypeError, ValueError):
+                        return 0
+                best = max(mp4s, key=_bitrate)
+                url = str(best.get("url") or url)
+            elif entry.get("transcode_url"):
+                url = str(entry["transcode_url"])
+            kind = "video"
+        else:
+            kind = "photo"
+        add_media_item(result, url, kind)
+    return result[:10]
+
+
+def fetch_fxtwitter_account_tweets(account: str, limit: int = 50) -> dict:
+    """Читает публичную ленту аккаунта через FxTwitter без X cookies/API key."""
+    def _result(tweets=None, raw_count=0, status="ok"):
+        return {"tweets": tweets or [], "raw_count": raw_count, "status": status}
+
+    account = normalize_twitter_account(account)
+    if not account:
+        return _result(status="invalid_account")
+
+    url = f"https://api.fxtwitter.com/2/profile/{account}/statuses"
+    remaining = max(1, int(limit or 1))
+    cursor = None
+    raw_count = 0
+    output = []
+    successful_page = False
+
+    while remaining > 0:
+        page_size = min(100, remaining)
+        params = {"count": page_size}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            response = requests.get(
+                url,
+                params=params,
+                headers=REQUEST_HEADERS,
+                timeout=(10, 25),
+            )
+            if response.status_code == 204:
+                successful_page = True
+                break
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict) or payload.get("code", 200) not in (200, "200"):
+                raise ValueError(f"FxTwitter вернул неожиданный ответ: {str(payload)[:180]}")
+        except Exception as exc:
+            print(f"  FxTwitter @{account}: ошибка запроса: {exc}")
+            return _result(output, raw_count, "fetch_error") if not successful_page else _result(output, raw_count)
+
+        successful_page = True
+        page = payload.get("results") or []
+        if not isinstance(page, list):
+            print(f"  FxTwitter @{account}: поле results имеет неожиданный формат")
+            return _result(output, raw_count, "invalid_response")
+        raw_count += len(page)
+
+        for status in page:
+            if not isinstance(status, dict):
+                continue
+            post_id = str(status.get("id") or "").strip()
+            if not post_id:
+                continue
+            author_obj = status.get("author") or {}
+            author = normalize_twitter_account(
+                (author_obj.get("screen_name") or author_obj.get("username") or account)
+                if isinstance(author_obj, dict) else account
+            ) or account
+            post_url = normalize_twitter_post_url(str(status.get("url") or ""), post_id)
+            raw_text = status.get("text")
+            if not raw_text and isinstance(status.get("raw_text"), dict):
+                raw_text = status["raw_text"].get("text")
+            timestamp = status.get("created_timestamp")
+            pub_date = str(status.get("created_at") or "")
+            if not pub_date and timestamp is not None:
+                try:
+                    pub_date = datetime.fromtimestamp(float(timestamp), tz=timezone.utc).isoformat()
+                except (TypeError, ValueError, OverflowError, OSError):
+                    pub_date = ""
+            output.append({
+                "post_id": post_id,
+                "post_url": post_url or f"https://x.com/{author}/status/{post_id}",
+                "author": author,
+                "raw": str(raw_text or ""),
+                "pub_date": pub_date,
+                "media_items": fxtwitter_status_media(status),
+                "raw_status": status,
+            })
+
+        remaining -= max(len(page), 1)
+        cursor_info = payload.get("cursor")
+        if isinstance(cursor_info, dict):
+            cursor = cursor_info.get("bottom") or cursor_info.get("next")
+        elif isinstance(cursor_info, str):
+            cursor = cursor_info
+        else:
+            cursor = None
+        if not page or not cursor or len(page) < page_size:
+            break
+
+    print(f"  FxTwitter @{account}: получено {raw_count} публикаций")
+    return _result(sort_twitter_items_newest_first(output), raw_count)
+
+
+def fetch_fxtwitter_accounts_tweets(accounts: list, limit: int = 50) -> dict:
+    """Получает ограниченное число последних публикаций по каждому аккаунту."""
+    results = []
+    raw_count = 0
+    successes = 0
+    failures = 0
+    for account in accounts or []:
+        result = fetch_fxtwitter_account_tweets(account, limit=limit)
+        raw_count += int(result.get("raw_count") or 0)
+        results.extend(result.get("tweets") or [])
+        if result.get("status") == "ok":
+            successes += 1
+        else:
+            failures += 1
+    if successes == 0 and failures:
+        status = "fetch_error"
+    elif failures:
+        status = "partial_error"
+    else:
+        status = "ok"
+    print(f"  FxTwitter: аккаунтов успешно={successes}, ошибок={failures}, публикаций={raw_count}")
+    return {"tweets": sort_twitter_items_newest_first(results), "raw_count": raw_count, "status": status}
+
+def step3_should_use_nitter_fallback(tweets: list) -> bool:
     if not STEP3_NITTER_FALLBACK:
         return False
     newest_age = twitter_newest_age_hours(scweet_tweets)
     if newest_age is None:
-        print("  Scweet не дал датированных твитов — включаем Nitter fallback")
+        print("  Основной источник не дал датированных публикаций — включаем Nitter fallback")
         return True
     if newest_age > STEP3_NITTER_STALE_HOURS:
         print(
-            "  Scweet выглядит устаревшим "
+            "  Результаты основного источника выглядят устаревшими "
             f"(самый свежий твит {newest_age:.1f} ч назад) — включаем Nitter fallback"
         )
         return True
@@ -9718,9 +9874,8 @@ def step3_should_use_nitter_fallback(scweet_tweets: list) -> bool:
 
 
 def tweet_matches_keywords(raw_text: str, keywords: list) -> bool:
-    """Локальное соответствие ключевым словам для Nitter-фоллбэка Шага 1
-    (Nitter отдаёт всю ленту аккаунта — Scweet-запрос делал фильтрацию на
-    стороне X, здесь просто ищем подстроку без учёта регистра)."""
+    """Проверяет ключевые слова в тексте публикации без учёта регистра.
+    Нужна для локальной фильтрации лент профилей FxTwitter и Nitter."""
     if not keywords:
         return True
     lowered = str(raw_text or "").lower()
@@ -9765,41 +9920,75 @@ def check_scweet_zero_raw_alert(step_label: str, source_label: str, scweet_resul
 
 
 def step1_twitter_keywords(published: set) -> set:
-    print("\n══════ ШАГ 1: Twitter по ключевым словам (Scweet) ══════")
+    print("\n══════ ШАГ 1: Twitter по ключевым словам и заданным аккаунтам ══════")
     if not STEP1_KEYWORDS:
         print("  STEP1_KEYWORDS не задан — пропускаем")
-        return published
-    if not SCWEET_AUTH_TOKEN:
-        print("  SCWEET_AUTH_TOKEN не задан — пропускаем")
         return published
 
     new_count = 0
     failed_attempts = load_failed_attempts()
     source_label = ",".join(STEP1_ACCOUNTS) if STEP1_ACCOUNTS else "global_search"
 
-    tweets_result = fetch_tweets_with_fallback(
-        keywords=STEP1_KEYWORDS,
-        from_accounts=STEP1_ACCOUNTS or None,
-        limit=STEP1_LIMIT,
-    )
-    tweets = tweets_result["tweets"]
-    check_scweet_zero_raw_alert("Шаг 1", source_label, tweets_result)
-
-    if step1_should_use_nitter_fallback(tweets_result):
-        raw_fallback_tweets = fetch_nitter_accounts_tweets(STEP1_ACCOUNTS, limit=STEP1_LIMIT)
-        fallback_tweets = [
-            tw for tw in raw_fallback_tweets
+    if STEP1_ACCOUNTS:
+        # FxTwitter отдаёт ленту каждого профиля. Ключевые слова применяем
+        # локально только к этим публикациям — поиск по всему X не выполняется.
+        source_result = fetch_fxtwitter_accounts_tweets(STEP1_ACCOUNTS, limit=STEP1_LIMIT)
+        raw_tweets = source_result["tweets"]
+        tweets = [
+            tw for tw in raw_tweets
             if tweet_matches_keywords(tw.get("raw", ""), STEP1_KEYWORDS)
         ]
-        if fallback_tweets:
-            before_merge = len(tweets)
-            tweets = merge_twitter_results(tweets, fallback_tweets)
-            print(
-                f"  Step 1 merge: Scweet {before_merge} + Nitter (после фильтра по ключевым "
-                f"словам) {len(fallback_tweets)} => {len(tweets)}"
+        print(
+            f"  FxTwitter: просмотрено {source_result['raw_count']} публикаций "
+            f"аккаунтов, совпало с ключевыми словами {len(tweets)}"
+        )
+
+        # Если не удалось прочитать все ленты, используем старую авторизованную
+        # цепочку как резерв. При успешном чтении без совпадений лишний раз
+        # не обращаемся к Scweet.
+        if source_result["status"] != "ok" and SCWEET_AUTH_TOKEN:
+            print("  FxTwitter недоступен полностью или частично — пробуем Scweet")
+            scweet_result = fetch_tweets_with_fallback(
+                keywords=STEP1_KEYWORDS,
+                from_accounts=STEP1_ACCOUNTS,
+                limit=STEP1_LIMIT,
             )
-        else:
-            print("  Nitter fallback: подходящих по ключевым словам твитов не найдено")
+            check_scweet_zero_raw_alert("Шаг 1", source_label, scweet_result)
+            tweets = merge_twitter_results(tweets, scweet_result.get("tweets") or [])
+
+        # Nitter остаётся последним бесплатным резервом для заданных профилей.
+        if STEP1_NITTER_FALLBACK and (source_result["status"] != "ok" or not tweets):
+            raw_fallback_tweets = fetch_nitter_accounts_tweets(
+                STEP1_ACCOUNTS, limit=STEP1_LIMIT
+            )
+            fallback_tweets = [
+                tw for tw in raw_fallback_tweets
+                if tweet_matches_keywords(tw.get("raw", ""), STEP1_KEYWORDS)
+            ]
+            if fallback_tweets:
+                before_merge = len(tweets)
+                tweets = merge_twitter_results(tweets, fallback_tweets)
+                print(
+                    f"  Step 1 merge: источники {before_merge} + Nitter "
+                    f"(после фильтра по ключевым словам) {len(fallback_tweets)} "
+                    f"=> {len(tweets)}"
+                )
+            else:
+                print("  Nitter fallback: совпадений по ключевым словам не найдено")
+
+    else:
+        # Без STEP1_ACCOUNTS нужен именно поиск по всему X. FxTwitter читает
+        # только профили, поэтому для глобального поиска оставляем Scweet.
+        if not SCWEET_AUTH_TOKEN:
+            print("  Для глобального поиска нужен SCWEET_AUTH_TOKEN; список аккаунтов не задан")
+            return published
+        tweets_result = fetch_tweets_with_fallback(
+            keywords=STEP1_KEYWORDS,
+            from_accounts=None,
+            limit=STEP1_LIMIT,
+        )
+        tweets = tweets_result["tweets"]
+        check_scweet_zero_raw_alert("Шаг 1", source_label, tweets_result)
 
     for tw in tweets:
         post_id     = tw["post_id"]
@@ -10008,33 +10197,37 @@ def step2_instagram(published: set) -> set:
     print(f"\n  Итого опубликовано: {new_count}")
     return published
 def step3_twitter_accounts(published: set) -> set:
-    print("\n══════ ШАГ 3: Twitter-аккаунты (Scweet) ══════")
+    print("\n══════ ШАГ 3: Twitter-аккаунты (FxTwitter, бесплатный публичный источник) ══════")
     if not STEP3_ACCOUNTS:
         print("  STEP3_ACCOUNTS не задан — пропускаем")
-        return published
-    if not SCWEET_AUTH_TOKEN:
-        print("  SCWEET_AUTH_TOKEN не задан — пропускаем")
         return published
 
     new_count = 0
     failed_attempts = load_failed_attempts()
-
     scan_limit = max(STEP3_LIMIT, STEP3_SCAN_LIMIT)
 
-    # Забираем свежие посты сразу по всем аккаунтам одним запросом
-    scweet_result = fetch_tweets_with_fallback(
-        keywords=[],           # без фильтра по словам — все посты аккаунтов
-        from_accounts=STEP3_ACCOUNTS,
-        limit=scan_limit,
-    )
-    tweets = scweet_result["tweets"]
-    check_scweet_zero_raw_alert("Шаг 3", ",".join(STEP3_ACCOUNTS), scweet_result)
+    # Сначала читаем открытые ленты профилей без cookies и платного X API.
+    source_result = fetch_fxtwitter_accounts_tweets(STEP3_ACCOUNTS, limit=scan_limit)
+    tweets = source_result["tweets"]
+
+    # Если бесплатный источник недоступен, пробуем старую цепочку авторизации,
+    # только когда секреты Scweet действительно заданы.
+    if source_result["status"] != "ok" and SCWEET_AUTH_TOKEN:
+        print("  FxTwitter недоступен — пробуем авторизованные резервные источники")
+        scweet_result = fetch_tweets_with_fallback(
+            keywords=[],
+            from_accounts=STEP3_ACCOUNTS,
+            limit=scan_limit,
+        )
+        check_scweet_zero_raw_alert("Шаг 3", ",".join(STEP3_ACCOUNTS), scweet_result)
+        tweets = merge_twitter_results(tweets, scweet_result.get("tweets") or [])
+
     if step3_should_use_nitter_fallback(tweets):
         fallback_tweets = fetch_nitter_accounts_tweets(STEP3_ACCOUNTS, limit=scan_limit)
         if fallback_tweets:
             before_merge = len(tweets)
             tweets = merge_twitter_results(tweets, fallback_tweets)
-            print(f"  Step 3 merge: Scweet {before_merge} + Nitter {len(fallback_tweets)} => {len(tweets)}")
+            print(f"  Step 3 merge: текущие источники {before_merge} + Nitter {len(fallback_tweets)} => {len(tweets)}")
 
     for tw in tweets:
         post_id     = tw["post_id"]
