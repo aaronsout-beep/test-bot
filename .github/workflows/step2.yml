@@ -109,6 +109,11 @@ jobs:
           USAGE_LOG_TOKEN: ${{ secrets.USAGE_LOG_TOKEN }}
           TRANSLATION_LOG_URL: ${{ secrets.TRANSLATION_LOG_URL }}
           TRANSLATION_LOG_TOKEN: ${{ secrets.TRANSLATION_LOG_TOKEN }}
+          GEMINI_FREE_KEYS:    ${{ secrets.GEMINI_FREE_KEYS }}
+          GEMINI_QUOTA_URL:    ${{ secrets.GEMINI_QUOTA_URL }}
+          GEMINI_QUOTA_SECRET: ${{ secrets.GEMINI_QUOTA_SECRET }}
+          GEMINI_FREE_MODEL:   ${{ vars.GEMINI_FREE_MODEL }}
+          GEMINI_FREE_OPS:     ${{ vars.GEMINI_FREE_OPS }}
         run: python bot.py --step 2
 
       - name: Save state
