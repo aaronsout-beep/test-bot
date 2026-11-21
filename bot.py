@@ -9860,7 +9860,7 @@ def fetch_fxtwitter_accounts_tweets(accounts: list, limit: int = 50) -> dict:
 def step3_should_use_nitter_fallback(tweets: list) -> bool:
     if not STEP3_NITTER_FALLBACK:
         return False
-    newest_age = twitter_newest_age_hours(scweet_tweets)
+    newest_age = twitter_newest_age_hours(tweets)
     if newest_age is None:
         print("  Основной источник не дал датированных публикаций — включаем Nitter fallback")
         return True
