@@ -9,7 +9,6 @@ STEP 3: Twitter-аккаунты                   -> Gemini + OpenRouter -> Tel
 """
 
 import argparse
-import base64
 import hashlib
 import html
 import json
@@ -27,13 +26,15 @@ from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlun
 import requests
 from format_model.rag_layout import (
     build_layout_prompt,
+    call_gemini_layout_checker,
     load_examples,
     parse_checker_json,
     select_similar_examples,
 )
 from format_model.hard_cases import save_hard_case
 from format_model.candidates import save_candidate, pending_count
-from glossary import GLOSSARY, glossary_for_prompt
+from glossary import GLOSSARY, glossary_for_prompt, yandex_translate_glossary_pairs
+from gemini_free_pool import GeminiFreePool, GeminiPoolExhausted, RemoteQuota, load_keys_from_env
 
 # ────────────────────────────────────────────────────────────
 # НАСТРОЙКИ
@@ -133,6 +134,13 @@ _DEFAULT_TOKEN_PRICE_RUB_PER_1K: dict[str, dict[str, float]] = {
     # Gemini/OpenRouter — цены в USD у провайдера, переводим по грубому
     # курсу; при желании переопределите через USAGE_PRICE_OVERRIDES_JSON.
     "gemini-2.5-flash-lite":  {"input": 0.30, "output": 1.20},
+    # Yandex Translate тарифицируется по СИМВОЛАМ, а не по токенам — сюда
+    # логируется как "input" длина текста в символах (см. log_usage вызов в
+    # translate_yandex_translate_api). Оставлено 0.0 по умолчанию: точную
+    # актуальную ставку руб./1000 символов сверьте в калькуляторе AI Studio
+    # и задайте через USAGE_PRICE_OVERRIDES_JSON, например:
+    # {"yandex-translate-api": {"input": 0.15}}
+    "yandex-translate-api":   {"input": 0.0, "output": 0.0},
 }
 
 
@@ -209,6 +217,224 @@ def log_usage(
         # Проблема с таблицей (сеть, квота Apps Script и т.п.) не должна
         # останавливать публикацию поста.
         print(f"  Не удалось отправить usage-лог в таблицу: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# ЛОГИРОВАНИЕ ВСЕХ ПЕРЕВОДОВ (оригинал + результат) В GOOGLE-ТАБЛИЦУ
+# ─────────────────────────────────────────────────────────────────────────
+# Изначально это было только для AI-отказов ("Я не могу обсуждать эту
+# тему..."), но полезно логировать вообще ВСЕ переводы — и успешные тоже —
+# чтобы можно было посмотреть подборку и понять, где модель галлюцинирует,
+# теряет смысл, или просто оценить общее качество перевода не только по
+# единичным жалобам, а по выборке.
+#
+# TRANSLATION_LOG_URL — URL веб-приложения Google Apps Script (см.
+# инструкцию по настройке — по образцу USAGE_LOG_URL, но пишет в отдельный
+# лист с другими колонками, включая status: ok / refusal / all_failed).
+#
+# ВАЖНО про объём: в отличие от лога отказов (которых по идее немного),
+# логирование ВСЕХ переводов пишет строку на КАЖДЫЙ переведённый пост по
+# ВСЕМ ботам сразу — это на порядки больше строк. Google Sheets выдерживает
+# до ~10 млн ячеек на таблицу, так что при активной работе фленого списка
+# стоит периодически архивировать старые строки (например, раз в
+# несколько месяцев переносить в отдельный архивный лист/файл), чтобы
+# таблица не разрослась и не начала тормозить.
+TRANSLATION_LOG_URL = (os.environ.get("TRANSLATION_LOG_URL") or os.environ.get("AI_REFUSAL_LOG_URL") or "").strip()
+# Если отдельный токен не задан — используем тот же секрет, что и для
+# usage-лога, чтобы не заводить лишнюю переменную, если удобнее один Apps
+# Script на несколько листов.
+TRANSLATION_LOG_TOKEN = (
+    os.environ.get("TRANSLATION_LOG_TOKEN")
+    or os.environ.get("AI_REFUSAL_LOG_TOKEN")
+    or USAGE_LOG_TOKEN
+).strip()
+
+
+def log_translation_case(
+    original_text: str,
+    result_text: str | None,
+    service: str,
+    status: str,
+    post_id: str = "",
+    url: str = "",
+    translated_text: str = "",
+    glossary_text: str = "",
+    glossary_model: str = "",
+    style_text: str = "",
+    style_model: str = "",
+    raw_style_response: str = "",
+    layout_model: str = "",
+) -> None:
+    """Отправляет случай перевода (оригинал + результат + статус + какой
+    сервис его выполнил/отказался) в Google-таблицу для последующего разбора
+    и для сборки датасетов дообучения.
+
+    status: "ok" (перевод успешно выполнен), "refusal" (AI вернул
+    guardrail-отказ вместо перевода), "all_failed" (вся цепочка сервисов
+    отказала — пост не публикуется).
+
+    Цепочка этапов и соответствующие им пары «текст/модель» (каждый *_text —
+    это ТЕКСТ НА ВЫХОДЕ соответствующего этапа, то есть одновременно и вход
+    следующего этапа):
+      original_text    → (перевод, service)      → translated_text
+      translated_text  → (глоссарий, glossary_model) → glossary_text
+      glossary_text    → (стиль, style_model)        → style_text
+      style_text       → (вёрстка, layout_model)     → result_text
+
+    raw_style_response — сырой JSON-ответ модели на этапе стиля (до
+    parse_replacement_ops и до применения/отклонения операций валидатором).
+    Нужен отдельно от style_text для датасета дообучения: style_text — это
+    уже ПРИМЕНЁННЫЙ и провалидированный текст, а raw_style_response — то,
+    что модель реально вернула в ответ на промпт (формат
+    {"replacements":[{"from":...,"to":...}]}), то есть именно тот "response",
+    который нужен для fine-tuning датасета в формате TextToTextGeneration.
+
+    Это даёт возможность построить датасет дообучения для КАЖДОГО этапа
+    отдельно (например, для style-этапа: input=glossary_text, output=style_text),
+    а не только видеть итоговый result_text без понимания, что именно
+    сделал каждый шаг.
+
+    glossary_model / style_model / layout_model — через какую модель прошёл
+    соответствующий этап (или пометка вроде "(правок не потребовалось)" /
+    "(правки отклонены валидатором)"). Пустая строка — этап не запускался
+    (например, отключён или до него не дошло из-за ошибки перевода).
+    Заполняются в ту же строку, что и перевод — см.
+    _trace_start()/_trace_note()/_trace_finalize_and_log() ниже, которые
+    собирают эти значения по ходу пайплайна и отправляют одной строкой уже
+    после того, как известны все этапы.
+
+    Ничего не делает, если TRANSLATION_LOG_URL не задан, и никогда не
+    бросает исключение наружу — логирование не должно ронять основной
+    прогон бота.
+    """
+    if not TRANSLATION_LOG_URL:
+        return
+    try:
+        requests.post(
+            TRANSLATION_LOG_URL,
+            json={
+                "token": TRANSLATION_LOG_TOKEN,
+                "rows": [{
+                    "repo": USAGE_LOG_REPO,
+                    "service": service,
+                    "status": status,
+                    "post_id": post_id,
+                    "url": url,
+                    # Обрезаем на всякий случай — Google Sheets не любит
+                    # огромные ячейки, а нам для разбора хватит и начала текста.
+                    "original_text": (original_text or "")[:2000],
+                    "translated_text": (translated_text or "")[:2000],
+                    "glossary_text": (glossary_text or "")[:2000],
+                    "glossary_model": glossary_model or "",
+                    "style_text": (style_text or "")[:2000],
+                    "style_model": style_model or "",
+                    "raw_style_response": (raw_style_response or "")[:2000],
+                    "layout_model": layout_model or "",
+                    "result_text": (result_text or "")[:2000],
+                }],
+            },
+            timeout=5,
+        )
+    except Exception as e:
+        print(f"  Не удалось отправить лог перевода в таблицу: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# "ТРЕЙС" ПАЙПЛАЙНА ОДНОГО ПОСТА — чтобы в лог перевода попадала ОДНА строка
+# с оригиналом/переводом И с пометкой, какие модели дальше редактировали
+# этот же текст (глоссарий / литературная редактура / вёрстка).
+#
+# Перевод (translate_with_fallback) выполняется раньше, чем глоссарий, стиль
+# и вёрстка успевают отработать, поэтому нельзя просто логировать сразу по
+# окончании перевода — тогда данные о дальнейших этапах потеряются. Вместо
+# этого translate_with_fallback открывает "трейс" на исходный текст поста,
+# каждый последующий этап дописывает в него, через какую модель он прошёл, а
+# по завершении всего пайплайна (после AI-проверки вёрстки, см.
+# send_to_telegram()) трейс закрывается ОДНИМ вызовом log_translation_case().
+#
+# Бот обрабатывает посты последовательно в один поток, поэтому одного
+# активного трейса на модуль достаточно — конкурентной перезаписи между
+# разными постами не возникает.
+# ─────────────────────────────────────────────────────────────────────────
+_translation_trace: dict | None = None
+
+
+def _trace_start(original_text: str) -> None:
+    """Открывает трейс для нового поста — вызывается в начале перевода."""
+    global _translation_trace
+    _translation_trace = {
+        "original_text": original_text,
+        "service": "",
+        # Текст сразу после перевода (translate_with_fallback + локальные
+        # фиксы), то есть именно то, что видит edit_gemini() на входе.
+        "translated_text": "",
+        "glossary_model": "",
+        # Текст после этапа глоссария (edit_gemini) — вне зависимости от
+        # того, были правки или нет. Это вход для edit_style_gemini().
+        "glossary_text": "",
+        "style_model": "",
+        # Текст после этапа стиля (edit_style_gemini) — вне зависимости от
+        # того, были правки или нет.
+        "style_text": "",
+        # Сырой JSON-ответ модели на этапе стиля (до parse_replacement_ops
+        # и до применения/валидации операций) — нужен для датасета дообучения:
+        # именно это модель должна научиться возвращать на вход glossary_text.
+        "raw_style_response": "",
+        "layout_model": "",
+    }
+
+
+def _trace_note(field: str, value: str) -> None:
+    """Записывает в активный трейс, какая модель отработала на очередном
+    этапе. Если трейс не открыт (например, текст вообще не переводился —
+    has_no_translatable_text) — просто ничего не делает."""
+    if _translation_trace is not None and value:
+        _translation_trace[field] = value
+
+
+def _trace_append(field: str, value: str) -> None:
+    """Как _trace_note, но добавляет к уже записанному значению через `; `
+    (нужно для вёрстки — там может отработать и RAG-проверка, и AI-проверка
+    по отдельности)."""
+    if _translation_trace is None or not value:
+        return
+    existing = _translation_trace.get(field) or ""
+    _translation_trace[field] = f"{existing}; {value}" if existing else value
+
+
+def _trace_clear() -> None:
+    """Закрывает трейс без отправки лога — для случаев, когда перевод
+    провалился целиком (all_failed уже логируется отдельно) и дальнейших
+    этапов не будет."""
+    global _translation_trace
+    _translation_trace = None
+
+
+def _trace_finalize_and_log(result_text: str | None, post_id: str = "", url: str = "") -> None:
+    """Закрывает трейс и отправляет в лог одну строку со всеми накопленными
+    этапами (перевод + глоссарий + стиль + вёрстка)."""
+    global _translation_trace
+    trace = _translation_trace
+    _translation_trace = None
+    if trace is None:
+        return
+    log_translation_case(
+        trace["original_text"],
+        result_text,
+        service=trace.get("service") or "unknown",
+        status="ok",
+        post_id=post_id,
+        url=url,
+        translated_text=trace.get("translated_text", ""),
+        glossary_text=trace.get("glossary_text", ""),
+        glossary_model=trace.get("glossary_model", ""),
+        style_text=trace.get("style_text", ""),
+        style_model=trace.get("style_model", ""),
+        raw_style_response=trace.get("raw_style_response", ""),
+        layout_model=trace.get("layout_model", ""),
+    )
+
+
 ALERT_CHANNEL_ID = os.environ.get("ALERT_CHANNEL_ID", "").strip()
 DEEPL_KEY = os.environ.get("DEEPL_KEY", "").strip()
 OPENROUTER_KEY = os.environ.get("OPENROUTER_KEY", "")
@@ -218,9 +444,28 @@ YANDEX_FOLDER_ID = os.environ.get("YANDEX_FOLDER_ID", "").strip()
 # Studio (/v1/chat/completions), а не через старый foundationModels/v1/completion —
 # тот отвечает 404 "unknown model", т.к. ничего не знает про эту marketplace-модель.
 YANDEX_API_URL   = "https://ai.api.cloud.yandex.net/v1/chat/completions"
-# Основная модель для перевода, редактуры, проверки глоссария и RAG-верстки —
-# Qwen3 235B FP8, доступная через Yandex AI Studio.
-YANDEX_QWEN_MODEL = (os.environ.get("YANDEX_QWEN_MODEL") or "qwen3.6-35b-a3b/latest").strip()
+# Отдельный сервис Yandex Translate (специализированный NMT, не LLM) — другой
+# эндпоинт, другая тарификация (по символам, без reasoning-токенов). Требует
+# отдельную роль ai.translate.user на сервисном аккаунте (в дополнение к
+# ai.languageModels.user); scope API-ключа тот же — yc.ai.foundationModels.execute.
+YANDEX_TRANSLATE_API_URL = "https://translate.api.cloud.yandex.net/translate/v2/translate"
+# Отдельный эндпоинт того же сервиса — только определяет язык текста, перевод
+# не делает. Нужен ТОЛЬКО для того, чтобы передать sourceLanguageCode при
+# использовании glossaryConfig: Yandex Translate требует явный исходный язык
+# всякий раз, когда в запросе есть глоссарий (без него — ошибка "You have to
+# set source_language_code while using glossary"). Тот же ключ/роль, что и
+# для перевода — отдельных прав не требует.
+YANDEX_DETECT_API_URL = "https://translate.api.cloud.yandex.net/translate/v2/detect"
+# Первый шаг перевода (см. translate_with_fallback): если сервис недоступен/вернул
+# ошибку — код автоматически откатывается на LLM-цепочку:
+# fine-tuned YandexGPT Lite → YandexGPT 5 Lite → Qwen3 → Gemini → GPT OSS.
+# Можно временно выключить одной переменной без правки кода.
+YANDEX_TRANSLATE_API_ENABLED = os.environ.get("YANDEX_TRANSLATE_API_ENABLED", "1").strip().lower() not in {
+    "0", "false", "no", "off"
+}
+# Основная резервная Qwen-модель для перевода, редактуры, проверки глоссария и RAG-верстки —
+# Qwen3 235B A22B FP8, доступная через Yandex AI Studio.
+YANDEX_QWEN_MODEL = (os.environ.get("YANDEX_QWEN_MODEL") or "qwen3-235b-a22b-fp8").strip()
 # Fallback-модель для этапов редактуры/глоссария/RAG на случай перегрузки Qwen3 (429/503).
 YANDEX_EDIT_FALLBACK_MODEL = (os.environ.get("YANDEX_EDIT_FALLBACK_MODEL") or "yandexgpt/latest").strip()
 # Управление режимом рассуждений (reasoning) у Qwen-моделей через Yandex AI
@@ -242,22 +487,32 @@ SHORT_TEXT_TRANSLATION_THRESHOLD = int(
     os.environ.get("SHORT_TEXT_TRANSLATION_THRESHOLD") or 50
 )
 YANDEX_SHORT_TEXT_MODEL = (
-    os.environ.get("YANDEX_SHORT_TEXT_MODEL") or "yandexgpt-lite/latest"
+    os.environ.get("YANDEX_SHORT_TEXT_MODEL")
+    or os.environ.get("YANDEX_TRANSLATE_LITE_MODEL")
+    or "yandexgpt-5-lite"
+).strip()
+YANDEX_FINE_TUNED_TRANSLATION_MODEL = (
+    os.environ.get("YANDEX_FINE_TUNED_TRANSLATION_MODEL")
+    or "gpt://b1gltim1rgj19805vucv/yandexgpt-lite/latest@tamr27rjnn9iui6fedtk7"
+).strip()
+YANDEX_GPT_OSS_TRANSLATE_MODEL = (
+    os.environ.get("YANDEX_GPT_OSS_TRANSLATE_MODEL") or "gpt-oss-120b"
 ).strip()
 
 
-def _is_qwen_model(model_name: str) -> bool:
+def _supports_reasoning_effort(model_name: str) -> bool:
     """Определяет, нужно ли слать reasoning_effort для этой модели.
 
     reasoning_effort имеет смысл только для reasoning-моделей (Qwen, GPT OSS).
     Для yandexgpt/yandexgpt-lite (не-reasoning) параметр либо не нужен, либо
-    может привести к ошибке — поэтому шлём его только для Qwen.
+    может привести к ошибке — поэтому шлём его только для моделей, где он нужен.
     """
-    return "qwen" in (model_name or "").lower()
+    model = (model_name or "").lower()
+    return "qwen" in model or "gpt-oss" in model
 
 
 # ВАЖНО: не используем ни YANDEX_EDIT_FALLBACK_MODEL (YandexGPT Pro), ни
-# YANDEX_QWEN_MODEL (Qwen3.6 235B) как основную модель для проверки дублей.
+# YANDEX_QWEN_MODEL (Qwen3 235B) как основную модель для проверки дублей.
 # Pro тарифицируется заметно дороже Lite и на вход, и на выход — по разным
 # прайс-агрегаторам ориентировочно в 2-5 раз (когда пробовали в проде, счёт
 # за день подскочил почти вдвое — см. историю переписки). У Qwen, в свою
@@ -289,25 +544,7 @@ VK_OWNER_ID = os.environ.get("VK_OWNER_ID", "").strip()
 VK_DEFAULT_API_VERSION = "5.199"
 VK_API_VERSION = os.environ.get("VK_API_VERSION", "").strip() or VK_DEFAULT_API_VERSION
 VK_FROM_GROUP = os.environ.get("VK_FROM_GROUP", "1").strip()
-_vk_delay_seconds_raw = (os.environ.get("VK_CROSSPOST_DELAY_SECONDS") or "").strip()
-_vk_delay_minutes_raw = (os.environ.get("VK_CROSSPOST_DELAY_MINUTES") or "").strip()
-if _vk_delay_seconds_raw:
-    VK_CROSSPOST_DELAY_SECONDS = int(float(_vk_delay_seconds_raw))
-elif _vk_delay_minutes_raw:
-    VK_CROSSPOST_DELAY_SECONDS = int(float(_vk_delay_minutes_raw) * 60)
-else:
-    VK_CROSSPOST_DELAY_SECONDS = 0
-VK_CROSSPOST_MODE = (os.environ.get("VK_CROSSPOST_MODE") or "api").strip().lower()
-VK_WEB_TARGET_URL = os.environ.get("VK_WEB_TARGET_URL", "").strip()
-VK_WEB_STORAGE_STATE_FILE = (os.environ.get("VK_WEB_STORAGE_STATE_FILE") or "vk_storage_state.json").strip()
-VK_WEB_STORAGE_STATE_JSON = os.environ.get("VK_WEB_STORAGE_STATE_JSON", "").strip()
-VK_WEB_STORAGE_STATE_B64 = os.environ.get("VK_WEB_STORAGE_STATE_B64", "").strip()
-VK_WEB_COOKIES_JSON = os.environ.get("VK_WEB_COOKIES_JSON", "").strip()
-VK_WEB_COOKIES_B64 = os.environ.get("VK_WEB_COOKIES_B64", "").strip()
-VK_WEB_HEADLESS = (os.environ.get("VK_WEB_HEADLESS") or "1").strip().lower() not in {"0", "false", "no", "off"}
-VK_WEB_TIMEOUT_SECONDS = int((os.environ.get("VK_WEB_TIMEOUT_SECONDS") or "90").strip())
-VK_WEB_SETTLE_SECONDS = int((os.environ.get("VK_WEB_SETTLE_SECONDS") or "5").strip())
-VK_WEB_SLOW_MO_MS = int((os.environ.get("VK_WEB_SLOW_MO_MS") or "0").strip())
+VK_CROSSPOST_DELAY_SECONDS = int((os.environ.get("VK_CROSSPOST_DELAY_SECONDS") or "0").strip())
 
 MAX_TOKEN = os.environ.get("MAX_TOKEN", "").strip()
 MAX_CHAT_ID = os.environ.get("MAX_CHAT_ID", "").strip()
@@ -363,6 +600,14 @@ STEP1_ACCOUNTS = [
     if account
 ]
 SCWEET_AUTH_TOKEN = os.environ.get("SCWEET_AUTH_TOKEN", "").strip()
+# ct0 — второй cookie X.com (CSRF-токен), нужен рядом с auth_token.
+# Без него Scweet пытается добыть ct0 сам через headless-браузер (пакет
+# nodriver), которого нет в requirements.txt — и падает с "missing_csrf"
+# ещё до какой-либо сетевой проверки самого auth_token. Передавая ct0
+# напрямую, мы полностью обходим этот bootstrap-шаг.
+# Берётся оттуда же, откуда auth_token: DevTools → Application → Cookies →
+# https://x.com → значение cookie "ct0".
+SCWEET_CT0 = os.environ.get("SCWEET_CT0", "").strip()
 SCWEET_PROXY = os.environ.get("SCWEET_PROXY", "").strip()  # http://user:pass@host:port
 SCWEET_MANIFEST_SCRAPE_ON_INIT = os.environ.get("SCWEET_MANIFEST_SCRAPE_ON_INIT", "1").strip().lower() not in {
     "0", "false", "no", "off"
@@ -512,7 +757,10 @@ REQUIRE_PUBLISHED_CACHE = os.environ.get("REQUIRE_PUBLISHED_CACHE", "0").strip()
 SOURCE_NEWS_FILE = "source_news_cache.json"
 SOURCE_NEWS_CACHE_DAYS = 2
 SOURCE_NEWS_CACHE_LIMIT = 500
-SEMANTIC_CANDIDATE_LIMIT = 3
+# Было 3 — снижено до 2: в промпт AI-проверки дублей попадает на одного
+# кандидата меньше, а решающую роль почти всегда играет только самый похожий
+# (первый) кандидат; третий по счёту крайне редко на что-то влиял.
+SEMANTIC_CANDIDATE_LIMIT = 2
 SEMANTIC_LOCAL_DUPLICATE_THRESHOLD = 0.86
 # Порог 0.18 был снижен раньше, чтобы цитаты с другими словами доходили до AI —
 # но т.к. проверялся ГЛОБАЛЬНО (для любого поста, не только цитат), это стало
@@ -522,8 +770,19 @@ SEMANTIC_LOCAL_DUPLICATE_THRESHOLD = 0.86
 # Возвращаем узкий порог только для постов-цитат (см. _looks_like_quote_post),
 # а для обычных постов держим более высокий барьер — меньше ложных кандидатов,
 # меньше вызовов AI, тот же результат по качеству детекции дублей.
-SEMANTIC_AI_PREFILTER_THRESHOLD = 0.32
-SEMANTIC_AI_PREFILTER_THRESHOLD_QUOTE = 0.18
+#
+# Было 0.32, поднято до 0.40: после первого повышения (0.18→0.32) доля
+# duplicate_check в общих расходах токенов упала с ~74% до ~48%, но всё ещё
+# доминирует — значит "серая зона" [0.32, 0.86), где AI вызывается на любой
+# намёк на схожесть, остаётся слишком широкой. Поднимаем нижнюю границу ещё,
+# сужая её до [0.40, 0.86).
+# ВАЖНО — компромисс: чем выше порог, тем больше риск пропустить настоящий
+# дубль, пересказанный другими словами (низкое словарное пересечение, но тот
+# же смысл) — именно такие случаи ловит AI, а не токен-схожесть. Если после
+# этого изменения в канале начнут проскакивать повторы — можно откатить
+# через переменную окружения SEMANTIC_AI_PREFILTER_THRESHOLD без правки кода.
+SEMANTIC_AI_PREFILTER_THRESHOLD = float(os.environ.get("SEMANTIC_AI_PREFILTER_THRESHOLD") or 0.40)
+SEMANTIC_AI_PREFILTER_THRESHOLD_QUOTE = float(os.environ.get("SEMANTIC_AI_PREFILTER_THRESHOLD_QUOTE") or 0.18)
 DUPLICATE_TEXT_MIN_WORDS = int((os.environ.get("DUPLICATE_TEXT_MIN_WORDS") or "7").strip())
 DUPLICATE_TEXT_MIN_CHARS = int((os.environ.get("DUPLICATE_TEXT_MIN_CHARS") or "45").strip())
 SOURCE_DUPLICATE_TEXT_MIN_WORDS = int((os.environ.get("SOURCE_DUPLICATE_TEXT_MIN_WORDS") or "5").strip())
@@ -541,9 +800,52 @@ LAYOUT_AI_MODEL = os.environ.get(
 ).strip()
 LAYOUT_AI_MAX_CHARS = int(os.environ.get("LAYOUT_AI_MAX_CHARS", "3200"))
 LAYOUT_AI_TIMEOUT = int(os.environ.get("LAYOUT_AI_TIMEOUT", "12"))
-STYLE_EDIT_ENABLED = os.environ.get("STYLE_EDIT_ENABLED", "1").strip().lower() not in {
+STYLE_EDIT_ENABLED = os.environ.get("STYLE_EDIT_ENABLED", "0").strip().lower() not in {
     "0", "false", "no", "off"
 }
+# Выключено (не удалено): перевод теперь идёт через дообученную YandexGPT
+# Lite (YANDEX_FINE_TUNED_TRANSLATION_MODEL), которая должна сразу выдавать
+# нужный стиль/склонения без отдельного AI-прохода редактуры. Раньше именно
+# этот этап уходил в фоллбэк на YandexGPT Pro и делал некорректные правки
+# (см. историю с "Арда Гюлер" → "Арда Гюлера"). Включить обратно —
+# STYLE_EDIT_ENABLED=1 в переменных окружения.
+GLOSSARY_AI_EDIT_ENABLED = os.environ.get("GLOSSARY_AI_EDIT_ENABLED", "0").strip().lower() not in {
+    "0", "false", "no", "off"
+}
+# Выключено (не удалено): AI-проход глоссария в edit_gemini() по той же
+# причине — дообученная модель должна сама переводить имена/клубы верно.
+# Детерминированные замены (apply_literal_glossary_replacements,
+# normalize_known_player_names) остаются включёнными всегда — это не AI,
+# а словарь известных написаний, дешёвый safety-net. Включить обратно —
+# GLOSSARY_AI_EDIT_ENABLED=1.
+LAYOUT_AI_ENABLED = os.environ.get("LAYOUT_AI_ENABLED", "0").strip().lower() not in {
+    "0", "false", "no", "off"
+}
+# Раньше было выключено по умолчанию: apply_literal_glossary_replacements
+# (жёсткая подстановка GLOSSARY bad→good, например "Lamine Yamal"/
+# "Lamine Yamаl"→"Ламин Ямаль") всегда ставила good-форму в ИМЕНИТЕЛЬНОМ
+# падеже, не глядя на грамматическую роль слова в предложении — источник
+# ошибок вида "пас Ламин Ямаль на Карима Адейеми" вместо "пас Ламина Ямаля
+# на...". Теперь apply_literal_glossary_replacements() внутри вызывает
+# apply_case_aware_glossary_replacements() (см. ниже), которая через
+# pymorphy3 определяет падеж УЖЕ ВСТРЕТИВШЕЙСЯ (неправильной) словоформы в
+# тексте и ставит good-фамилию в тот же падеж, а не всегда в именительный —
+# поэтому подстановку можно снова держать включённой по умолчанию. Если
+# pymorphy3 не установлен или не смог определить падеж для конкретного
+# слова — используется прежнее поведение (именительный падеж), т.е. не хуже
+# старого варианта. normalize_known_player_names (отдельный, маленький
+# LOCAL_NAME_REPLACEMENTS — только транслитерация "Kendry Páez"-подобных
+# написаний) этим флагом не затрагивается. Выключить обратно (если найдутся
+# новые проблемы) — GLOSSARY_LITERAL_REPLACEMENTS_ENABLED=0.
+GLOSSARY_LITERAL_REPLACEMENTS_ENABLED = os.environ.get(
+    "GLOSSARY_LITERAL_REPLACEMENTS_ENABLED", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+# Выключено (не удалено): AI-часть ai_check_telegram_layout() (RAG-подбор
+# похожих примеров + запрос к Qwen3/Gemini/OpenRouter за версткой).
+# local_layout_repair()/safe_html_layout_fixes()/safe_plain_layout_fixes()
+# (детерминированный ремонт вёрстки, не AI) остаются работать как прежде —
+# дообученная модель должна сама расставлять <b>/<blockquote>/переносы верно.
+# Включить обратно — LAYOUT_AI_ENABLED=1.
 # Редактура и проверка глоссария теперь выполняются через Yandex, а не через
 # Gemini. Модели можно переопределить через .env при необходимости.
 # Сознательно оставлено на Qwen3 235B (в отличие от GLOSSARY_EDIT_MODEL и
@@ -556,17 +858,24 @@ STYLE_EDIT_MODEL = (os.environ.get("STYLE_EDIT_MODEL") or "qwen3.6-35b-a3b/lates
 GLOSSARY_EDIT_MODEL = (os.environ.get("GLOSSARY_EDIT_MODEL") or "gpt-oss-20b/latest").strip()
 STYLE_EDIT_MAX_CHARS = int(os.environ.get("STYLE_EDIT_MAX_CHARS", "1800"))
 STYLE_EDIT_TIMEOUT = int(os.environ.get("STYLE_EDIT_TIMEOUT", "18"))
-FORMAT_RAG_ENABLED = os.environ.get("FORMAT_RAG_ENABLED", "1").strip().lower() not in {
+FORMAT_RAG_ENABLED = os.environ.get("FORMAT_RAG_ENABLED", "0").strip().lower() not in {
     "0", "false", "no", "off"
 }
+# Выключено вместе с LAYOUT_AI_ENABLED — это тот самый "RAG-подбор" из
+# AI-части ai_check_telegram_layout(), см. комментарий у LAYOUT_AI_ENABLED
+# выше. Включить обратно — FORMAT_RAG_ENABLED=1.
 FORMAT_RAG_ONLY_WHEN_NEEDED = os.environ.get("FORMAT_RAG_ONLY_WHEN_NEEDED", "1").strip().lower() not in {
     "0", "false", "no", "off"
 }
 LAYOUT_AI_ONLY_WHEN_NEEDED = os.environ.get("LAYOUT_AI_ONLY_WHEN_NEEDED", "1").strip().lower() not in {
     "0", "false", "no", "off"
 }
-# Понижено до дешёвой модели по той же причине, что и LAYOUT_AI_QWEN_MODEL —
-# результат жёстко валидируется кодом, топовая модель не нужна.
+# Раньше был единственной моделью RAG-проверки вёрстки (см. историю ниже —
+# rag_check_telegram_layout() теперь строит цепочку фоллбэка по аналогии с
+# translate_with_fallback(): дообученная YandexGPT Lite → Qwen3 235B → Gemini
+# → дообученная модель ещё раз). FORMAT_RAG_MODEL в этой цепочке больше не
+# участвует — оставлено только для обратной совместимости, если где-то в
+# конфиге ещё задан переопределённый env var.
 FORMAT_RAG_MODEL = (
     os.environ.get("FORMAT_RAG_MODEL")
     or "yandexgpt-lite/latest"
@@ -636,6 +945,8 @@ def ensure_state_files(published: set):
         save_published(published)
     if not Path(SOURCE_NEWS_FILE).exists():
         save_source_news_cache([])
+    if not Path(FAILED_ATTEMPTS_FILE).exists():
+        save_failed_attempts({})
 
 
 def canonical_url(url: str) -> str:
@@ -928,6 +1239,77 @@ def mark_published(published: set, **kwargs):
     published.update(duplicate_keys(**kwargs))
 
 
+FAILED_ATTEMPTS_FILE = "failed_attempts.json"
+# Сколько раз подряд публикация одного и того же поста может провалиться
+# (недоступное/несжимаемое медиа, ошибка Telegram API и т.п.), прежде чем
+# пост считается непубликуемым и уходит в чёрный список — иначе он молотится
+# по кругу на каждом запуске (перевод → редактура → попытка отправки →
+# провал), впустую тратя токены AI и время, но так и не публикуется.
+BLACKLIST_AFTER_FAILURES = int((os.environ.get("BLACKLIST_AFTER_FAILURES") or "2").strip())
+
+
+def load_failed_attempts() -> dict:
+    if Path(FAILED_ATTEMPTS_FILE).exists():
+        try:
+            with open(FAILED_ATTEMPTS_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return {str(k): int(v) for k, v in data.items() if str(k)}
+        except Exception as e:
+            print(f"  Не удалось прочитать {FAILED_ATTEMPTS_FILE}: {e}")
+    return {}
+
+
+def save_failed_attempts(attempts: dict):
+    with open(FAILED_ATTEMPTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(attempts, f, ensure_ascii=False, indent=2)
+
+
+def register_publish_result(ok, *, published: set, attempts: dict, post_id: str, **mark_kwargs) -> bool:
+    """Общая обработка результата send_to_telegram() для всех шагов (1-4).
+
+    ok=True        → пост опубликован: помечаем в published_ids.json,
+                      счётчик неудач по этому посту сбрасывается.
+    ok=False/None  → неудача (False — временная ошибка Telegram API,
+                      None — медиа недоступны/несжимаемы). Считаем неудачи
+                      подряд по post_id; после BLACKLIST_AFTER_FAILURES
+                      неудач добавляем пост в published_ids.json как
+                      «псевдо-опубликованный», чтобы он больше не пытался
+                      публиковаться на следующих запусках.
+
+    Возвращает True, если пост нужно засчитать в new_count (успешная публикация).
+    Сохранение published_ids.json/failed_attempts.json на диск делает сам вызывающий
+    код — эта функция только меняет переданные in-memory published/attempts.
+    """
+    key = str(post_id or "").strip()
+
+    if ok:
+        if key:
+            attempts.pop(key, None)
+        mark_published(published, post_id=post_id, **mark_kwargs)
+        return True
+
+    if not key:
+        return False
+
+    reason = "медиа недоступны" if ok is None else "ошибка отправки в Telegram"
+    count = attempts.get(key, 0) + 1
+    if count >= BLACKLIST_AFTER_FAILURES:
+        print(
+            f"  Чёрный список после {count} неудачных попыток подряд "
+            f"({reason}) — публиковать больше не пытаемся: {key[:80]}"
+        )
+        mark_published(published, post_id=post_id, **mark_kwargs)
+        attempts.pop(key, None)
+    else:
+        attempts[key] = count
+        print(
+            f"  Попытка {count}/{BLACKLIST_AFTER_FAILURES} неудачна ({reason}) — "
+            f"пост не опубликован: {key[:80]}"
+        )
+    return False
+
+
 def source_news_duplicate_keys() -> set:
     try:
         records = load_source_news_cache()
@@ -1200,7 +1582,8 @@ def openrouter_semantic_duplicate(text: str, candidates: list) -> bool:
     qwen_available = bool(YANDEX_API_KEY and YANDEX_FOLDER_ID)
     gemini_available = bool(GEMINI_API_KEY)
     openrouter_available = bool(OPENROUTER_KEY)
-    if not qwen_available and not gemini_available and not openrouter_available:
+    free_available = "duplicate_check" in GEMINI_FREE_OPS and _get_gemini_free_pool() is not None
+    if not free_available and not qwen_available and not gemini_available and not openrouter_available:
         return False
 
     previous = [
@@ -1208,7 +1591,7 @@ def openrouter_semantic_duplicate(text: str, candidates: list) -> bool:
             "score": round(score, 3),
             "source": record.get("source", ""),
             "date": record.get("created_at", ""),
-            "text": record.get("text", "")[:700],
+            "text": record.get("text", "")[:500],
         }
         for score, record in candidates
     ]
@@ -1222,12 +1605,16 @@ def openrouter_semantic_duplicate(text: str, candidates: list) -> bool:
         "saying essentially the same thing as a PREVIOUS item — mark as duplicate.\n"
         "Return only valid JSON without markdown: "
         "{\"duplicate\": true|false, \"reason\": \"one short sentence\"}.\n\n"
-        f"NEW:\n{text[:1000]}\n\n"
+        f"NEW:\n{text[:800]}\n\n"
         f"PREVIOUS:\n{json.dumps(previous, ensure_ascii=False)}"
     )
 
     data = None
-    if qwen_available:
+    if free_available:
+        free_text = gemini_free_text(prompt, 120, 18, "duplicate_check", json_mode=True)
+        if free_text is not None:
+            data = _parse_duplicate_check_json(free_text)
+    if data is None and qwen_available:
         try:
             data = _qwen_semantic_duplicate_check(prompt)
         except requests.HTTPError as e:
@@ -1296,7 +1683,23 @@ def _quote_speaker(text: str) -> str:
     return ""
 
 
-def is_semantic_duplicate(text: str, source: str = "", post_id: str = "", url: str = "") -> bool:
+def is_semantic_duplicate(
+    text: str,
+    source: str = "",
+    post_id: str = "",
+    url: str = "",
+    use_ai_check: bool = True,
+    local_threshold_override: float | None = None,
+) -> bool:
+    """
+    use_ai_check=False           — отключает AI-проверку «по смыслу» (yandexgpt-lite/Gemini/OpenRouter),
+                                    остаётся только локальная проверка похожести по словам.
+    local_threshold_override     — если задан, используется вместо стандартного локального порога
+                                    (0.86 для обычных постов / адаптивный для цитат). Более высокое
+                                    значение = дублем считается только почти дословное совпадение.
+    Оба параметра нужны, чтобы для отдельных источников (например, узкоспециализированного
+    аккаунта на Шаге 3) можно было существенно смягчить проверку, не трогая остальные шаги.
+    """
     if word_count(text) < 6:
         return False
 
@@ -1337,6 +1740,12 @@ def is_semantic_duplicate(text: str, source: str = "", post_id: str = "", url: s
             # Спикер другой или не распознан — стандартный порог
             local_threshold = SEMANTIC_LOCAL_DUPLICATE_THRESHOLD
 
+    if local_threshold_override is not None:
+        # Явный override нужен, например, для узкоспециализированных источников
+        # (Шаг 3): там дублей по смыслу почти не бывает, поэтому порог поднимаем,
+        # чтобы срабатывало только на почти дословное совпадение.
+        local_threshold = local_threshold_override
+
     if best_score >= local_threshold:
         label = "цитата" if is_quote and local_threshold < SEMANTIC_LOCAL_DUPLICATE_THRESHOLD else "смысловой дубль"
         print(
@@ -1348,7 +1757,7 @@ def is_semantic_duplicate(text: str, source: str = "", post_id: str = "", url: s
     # ── AI-проверка для оставшихся кандидатов ───────────────────────────────
     # Для цитат передаём все кандидаты — AI лучше понимает что «та же мысль,
     # другими словами» это дубль.
-    if openrouter_semantic_duplicate(text, candidates):
+    if use_ai_check and openrouter_semantic_duplicate(text, candidates):
         return True
 
     return False
@@ -1385,6 +1794,71 @@ def is_too_old(date_str: str) -> bool:
     if dt:
         return (datetime.now(timezone.utc) - dt) > timedelta(days=MAX_AGE_DAYS)
     print(f"  Не удалось разобрать дату: {date_str}")
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# ФИЛЬТР "ЖИВЫХ" РЕПОРТАЖЕЙ О ХОДЕ МАТЧА
+# ─────────────────────────────────────────────────────────────────────────
+# Source-аккаунты иногда постят построчный текстовый репортаж прямо по ходу
+# матча — гол в конкретную минуту, начало/конец тайма и т.п. Такие посты не
+# самостоятельная новость (нет контекста: какой матч, какой счёт был до
+# этого), появляются пачками по несколько штук за матч и не имеют смысла в
+# переводе/публикации у нас — поэтому пропускаем их целиком, ДО перевода.
+#
+# Маркеры поста такого типа: минута матча ("43’"), восклицание гола (часто
+# с растянутыми буквами — "GOAAAAAAAAAAAAAAAAAAL", "¡GOOOOOOOOOAAAAAL!!!!!"),
+# фамилия автора гола, счёт ("2-1"). Как правило, встречаются не все сразу —
+# см. примеры:
+#   "43’ ! GOAAAAAAAAAAAAAAAAAAL! YILDIZ"
+#   "⚽️ ¡GOOOOOOOOOAAAAAL!!!!! PINAAAAAAAAAAAAAAAAAA!!! 2-1🔵🔴"
+#   "SECOND-HALF: Barça v Montpellier FC 🔵🔴"
+_LIVE_MATCH_MINUTE_RE = re.compile(r"(?<!\d)\d{1,3}(?:\+\d{1,2})?\s*[’'`′]")
+# Слово из букв G/O/A/L (в любом порядке повторов вида G+O+A*L+, как и
+# пишут в живых репортажах — "GOAL", "GOOOL", "GOAAAAL", "GOOOOOOOOOAAAAAL")
+# — засчитывается как "выкрик гола", только если само слово заметно длиннее
+# обычного "GOAL"/"GOL" (см. _has_live_match_goal_shout: порог по длине), а
+# не просто содержит эти буквы — иначе ложно сработало бы на обычном "What
+# a goal from Yamal!".
+_LIVE_MATCH_GOAL_WORD_RE = re.compile(r"\bG+O+A*L+\b", re.I)
+_LIVE_MATCH_GOAL_SHOUT_MIN_LEN = 6
+_LIVE_MATCH_HALFTIME_RE = re.compile(
+    r"\b(SECOND[\s-]?HALF|FIRST[\s-]?HALF|HALF[\s-]?TIME\b|HT:|FULL[\s-]?TIME\b|FT:|KICK[\s-]?OFF)\b",
+    re.I,
+)
+_LIVE_MATCH_SCORE_RE = re.compile(r"(?<!\d)\d{1,2}\s*[-–:]\s*\d{1,2}(?!\d)")
+
+
+def _has_live_match_goal_shout(text: str) -> bool:
+    return any(
+        len(m.group(0)) >= _LIVE_MATCH_GOAL_SHOUT_MIN_LEN
+        for m in _LIVE_MATCH_GOAL_WORD_RE.finditer(text)
+    )
+
+
+def is_live_match_report_text(text: str) -> bool:
+    """True, если text похож на построчный "живой" репортаж о ходе матча
+    (гол/минута/перерыв/счёт), а не на самостоятельную новость — см. блок
+    комментариев выше. Вызывающий код (step1..step4) должен пропустить такой
+    пост ДО перевода/публикации.
+
+    Не претендует на 100% точность (эвристика по тексту, не по структуре
+    источника) — специально консервативна, чтобы не резать обычные посты:
+    - слова HALF-TIME/SECOND-HALF/FULL-TIME/KICK-OFF ловятся сразу;
+    - "растянутый" GOAL/GOOOL ловится сразу (обычный текст так не пишут);
+    - минута ("43’") сама по себе — недостаточно (может быть, например,
+      возраст или статистика), поэтому засчитывается только вместе со
+      счётом матча в этом же тексте.
+    """
+    if not text:
+        return False
+    plain = html.unescape(strip_html_tags(text))
+    if _LIVE_MATCH_HALFTIME_RE.search(plain):
+        return True
+    if _has_live_match_goal_shout(plain):
+        return True
+    if _LIVE_MATCH_MINUTE_RE.search(plain) and _LIVE_MATCH_SCORE_RE.search(plain):
+        return True
     return False
 
 
@@ -1684,7 +2158,15 @@ def word_count(text: str) -> int:
 
 def speaker_name_from_heading(heading: str) -> str:
     text = html.unescape(strip_html_tags(heading or "")).strip()
-    text = re.sub(r"^\s*[🗣🎙]️?\s*:?\s*", "", text)
+    # Срезаем ВЕСЬ ведущий блок эмодзи целиком (не только 🗣/🎙), иначе если
+    # перед 🎙️ стоит другой эмодзи (например 🚨), regex не срабатывает,
+    # исходный 🎙️ остаётся внутри имени, а render_colon_heading добавляет
+    # свой — получается задвоенный "🎙️ ... 🚨🎙️ ...".
+    text = re.sub(
+        r"^\s*(?:[\U0001F300-\U0001FAFF\u2600-\u27BF]\uFE0F?\s*)+:?\s*",
+        "",
+        text,
+    )
     text = re.sub(r"^\s*(?:спикер|speaker)\s*:?\s*", "", text, flags=re.I)
     return text.strip(" *:")
 
@@ -3125,6 +3607,35 @@ def translate_deepl(text: str, errors: list | None = None) -> str | None:
 
 
 
+def _safe_glossary_for_prompt() -> str:
+    """Обёртка над glossary_for_prompt() (glossary.py) для вставки в system
+    prompt переводчика — заземляющий список "правильных" написаний имён,
+    который модель видит ДО генерации перевода.
+
+    В отличие от apply_literal_glossary_replacements() (правит текст ПОСЛЕ
+    перевода, детерминированно), эта подсказка снижает саму вероятность
+    ошибки на этапе генерации — в частности, случаи вида "Yildiz" переведён
+    как "Миретти" (модель перепутала одного футболиста с другим похожим по
+    контексту, а не просто ошиблась в транслитерации). Список действует
+    только как подсказка "как правильно пишется базовая форма фамилии" — не
+    как инструкция копировать её дословно, поэтому не должен мешать модели
+    склонять имя по падежам (см. явное указание об этом в самом промпте).
+
+    Никогда не бросает исключение и не блокирует перевод, если glossary.py
+    недоступен/вернул ошибку — просто промпт останется без этого блока.
+    Результат кэшируется на весь процесс: glossary.py правится только через
+    деплой, пересчитывать на каждый перевод незачем.
+    """
+    try:
+        return (glossary_for_prompt() or "").strip()
+    except Exception as e:
+        print(f"  glossary_for_prompt() недоступен ({e}) — перевод продолжится без заземляющего списка имён")
+        return ""
+
+
+_GLOSSARY_PROMPT_BLOCK = _safe_glossary_for_prompt()
+
+
 _TRANSLATION_SYSTEM_PROMPT = (
     "Ты профессиональный переводчик футбольных новостей. "
     "Переведи текст на русский язык. Строгие требования:\n"
@@ -3154,7 +3665,28 @@ _TRANSLATION_SYSTEM_PROMPT = (
     "5. Счёт матча, время, дробные числа — всегда слитно без переноса строки: "
     "3:1, 19:30, 0,25.\n"
     "6. Все эмодзи оставляй на своих местах без изменений.\n"
-    "7. Верни только переведённый текст, без пояснений и комментариев."
+    "7. В тексте могут встречаться служебные метки вида @@AH0@@, @@DNT12@@ "
+    "и т.п. (две собаки, заглавные латинские буквы, число, снова две "
+    "собаки). Это НЕ слова и не аббревиатуры, а технические заглушки — их "
+    "содержимое подставится программой уже после перевода. Копируй каждую "
+    "такую метку в перевод СИМВОЛ В СИМВОЛ, ровно на том же месте по смыслу "
+    "предложения: не переводи её, не транслитерируй буквы в кириллицу, не "
+    "убирай и не добавляй символы @@, не меняй регистр букв и цифры внутри, "
+    "не оборачивай в кавычки и не отделяй лишними пробелами от соседних "
+    "слов (кроме случая, когда по правилам русского языка нужен пробел "
+    "до/после метки, как до/после обычного слова).\n"
+    "8. Верни только переведённый текст, без пояснений и комментариев."
+    + (
+        "\n9. Ниже — список игроков/тренеров с ПРАВИЛЬНЫМ написанием основы "
+        "фамилии по-русски (в именительном падеже). Если человек из этого "
+        "списка упоминается в тексте (в том числе если исходное написание "
+        "на другом языке отличается или похоже на написание другого "
+        "человека) — используй ИМЕННО эту фамилию, не путай с похожими. "
+        "Но ОБЯЗАТЕЛЬНО ставь её в падеж, нужный по контексту предложения — "
+        "НЕ копируй форму из списка дословно, если по правилам русского "
+        "языка нужен другой падеж:\n" + _GLOSSARY_PROMPT_BLOCK
+        if _GLOSSARY_PROMPT_BLOCK else ""
+    )
 )
 
 TRANSLATE_GEMINI_MODEL = (os.environ.get("TRANSLATE_GEMINI_MODEL") or "gemini-2.5-flash").strip()
@@ -3247,6 +3779,9 @@ def translate_openrouter(text: str, errors: list | None = None) -> str | None:
             raise ValueError("Пустой ответ от OpenRouter")
         if not _looks_translated_to_russian(text, result):
             raise ValueError("OpenRouter вернул текст не на русском (похоже, перевод не выполнен)")
+        if _looks_like_ai_refusal(result):
+            log_translation_case(text, result, service="OpenRouter", status="refusal")
+            raise ValueError("OpenRouter вернул отказ-boilerplate вместо перевода")
         return result
     except requests.HTTPError as e:
         status = e.response.status_code if e.response is not None else "?"
@@ -3274,6 +3809,7 @@ def translate_gemini(text: str, errors: list | None = None) -> str | None:
         return None
 
     prompt = _TRANSLATION_SYSTEM_PROMPT + "\n\nТекст для перевода:\n" + text
+    used_model: list[str] = []
     try:
         result = gemini_text_completion(
             prompt=prompt,
@@ -3281,12 +3817,21 @@ def translate_gemini(text: str, errors: list | None = None) -> str | None:
             timeout=TRANSLATE_GEMINI_TIMEOUT,
             model=TRANSLATE_GEMINI_MODEL,
             fallback_models=TRANSLATE_GEMINI_FALLBACK_MODELS,
+            used_model_out=used_model,
         )
+        # Точное имя модели, которая реально ответила (primary или один из
+        # TRANSLATE_GEMINI_FALLBACK_MODELS) — пишем в лог перевода не просто
+        # "Gemini", а "Gemini (gemini-2.5-flash-lite)" и т.п.
+        model_label = f"Gemini ({used_model[0]})" if used_model else "Gemini"
         result = parse_gemini_editor_response(result)
         if not result:
             raise ValueError("Пустой ответ от Gemini")
         if not _looks_translated_to_russian(text, result):
             raise ValueError("Gemini вернул текст не на русском (похоже, перевод не выполнен)")
+        if _looks_like_ai_refusal(result):
+            log_translation_case(text, result, service=model_label, status="refusal")
+            raise ValueError("Gemini вернул отказ-boilerplate вместо перевода")
+        _set_last_translation_service(model_label)
         return result
     except requests.HTTPError as e:
         status = e.response.status_code if e.response is not None else "?"
@@ -3303,6 +3848,159 @@ def translate_gemini(text: str, errors: list | None = None) -> str | None:
         return None
 
 
+# --- Пул бесплатных Gemini-ключей (Free tier) ---------------------------------
+# Ключи: GEMINI_FREE_KEYS="k1,k2,...,k16" или GEMINI_FREE_KEY_1..GEMINI_FREE_KEY_16.
+# Лимиты ниже — ЗНАЧЕНИЯ ПО УМОЛЧАНИЮ, сверьте их с AI Studio (Rate limits) для
+# вашей модели и при необходимости задайте через переменные окружения.
+GEMINI_FREE_MODEL = (os.environ.get("GEMINI_FREE_MODEL") or "gemini-3.5-flash-lite").strip()
+GEMINI_FREE_RPM = int(os.environ.get("GEMINI_FREE_RPM") or 15)
+GEMINI_FREE_TPM = int(os.environ.get("GEMINI_FREE_TPM") or 250000)
+GEMINI_FREE_RPD = int(os.environ.get("GEMINI_FREE_RPD") or 500)
+# Доля лимита, которую разрешено использовать (0.9 = останавливаемся на 90%).
+GEMINI_FREE_SAFETY = float(os.environ.get("GEMINI_FREE_SAFETY") or 0.9)
+GEMINI_FREE_TIMEOUT = int(os.environ.get("GEMINI_FREE_TIMEOUT") or 30)
+GEMINI_FREE_STATE_FILE = "gemini_quota_state.json"  # только для локального режима (без координатора)
+# Общий счётчик лимитов для ВСЕХ ботов — Cloudflare Worker + Durable Object
+# (см. gemini_quota_do.js). Пример: GEMINI_QUOTA_URL=https://<worker>.workers.dev
+# Если не заданы — используются локальные счётчики (годятся только для одного бота).
+GEMINI_QUOTA_URL = os.environ.get("GEMINI_QUOTA_URL", "").strip()
+GEMINI_QUOTA_SECRET = os.environ.get("GEMINI_QUOTA_SECRET", "").strip()
+# Для каких AI-операций сначала пробуется бесплатный пул Gemini. Чтобы выключить
+# операцию (например style_edit) без правки кода — уберите её из списка.
+GEMINI_FREE_OPS = {
+    o.strip()
+    for o in (
+        os.environ.get("GEMINI_FREE_OPS")
+        or "translate,glossary_edit,style_edit,duplicate_check,layout,rag_layout"
+    ).split(",")
+    if o.strip()
+}
+
+_gemini_free_pool: GeminiFreePool | None = None
+_gemini_free_pool_init = False
+
+
+def _get_gemini_free_pool() -> GeminiFreePool | None:
+    global _gemini_free_pool, _gemini_free_pool_init
+    if not _gemini_free_pool_init:
+        _gemini_free_pool_init = True
+        keys = load_keys_from_env()
+        if keys:
+            _gemini_free_pool = GeminiFreePool(
+                keys=keys,
+                model=GEMINI_FREE_MODEL,
+                rpm=GEMINI_FREE_RPM,
+                tpm=GEMINI_FREE_TPM,
+                rpd=GEMINI_FREE_RPD,
+                safety=GEMINI_FREE_SAFETY,
+                state_file=GEMINI_FREE_STATE_FILE,
+                base_url=GEMINI_BASE_URL,
+                quota=(
+                    RemoteQuota(GEMINI_QUOTA_URL, GEMINI_QUOTA_SECRET, len(keys))
+                    if GEMINI_QUOTA_URL and GEMINI_QUOTA_SECRET else None
+                ),
+            )
+            mode = "общий координатор" if GEMINI_QUOTA_URL and GEMINI_QUOTA_SECRET else "локальные счётчики"
+            print(f"  Gemini Free: пул из {len(keys)} ключей, модель {GEMINI_FREE_MODEL}, {mode}")
+    return _gemini_free_pool
+
+
+def translate_gemini_free(text: str, errors: list | None = None) -> str | None:
+    """Перевод через пул бесплатных Gemini-ключей с контролем лимитов.
+
+    Идёт по ключам по порядку: пока у ключа есть запас по RPM/TPM/RPD — работаем
+    на нём, когда лимит почти выбран — берём следующий ключ. Если исчерпаны все
+    ключи — возвращает None, и translate_with_fallback() идёт к следующему шагу.
+    """
+    if not text:
+        return None
+    pool = _get_gemini_free_pool()
+    if pool is None:
+        return None  # ключи не заданы — шаг молча пропускается
+
+    prompt = _TRANSLATION_SYSTEM_PROMPT + "\n\nТекст для перевода:\n" + text
+    try:
+        result, key_no, usage = pool.generate(
+            prompt, max_output_tokens=2000, timeout=GEMINI_FREE_TIMEOUT
+        )
+        log_usage(
+            "translate", GEMINI_FREE_MODEL, "gemini",
+            usage.get("promptTokenCount"), usage.get("candidatesTokenCount"),
+        )
+        model_label = f"Gemini Free #{key_no} ({GEMINI_FREE_MODEL})"
+        result = parse_gemini_editor_response(result)
+        if not result:
+            raise ValueError("Пустой ответ от Gemini Free")
+        if not _looks_translated_to_russian(text, result):
+            raise ValueError("Gemini Free вернул текст не на русском (похоже, перевод не выполнен)")
+        if _looks_like_ai_refusal(result):
+            log_translation_case(text, result, service=model_label, status="refusal")
+            raise ValueError("Gemini Free вернул отказ-boilerplate вместо перевода")
+        _set_last_translation_service(model_label)
+        print(f"  ✓ Gemini Free #{key_no}: перевод выполнен")
+        return result
+    except GeminiPoolExhausted as e:
+        print(f"  Gemini Free: {e} — переходим к следующим моделям")
+        if errors is not None:
+            errors.append(f"Gemini Free: {e}")
+        return None
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "?"
+        print(f"  Gemini Free перевод ошибка: HTTP {status}")
+        if errors is not None:
+            errors.append(f"Gemini Free: HTTP {status}")
+        return None
+    except Exception as e:
+        print(f"  Gemini Free перевод ошибка: {e}")
+        if errors is not None:
+            errors.append(f"Gemini Free: {e}")
+        return None
+
+
+def gemini_free_text(
+    prompt: str,
+    max_tokens: int,
+    timeout: int,
+    operation: str,
+    json_mode: bool = False,
+    used_model_out: list | None = None,
+) -> str | None:
+    """Универсальный вызов бесплатного пула Gemini для любой текстовой AI-операции
+    (редактура, стиль, дубли, верстка). Возвращает текст ответа или None, если
+    операция не включена в GEMINI_FREE_OPS, пул не настроен, лимиты исчерпаны или
+    вызов упал — тогда вызывающий код идёт по своей прежней цепочке (Yandex и т.д.).
+    """
+    if operation not in GEMINI_FREE_OPS:
+        return None
+    pool = _get_gemini_free_pool()
+    if pool is None:
+        return None
+    try:
+        text, key_no, usage = pool.generate(
+            prompt,
+            # запас под служебные токены модели — иначе короткий JSON может обрезаться
+            max_output_tokens=max(max_tokens, 600),
+            timeout=timeout,
+            json_mode=json_mode,
+        )
+    except GeminiPoolExhausted as e:
+        print(f"  Gemini Free ({operation}): {e} — идём по прежней цепочке")
+        return None
+    except Exception as e:
+        print(f"  Gemini Free ({operation}) ошибка: {e} — идём по прежней цепочке")
+        return None
+    log_usage(
+        operation, GEMINI_FREE_MODEL, "gemini",
+        usage.get("promptTokenCount"), usage.get("candidatesTokenCount"),
+    )
+    if not text:
+        return None
+    print(f"  ✓ Gemini Free #{key_no}: {operation}")
+    if used_model_out is not None:
+        used_model_out.append(f"Gemini Free #{key_no} ({GEMINI_FREE_MODEL})")
+    return text
+
+
 _YANDEX_TRANSLATION_SYSTEM_PROMPT = (
     "Ты профессиональный переводчик спортивного издания.\n"
     "Переведи текст так, будто он написан русскоязычным журналистом.\n"
@@ -3314,8 +4012,22 @@ _YANDEX_TRANSLATION_SYSTEM_PROMPT = (
     "- не меняй порядок событий;\n"
     "- используй естественные русские конструкции;\n"
     "- избегай кальки с английского;\n"
-    "- используй общепринятые футбольные термины.\n"
+    "- используй общепринятые футбольные термины;\n"
+    "- в тексте могут встречаться служебные метки вида @@AH0@@, @@DNT12@@ "
+    "и т.п. (две собаки, заглавные латинские буквы, число, снова две "
+    "собаки) — это технические заглушки, а не слова; копируй их в перевод "
+    "СИМВОЛ В СИМВОЛ без изменений (не переводи, не транслитерируй в "
+    "кириллицу, не убирай и не добавляй @@, не меняй регистр и цифры, не "
+    "оборачивай в кавычки).\n"
     "Верни только перевод."
+    + (
+        "\n\nСписок игроков/тренеров с правильным написанием основы фамилии "
+        "по-русски (именительный падеж) — используй именно эту фамилию для "
+        "людей из списка (не путай с похожими по звучанию/контексту), но "
+        "ставь её в падеж по контексту предложения, а не копируй форму из "
+        "списка буквально:\n" + _GLOSSARY_PROMPT_BLOCK
+        if _GLOSSARY_PROMPT_BLOCK else ""
+    )
 )
 
 
@@ -3337,27 +4049,33 @@ def _http_error_body_snippet(e: "requests.HTTPError", limit: int = 300) -> str:
         return ""
 
 
-def translate_yandex(text: str, errors: list | None = None) -> str | None:
-    """Перевод через Qwen3 235B (Yandex Foundation Models). Возвращает None при любой ошибке."""
-    if not text:
-        return None
+_last_translation_service: str = ""
 
-    if not YANDEX_API_KEY or not YANDEX_FOLDER_ID:
-        print("  Yandex недоступен: YANDEX_API_KEY/YANDEX_FOLDER_ID не заданы")
-        if errors is not None:
-            errors.append("Yandex: YANDEX_API_KEY/YANDEX_FOLDER_ID не заданы")
-        return None
 
-    # Короткие тексты (условно "Чиро 🍵") гоняем сразу через YandexGPT Lite —
-    # она не-reasoning, дешевле и для 2-3 слов результат не хуже, чем у Qwen3
-    # с reasoning_effort=low, зато без риска накрутить скрытые reasoning-токены.
-    is_short = len(text.strip()) < SHORT_TEXT_TRANSLATION_THRESHOLD
-    model_to_use = YANDEX_SHORT_TEXT_MODEL if is_short else YANDEX_QWEN_MODEL
-    model_label = "YandexGPT Lite" if is_short else "Qwen3"
+def _set_last_translation_service(service: str) -> None:
+    global _last_translation_service
+    _last_translation_service = (service or "").strip()
 
+
+def _yandex_model_uri(model_to_use: str) -> str:
+    model = (model_to_use or "").strip()
+    if model.startswith("gpt://"):
+        return model
+    return f"gpt://{YANDEX_FOLDER_ID}/{model}"
+
+
+def _translate_yandex_single_model(
+    text: str, model_to_use: str, model_label: str, errors: list | None
+) -> str | None:
+    """Один вызов Yandex Foundation Models конкретной моделью на перевод.
+
+    Вынесено из translate_yandex() в отдельную функцию, чтобы можно было
+    пробовать несколько моделей подряд (сейчас — YandexGPT Lite, затем
+    Qwen3 как подстраховка), не дублируя код HTTP-запроса дважды.
+    """
     try:
         translate_body = {
-            "model": f"gpt://{YANDEX_FOLDER_ID}/{model_to_use}",
+            "model": _yandex_model_uri(model_to_use),
             "stream": False,
             "temperature": 0.1,
             "max_tokens": 4000,
@@ -3366,7 +4084,7 @@ def translate_yandex(text: str, errors: list | None = None) -> str | None:
                 {"role": "user",   "content": text},
             ],
         }
-        if _is_qwen_model(model_to_use) and YANDEX_QWEN_REASONING_EFFORT:
+        if _supports_reasoning_effort(model_to_use) and YANDEX_QWEN_REASONING_EFFORT:
             translate_body["reasoning_effort"] = YANDEX_QWEN_REASONING_EFFORT
         r = requests.post(
             YANDEX_API_URL,
@@ -3395,6 +4113,10 @@ def translate_yandex(text: str, errors: list | None = None) -> str | None:
             raise ValueError(f"Пустой ответ от {model_label}")
         if not _looks_translated_to_russian(text, result):
             raise ValueError(f"{model_label} вернул текст не на русском (похоже, перевод не выполнен)")
+        if _looks_like_ai_refusal(result):
+            log_translation_case(text, result, service=model_label, status="refusal")
+            raise ValueError(f"{model_label} вернул отказ-boilerplate вместо перевода")
+        _set_last_translation_service(model_label)
         return result
     except requests.HTTPError as e:
         status = e.response.status_code if e.response is not None else "?"
@@ -3402,12 +4124,203 @@ def translate_yandex(text: str, errors: list | None = None) -> str | None:
         reason = f"HTTP {status}" + (f" | тело: {body_snippet}" if body_snippet else "")
         print(f"  {model_label} (Yandex) перевод HTTP {status}: {e}" + (f" | тело: {body_snippet}" if body_snippet else ""))
         if errors is not None:
-            errors.append(f"Yandex: {reason}")
+            errors.append(f"Yandex ({model_label}): {reason}")
         return None
     except Exception as e:
         print(f"  {model_label} (Yandex) перевод ошибка: {e}")
         if errors is not None:
-            errors.append(f"Yandex: {e}")
+            errors.append(f"Yandex ({model_label}): {e}")
+        return None
+
+
+def translate_yandex(text: str, errors: list | None = None) -> str | None:
+    """Перевод через Yandex Foundation Models.
+
+    Цепочка внутри Yandex: дообученная YandexGPT Lite →
+    YandexGPT 5 Lite → Qwen3 235B. Если все три вызова не сработали,
+    возвращает None, и translate_with_fallback() продолжает внешнюю цепочку:
+    Gemini → GPT OSS 120B.
+    """
+    if not text:
+        return None
+
+    if not YANDEX_API_KEY or not YANDEX_FOLDER_ID:
+        print("  Yandex недоступен: YANDEX_API_KEY/YANDEX_FOLDER_ID не заданы")
+        if errors is not None:
+            errors.append("Yandex: YANDEX_API_KEY/YANDEX_FOLDER_ID не заданы")
+        return None
+
+    models_to_try = [
+        (YANDEX_FINE_TUNED_TRANSLATION_MODEL, "Fine-tuned YandexGPT Lite"),
+        (YANDEX_SHORT_TEXT_MODEL, "YandexGPT 5 Lite"),
+        (YANDEX_QWEN_MODEL, "Qwen3 235B"),
+    ]
+
+    seen: set[str] = set()
+    for model_to_use, model_label in models_to_try:
+        if not model_to_use or model_to_use in seen:
+            continue
+        seen.add(model_to_use)
+        result = _translate_yandex_single_model(text, model_to_use, model_label, errors)
+        if result:
+            return result
+        print(f"  {model_label} не справилась — пробуем следующий fallback перевода...")
+
+    return None
+
+
+def translate_yandex_gpt_oss(text: str, errors: list | None = None) -> str | None:
+    """Последний Yandex fallback перевода: GPT OSS 120B."""
+    if not text:
+        return None
+
+    if not YANDEX_API_KEY or not YANDEX_FOLDER_ID:
+        print("  GPT OSS 120B недоступна: YANDEX_API_KEY/YANDEX_FOLDER_ID не заданы")
+        if errors is not None:
+            errors.append("GPT OSS 120B: YANDEX_API_KEY/YANDEX_FOLDER_ID не заданы")
+        return None
+
+    return _translate_yandex_single_model(
+        text, YANDEX_GPT_OSS_TRANSLATE_MODEL, "GPT OSS 120B", errors
+    )
+
+
+def _detect_source_language(text: str) -> str | None:
+    """Определяет язык исходного текста через Yandex Translate (эндпоинт detect).
+
+    Нужна ТОЛЬКО как подготовительный шаг перед вызовом перевода с
+    glossaryConfig — см. комментарий у YANDEX_DETECT_API_URL и у
+    translate_yandex_translate_api(). Возвращает код языка (например "en",
+    "es", "tr") или None, если определить не удалось (сеть недоступна,
+    пустой ответ и т.п.) — в этом случае вызывающий код просто не будет
+    применять глоссарий для этого текста, а не упадёт с ошибкой.
+    """
+    if not text:
+        return None
+    try:
+        r = requests.post(
+            YANDEX_DETECT_API_URL,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Api-Key {YANDEX_API_KEY}",
+            },
+            json={"text": text, "folderId": YANDEX_FOLDER_ID},
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+        lang = str(data.get("languageCode") or "").strip()
+        return lang or None
+    except Exception as e:
+        print(f"  Yandex Translate: не удалось определить язык текста ({e}) — глоссарий для этого текста применён не будет")
+        return None
+
+
+def translate_yandex_translate_api(text: str, errors: list | None = None) -> str | None:
+    """Перевод через специализированный сервис Yandex Translate (NMT), а НЕ через LLM.
+
+    Первый шаг цепочки translate_with_fallback(). Отдельный REST-эндпоинт
+    (YANDEX_TRANSLATE_API_URL) — не путать с YANDEX_API_URL (Foundation Models).
+    Тарифицируется по количеству символов, без reasoning-токенов и накладных
+    расходов LLM (в отличие от translate_yandex/Qwen3).
+
+    Передаёт CANONICAL_NAMES (glossary.py) через glossaryConfig — это ЗАЩИТА
+    ОТ дословного перевода имён, которые совпадают со словарными словами
+    исходного языка (пример: турецкое "Güler" переводится как "смеётся" без
+    этой подсказки). Не путать с GLOSSARY: тот список работает уже ПОСЛЕ
+    перевода через edit_gemini()/edit_style_gemini() и лечит другой класс
+    ошибок (RU→RU-опечатки/склонения) — этими стадиями по-прежнему занимается
+    edit_translation_text(), см. её вызов после translate_with_fallback().
+    glossaryConfig не отвечает за склонение — вставляет статичную форму,
+    поэтому падежи по-прежнему поправляет edit_style_gemini().
+
+    Возвращает None при любой ошибке — вызывающий код (translate_with_fallback)
+    в этом случае откатывается на прежнюю цепочку: Yandex LLM → Gemini → DeepL →
+    OpenRouter.
+
+    Требует отдельную роль ai.translate.user на сервисном аккаунте (в дополнение
+    к ai.languageModels.user, который уже нужен для translate_yandex) — см.
+    инструкцию по настройке. Использует те же YANDEX_API_KEY/YANDEX_FOLDER_ID.
+    """
+    if not text:
+        return None
+    if not YANDEX_TRANSLATE_API_ENABLED:
+        return None
+    if not YANDEX_API_KEY or not YANDEX_FOLDER_ID:
+        print("  Yandex Translate API недоступен: YANDEX_API_KEY/YANDEX_FOLDER_ID не заданы")
+        if errors is not None:
+            errors.append("YandexTranslateAPI: YANDEX_API_KEY/YANDEX_FOLDER_ID не заданы")
+        return None
+
+    try:
+        body = {
+            "targetLanguageCode": "ru",
+            "format": "PLAIN_TEXT",
+            "texts": [text],
+            "folderId": YANDEX_FOLDER_ID,
+        }
+        # Защищённые имена (CANONICAL_NAMES в glossary.py) — не даём Yandex
+        # Translate переводить фамилии дословно как словарные слова исходного
+        # языка (пример: "Güler" → "смеётся" по-турецки без этой подсказки).
+        glossary_pairs = yandex_translate_glossary_pairs()
+        if glossary_pairs:
+            # Yandex Translate требует явный sourceLanguageCode всякий раз,
+            # когда в запросе передан glossaryConfig (без auto-определения
+            # языка) — иначе HTTP 400 "You have to set source_language_code
+            # while using glossary". Поэтому сначала определяем язык отдельным
+            # вызовом (detect), и только если это удалось — подключаем
+            # глоссарий. Если определить язык не удалось, просто переводим
+            # без глоссария вместо того, чтобы упасть с ошибкой целиком.
+            source_lang = _detect_source_language(text)
+            if source_lang:
+                body["sourceLanguageCode"] = source_lang
+                body["glossaryConfig"] = {"glossaryData": {"glossaryPairs": glossary_pairs}}
+
+        r = requests.post(
+            YANDEX_TRANSLATE_API_URL,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Api-Key {YANDEX_API_KEY}",
+            },
+            json=body,
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+        translations = data.get("translations") or []
+        if not translations:
+            raise ValueError("Пустой ответ от Yandex Translate (translations пуст)")
+        result = str(translations[0].get("text") or "").strip()
+
+        # Тарификация по символам, не по токенам — логируем длину исходного
+        # текста как "input" (completion_tokens=0, у NMT нет отдельного output).
+        char_count = len(text)
+        print(f"  [usage] yandex-translate-api: символов={char_count}")
+        log_usage("translate_native", "yandex-translate-api", "yandex", char_count, 0)
+
+        if not result:
+            raise ValueError("Пустой ответ от Yandex Translate")
+        if not _looks_translated_to_russian(text, result):
+            raise ValueError("Yandex Translate вернул текст не на русском (похоже, перевод не выполнен)")
+        if _looks_like_ai_refusal(result):
+            # Для чистого NMT-сервиса практически невозможно, но проверяем для
+            # единообразия с остальными шагами цепочки — на случай, если
+            # исходный текст сам содержал похожую фразу.
+            log_translation_case(text, result, service="YandexTranslateAPI", status="refusal")
+            raise ValueError("Yandex Translate вернул отказ-boilerplate вместо перевода")
+        return result
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "?"
+        body_snippet = _http_error_body_snippet(e)
+        reason = f"HTTP {status}" + (f" | тело: {body_snippet}" if body_snippet else "")
+        print(f"  Yandex Translate API ошибка: {reason}")
+        if errors is not None:
+            errors.append(f"YandexTranslateAPI: {reason}")
+        return None
+    except Exception as e:
+        print(f"  Yandex Translate API ошибка: {e}")
+        if errors is not None:
+            errors.append(f"YandexTranslateAPI: {e}")
         return None
 
 
@@ -3416,7 +4329,8 @@ _translation_total_failure_alerted = False
 
 def _alert_translation_total_failure(errors: list) -> None:
     """Шлёт в ALERT_CHANNEL_ID один алерт за весь прогон, если ВСЯ цепочка
-    перевода (Yandex → Gemini → DeepL → OpenRouter) отказала.
+    перевода (fine-tuned YandexGPT Lite → YandexGPT 5 Lite → Qwen3 → Gemini
+    → GPT OSS 120B) отказала.
 
     Отправляется один раз за запуск (не на каждый пропущенный пост),
     чтобы не заспамить канал при пачке твитов/постов подряд.
@@ -3429,7 +4343,7 @@ def _alert_translation_total_failure(errors: list) -> None:
     details = "\n".join(f"• {line}" for line in errors[:8]) if errors else "(без деталей)"
     print(f"  [ALERT] Все сервисы перевода недоступны за этот прогон:\n{details}")
     alert(
-        "⚠️ Вся цепочка перевода (Yandex → Gemini → DeepL → OpenRouter) отказала за этот прогон. "
+        "⚠️ Вся цепочка перевода (fine-tuned YandexGPT Lite → YandexGPT 5 Lite → Qwen3 → Gemini → GPT OSS 120B) отказала за этот прогон. "
         "Посты не публикуются (будут повторены на следующем запуске). Причины:\n" + details
     )
 
@@ -3446,6 +4360,41 @@ _EMOJI_PATTERN = re.compile(
     "]+",
     flags=re.UNICODE,
 )
+
+
+# Флаг стран (🇪🇸, 🇫🇷 и т.п.) — это ДВА отдельных символа "региональных
+# индикаторов" (диапазон U+1F1E6-U+1F1FF, по сути специальные буквы),
+# которые Telegram/устройство склеивают в картинку флага, только если между
+# ними НЕТ вообще ничего — ни пробела, ни другого символа. AI-этапы пайплайна
+# (перевод/глоссарий/стиль/вёрстка) периодически вставляют пробел между
+# соседними эмодзи как "естественное" форматирование (та же природа, что и
+# известный баг "🍷🩶" → "🍷 🩶" в raw_style_response) — для обычных эмодзи
+# это просто портит плотность, а для флагов физически ломает картинку.
+#
+# Ищем первый индикатор + пробелы + (не поглощая) следующий индикатор —
+# lookahead не потребляет символ, поэтому цепочка из 3+ индикаторов подряд
+# (например "E S F R" — два разорванных флага) склеивается за один проход:
+# каждое совпадение убирает ровно один пробельный промежуток, а следующий
+# индикатор остаётся стартовой точкой для следующего совпадения. Порядок
+# индикаторов не меняется, поэтому они пересобираются в те же флаги, что
+# были задуманы изначально — независимо от того, где именно был лишний
+# пробел.
+_FLAG_SPACE_RE = re.compile(
+    r"([\U0001F1E6-\U0001F1FF])\s+(?=[\U0001F1E6-\U0001F1FF])"
+)
+
+
+def fix_broken_flag_emoji(text: str) -> str:
+    """Убирает пробел(ы), случайно вставленные AI-этапами между двумя
+    половинками флага-эмодзи, из-за чего вместо флага показываются две
+    отдельные буквы-плитки (см. комментарий у _FLAG_SPACE_RE). Вызывается
+    один раз, в самом конце пайплайна перед отправкой в Telegram — см.
+    send_to_telegram() — чтобы почистить результат независимо от того, на
+    каком именно этапе (перевод/глоссарий/стиль/вёрстка) вкрался пробел.
+    """
+    if not text:
+        return text
+    return _FLAG_SPACE_RE.sub(r"\1", text)
 
 
 def has_no_translatable_text(text: str) -> bool:
@@ -3469,8 +4418,211 @@ def has_no_translatable_text(text: str) -> bool:
     return not has_letters
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# СПИСОК ТОКЕНОВ, КОТОРЫЕ НИКОГДА НЕ ПЕРЕВОДИМ (дополняется вручную)
+# ─────────────────────────────────────────────────────────────────────────
+# Устоявшиеся сокращения/инициалы вида "LY10" (Lamine Yamal, номер 10) —
+# переводчик честно пытается их "перевести"/транслитерировать/просклонять,
+# хотя это готовый узнаваемый токен, который должен попасть в пост ровно
+# как в источнике. Чтобы добавить новый — просто впишите строку в список
+# ниже, регэксп для маски пересобирается из него автоматически.
+DO_NOT_TRANSLATE_TOKENS: list[str] = [
+    "LY10",
+    "LY19",
+]
+
+
+def _build_do_not_translate_re(tokens: list[str]) -> re.Pattern | None:
+    escaped = sorted(
+        (re.escape(t) for t in tokens if t and t.strip()),
+        key=len,
+        reverse=True,  # длинные токены проверяем раньше — на случай, если один токен префикс другого
+    )
+    if not escaped:
+        return None
+    return re.compile(r"\b(?:" + "|".join(escaped) + r")\b", flags=re.IGNORECASE)
+
+
+_DO_NOT_TRANSLATE_RE = _build_do_not_translate_re(DO_NOT_TRANSLATE_TOKENS)
+
+
+def _mask_do_not_translate_tokens(text: str) -> tuple[str, list[str]]:
+    """Прячет токены из DO_NOT_TRANSLATE_TOKENS за маркеры @@DNT0@@ перед
+    отправкой в ЛЮБОЙ переводчик. Регистр сохраняется ровно как в
+    оригинале (сравнение регистронезависимое, но возвращается найденная
+    подстрока как есть)."""
+    if not _DO_NOT_TRANSLATE_RE or not text:
+        return text, []
+    originals: list[str] = []
+
+    def _replace(match: re.Match) -> str:
+        originals.append(match.group(0))
+        return f"@@DNT{len(originals) - 1}@@"
+
+    masked = _DO_NOT_TRANSLATE_RE.sub(_replace, text)
+    return masked, originals
+
+
+def _unmask_do_not_translate_tokens(text: str, originals: list[str]) -> str:
+    """Возвращает токен из DO_NOT_TRANSLATE_TOKENS на место маркера @@DNT0@@
+    после перевода — БЕЗ каких-либо изменений."""
+    if not originals or not text:
+        return text
+    for i, original in enumerate(originals):
+        text = text.replace(f"@@DNT{i}@@", original)
+    return text
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# МАСКА ХЭНДЛОВ АККАУНТОВ ("-xaviespart", "-diarioas" и т.п.)
+# ─────────────────────────────────────────────────────────────────────────
+# clean_text() (см. выше) заменяет "@" на "-" — исходно чтобы убрать живые
+# упоминания вида "@xaviespart" из текста до перевода (не пинговать чужие
+# аккаунты). Побочный эффект: получившееся "-xaviespart" выглядит как
+# обычное слово, и AI-переводчик честно пытается его перевести/
+# транслитерировать как имя собственное ("-xaviespart" → «Ксавьеспар»),
+# хотя это техническое имя аккаунта, а не слово естественного языка —
+# переводить/склонять его не нужно, публиковать нужно как есть.
+#
+# Регекс ловит "-хэндл" только когда дефис стоит вплотную к хэндлу (без
+# пробела) и это не часть обычного слова/составного прилагательного/счёта:
+#   - НЕ предшествует непробельный символ ("36-year-old", "hat-trick",
+#     "2-1" не подходят — перед "-" там буква/цифра, а не пробел/начало
+#     строки);
+#   - сразу после "-" — буква (не цифра), поэтому "-1"/"-2" (счёт со знаком)
+#     не попадают под маску;
+#   - обычное тире-разделитель с пробелами по бокам ("Барселона - Реал")
+#     тоже не подходит — сразу после "-" пробел, а не буква.
+_ACCOUNT_HANDLE_RE = re.compile(r"(?<!\S)-(?=[A-Za-zА-Яа-яЁё])[A-Za-zА-Яа-яЁё0-9_.]{2,40}")
+
+
+def _mask_account_handles(text: str) -> tuple[str, list[str]]:
+    """Прячет "-хэндл_аккаунта" за маркеры @@AH0@@ перед отправкой в ЛЮБОЙ
+    переводчик — см. блок комментариев выше. Возвращает
+    (текст_с_масками, список_оригиналов) для восстановления через
+    _unmask_account_handles()."""
+    originals: list[str] = []
+
+    def _replace(match: re.Match) -> str:
+        originals.append(match.group(0))
+        return f"@@AH{len(originals) - 1}@@"
+
+    masked = _ACCOUNT_HANDLE_RE.sub(_replace, text)
+    return masked, originals
+
+
+def _unmask_account_handles(text: str, originals: list[str]) -> str:
+    """Возвращает "-хэндл_аккаунта" на место маркеров @@AH0@@ после перевода
+    — БЕЗ каких-либо изменений (хэндл не переводится и не склоняется, это
+    техническое имя аккаунта, а не слово)."""
+    if not originals or not text:
+        return text
+    for i, original in enumerate(originals):
+        text = text.replace(f"@@AH{i}@@", original)
+    return text
+
+
+# Ловит "живой" маркер @@AH0@@/@@DNT0@@, ЕСЛИ переводчик скопировал его
+# буквально или испортил лишь частично (например "N@AH0@@" — переводчик
+# подменил один из символов "@@" на постороннюю букву, но ядро AH0 уцелело).
+# Достаточно ядра "AH<цифры>"/"DNT<цифры>" (это и есть реальные префиксы масок
+# — см. _mask_account_handles/_mask_do_not_translate_tokens) рядом хотя бы с
+# одной "@" с любой стороны — обычный русский/английский спортивный текст
+# такого сочетания не образует, так что риск ложного срабатывания минимален.
+_MASK_LEFTOVER_RE = re.compile(
+    r"@{1,2}\s*(?:AH|DNT)\s*\d+\s*@{0,2}"
+    r"|(?:AH|DNT)\s*\d+\s*@{1,2}"
+)
+
+
+def _has_mask_leftovers(text: str) -> list[str]:
+    """Возвращает список найденных в тексте "живых" маркеров @@AH0@@/@@DNT0@@
+    (в т.ч. частично испорченных — см. _MASK_LEFTOVER_RE) или пустой список,
+    если текст чист."""
+    if not text:
+        return []
+    return _MASK_LEFTOVER_RE.findall(text)
+
+
+def assert_no_mask_leftovers(text: str, stage: str) -> str:
+    """Финальный барьер перед публикацией: translate_with_fallback() уже
+    проверяет каждый вариант перевода на _MASK_LEFTOVER_RE (см. выше), но
+    ТОЛЬКО сразу после самого перевода — до глоссария/стиля/вёрстки
+    (edit_gemini/edit_style_gemini/ai_check_telegram_layout). Если один из
+    этих последующих AI-этапов случайно исказит/скопирует маркер защиты
+    хэндла аккаунта/неизменяемого токена в свой ответ, старая проверка это
+    уже не поймает — и подписчики увидят "@@AH0@@" вместо реального текста
+    поста (это и была жалоба "техтекст не должен вылезать").
+
+    Вызывается непосредственно перед отправкой в Telegram (и логированием
+    трейса), на итоговом full_text/final_text. Если маркер всё-таки найден —
+    публиковать пост нельзя: логируем случай (status="mask_leftover") и
+    возвращаем текст БЕЗ ИЗМЕНЕНИЙ, а вызывающий код (send_to_telegram)
+    обязан проверить и прервать публикацию, а не отправлять текст с
+    техническим маркером наружу.
+    """
+    leftover = _has_mask_leftovers(text)
+    if leftover:
+        print(f"  [{stage}] публикация остановлена: в тексте остался маркер защиты {leftover}")
+        log_translation_case(text, text, service=stage, status="mask_leftover")
+    return text
+
+
+
+def _translate_yandex_step(model_to_use: str, model_label: str):
+    """Возвращает функцию-шаг для translate_with_fallback(), которая дёргает
+    один конкретный вызов Yandex Foundation Models конкретной моделью под
+    конкретной подписью для лога (см. model_label в _translate_yandex_single_model).
+
+    Обёртка нужна, чтобы можно было несколько раз подряд поставить в цепочку
+    одну и ту же модель (см. translate_with_fallback: дообученная модель
+    пробуется 3 раза подряд, а затем ещё раз в конце как последний резерв) —
+    и при этом в логе каждая попытка была подписана отдельно
+    ("Fine-tuned YandexGPT Lite 1" / "2" / "3" / "финальная попытка"), а не
+    одинаково.
+    """
+
+    def _step(text: str, errors: list | None = None) -> str | None:
+        if not YANDEX_API_KEY or not YANDEX_FOLDER_ID:
+            print(f"  {model_label} недоступна: YANDEX_API_KEY/YANDEX_FOLDER_ID не заданы")
+            if errors is not None:
+                errors.append(f"{model_label}: YANDEX_API_KEY/YANDEX_FOLDER_ID не заданы")
+            return None
+        return _translate_yandex_single_model(text, model_to_use, model_label, errors)
+
+    return _step
+
+
 def translate_with_fallback(text: str) -> str | None:
-    """Цепочка перевода: Yandex → Gemini → DeepL → OpenRouter.
+    """Цепочка перевода — строго последовательная, без коротких путей:
+
+    0) пул бесплатных Gemini-ключей (translate_gemini_free) с контролем лимитов
+       RPM/TPM/RPD по каждому ключу; когда лимит ключа почти выбран — следующий
+       ключ, когда исчерпаны все — идём дальше по цепочке ниже
+    1) дообученная YandexGPT Lite (YANDEX_FINE_TUNED_TRANSLATION_MODEL), попытка 1
+    2) та же модель, попытка 2 (если (1) упала с ошибкой)
+    3) та же модель, попытка 3 (если (2) упала с ошибкой)
+    4) Qwen3 235B (если (3) упала с ошибкой)
+    5) Gemini (если (4) упала с ошибкой)
+    6) дообученная модель ещё раз, финальный резерв (если (5) упала с ошибкой)
+
+    Три подряд попытки дообученной модели — она сейчас основной переводчик
+    (перевод+стиль+вёрстка одним проходом, без edit_gemini/edit_style_gemini/
+    ai_check_telegram_layout — см. GLOSSARY_AI_EDIT_ENABLED/STYLE_EDIT_ENABLED/
+    LAYOUT_AI_ENABLED), поэтому даём ей несколько шансов до перехода на
+    Qwen3/Gemini, которые не обучены на стиле канала. Финальный шаг тем же
+    образцом — на случай, если сбой у Qwen3/Gemini был кратковременным, а
+    после них дообученная модель уже отдохнула.
+
+    Раньше здесь была цепочка через YandexGPT 5 Lite и GPT OSS 120B — эти
+    шаги не убраны из файла (см. translate_yandex()/translate_yandex_gpt_oss()),
+    просто больше не входят в активную цепочку. При необходимости их можно
+    вернуть в список steps ниже.
+
+    Дальнейшая редактура (глоссарий, стиль, вёрстка) отдельными AI-проходами
+    сейчас выключена — см. GLOSSARY_AI_EDIT_ENABLED/STYLE_EDIT_ENABLED/
+    LAYOUT_AI_ENABLED. Детерминированные (не-AI) шаги в edit_translation_text()
+    и ai_check_telegram_layout() продолжают работать как safety-net.
 
     Возвращает переведённый текст или None если все сервисы недоступны.
     None означает что пост НЕ нужно публиковать и НЕ нужно помечать как
@@ -3479,23 +4631,66 @@ def translate_with_fallback(text: str) -> str | None:
     if not text:
         return text
 
+    # Открываем трейс на этот пост: дальнейшие этапы (глоссарий, стиль,
+    # вёрстка — см. edit_gemini/edit_style_gemini/ai_check_telegram_layout)
+    # допишут в него, через какую модель они прошли, а итоговая строка лога
+    # будет отправлена одним вызовом уже после того, как весь пайплайн
+    # отработает — см. _trace_finalize_and_log() в send_to_telegram().
+    _trace_start(text)
+
+    masked_text, dnt_originals = _mask_do_not_translate_tokens(text)
+    masked_text, account_handle_originals = _mask_account_handles(masked_text)
+
     steps = [
-        ("Yandex",      translate_yandex),
-        ("Gemini",      translate_gemini),
-        ("DeepL",       translate_deepl),
-        ("OpenRouter",  translate_openrouter),
+        ("Gemini Free (пул ключей)", translate_gemini_free),
+        ("Fine-tuned YandexGPT Lite 1", _translate_yandex_step(
+            YANDEX_FINE_TUNED_TRANSLATION_MODEL, "Fine-tuned YandexGPT Lite 1")),
+        ("Fine-tuned YandexGPT Lite 2", _translate_yandex_step(
+            YANDEX_FINE_TUNED_TRANSLATION_MODEL, "Fine-tuned YandexGPT Lite 2")),
+        ("Fine-tuned YandexGPT Lite 3", _translate_yandex_step(
+            YANDEX_FINE_TUNED_TRANSLATION_MODEL, "Fine-tuned YandexGPT Lite 3")),
+        ("Qwen3 235B", _translate_yandex_step(
+            YANDEX_QWEN_MODEL, "Qwen3 235B")),
+        ("Gemini", translate_gemini),
+        ("Fine-tuned YandexGPT Lite (финальная попытка)", _translate_yandex_step(
+            YANDEX_FINE_TUNED_TRANSLATION_MODEL, "Fine-tuned YandexGPT Lite (финальная попытка)")),
     ]
 
     errors: list[str] = []
     for name, fn in steps:
-        result = fn(text, errors=errors)
+        _set_last_translation_service("")
+        result = fn(masked_text, errors=errors)
         if result:
-            if name != "Yandex":
-                print(f"  Перевод выполнен через {name}")
-            return result
+            # Хэндлы аккаунтов ("-xaviespart") и не-переводимые токены
+            # восстанавливаются ровно как в оригинале — их не переводят и не
+            # склоняют (см. _mask_account_handles/_unmask_account_handles,
+            # _mask_do_not_translate_tokens/_unmask_do_not_translate_tokens).
+            unmasked = _unmask_account_handles(result, account_handle_originals)
+            unmasked = _unmask_do_not_translate_tokens(unmasked, dnt_originals)
+            # Защита от случая, когда переводчик исказил маркер @@AH0@@/@@DNT0@@
+            # настолько, что _unmask_* не нашли его в тексте дословно (модель
+            # перевела/транслитерировала саму метку вместо того, чтобы
+            # скопировать её без изменений). Публиковать текст с "сырым"
+            # маркером нельзя — пробуем следующий сервис в цепочке.
+            if _MASK_LEFTOVER_RE.search(unmasked):
+                leftover = _MASK_LEFTOVER_RE.findall(unmasked)
+                print(f"  {name}: перевод отброшен — служебный маркер не восстановился ({leftover}), пробуем следующий сервис")
+                errors.append(f"{name}: служебный маркер искажён переводчиком ({leftover})")
+                continue
+            service_name = _last_translation_service or name
+            print(f"  Перевод выполнен через {service_name}")
+            # Лог отправится позже, одной строкой вместе с глоссарием/стилем/
+            # вёрсткой — см. _trace_finalize_and_log().
+            _trace_note("service", service_name)
+            _trace_note("translated_text", unmasked)
+            return unmasked
 
     print("  Все сервисы перевода недоступны — пост пропущен (будет повторён в следующем запуске)")
     _alert_translation_total_failure(errors)
+    # Дальнейших этапов не будет — трейс закрываем без отправки, "all_failed"
+    # логируем как отдельную (полную) строку сразу же.
+    _trace_clear()
+    log_translation_case(text, None, service="none", status="all_failed")
     return None
 
 
@@ -3526,6 +4721,40 @@ def _looks_translated_to_russian(original: str, translated: str) -> bool:
     return True
 
 
+_AI_REFUSAL_PATTERNS = [
+    r"не могу обсуждать эту тему",
+    r"давайте поговорим о чём-нибудь ещё",
+    r"не могу (?:помочь|ответить|предоставить|обработать|перевести)\s+(?:с этим|этот|это|данн\w*)",
+    r"как (?:ии|искусственный интеллект|языковая модель)[, ]",
+    r"я являюсь языковой моделью",
+    r"i (?:cannot|can'?t|am not able to) (?:discuss|help|assist|translate|provide)",
+    r"as an ai (?:language model|assistant)",
+    r"i'?m sorry,? (?:but )?i (?:cannot|can'?t)",
+    r"извините,? (?:но )?я не могу",
+    r"эта тема (?:выходит за рамки|не может быть обсуждена)",
+]
+_AI_REFUSAL_RE = re.compile("|".join(_AI_REFUSAL_PATTERNS), flags=re.IGNORECASE)
+
+
+def _looks_like_ai_refusal(translated: str) -> bool:
+    """
+    Ловит характерный AI-guardrail-boilerplate ("Я не могу обсуждать эту
+    тему. Давайте поговорим о чём-нибудь ещё." и похожие фразы на русском
+    и английском), который модель-переводчик иногда выдаёт вместо перевода,
+    если решает, что исходный текст затрагивает "чувствительную" тему.
+
+    Отдельная проверка нужна, потому что _looks_translated_to_russian() эту
+    ситуацию не ловит — отказ на русском языке формально ЯВЛЯЕТСЯ кириллицей,
+    просто это не перевод исходного текста, а служебная фраза модели.
+    Короткий текст (пара слов) с такой фразой не бракуем — совпадение по
+    смыслу маловероятно, а вот полноценное предложение-отказ почти наверняка
+    и есть тот самый guardrail-ответ.
+    """
+    if not translated:
+        return False
+    return bool(_AI_REFUSAL_RE.search(translated))
+
+
 def parse_gemini_editor_response(content: str) -> str:
     content = (content or "").strip()
     content = re.sub(r"^```(?:text)?\s*", "", content, flags=re.I)
@@ -3552,12 +4781,19 @@ def gemini_text_completion(
     model: str | None = None,
     fallback_models: list[str] | None = None,
     operation: str = "translate",
+    used_model_out: list | None = None,
 ) -> str:
     """Вызов Gemini с автоматическим fallback при ошибках перегрузки (503 / 429).
 
     По умолчанию используется единственный fallback GEMINI_EDIT_FALLBACK_MODEL
     (прежнее поведение). Передав fallback_models, можно задать свою цепочку
-    моделей (например, для перевода: 2.5 Flash → 2.5 Flash-Lite → 3.1 Flash-Lite)."""
+    моделей (например, для перевода: 2.5 Flash → 2.5 Flash-Lite → 3.1 Flash-Lite).
+
+    used_model_out — как и у yandex_qwen_completion: если передан список, при
+    успехе в него добавляется имя модели, которая реально ответила (primary
+    или один из fallback_models/GEMINI_EDIT_FALLBACK_MODEL) — нужно вызывающему
+    коду (translate_gemini), чтобы точно писать в лог перевода, какая именно
+    версия Gemini сработала, а не просто "Gemini"."""
     primary_model = (model or LAYOUT_AI_MODEL).strip()
     models_to_try = [primary_model]
     if fallback_models:
@@ -3596,6 +4832,8 @@ def gemini_text_completion(
             parts = data["candidates"][0]["content"].get("parts", [])
             if attempt_model != primary_model:
                 print(f"  Gemini fallback: использована модель {attempt_model}")
+            if used_model_out is not None:
+                used_model_out.append(attempt_model)
             return "\n".join(part.get("text", "") for part in parts).strip()
         except requests.HTTPError as e:
             status = e.response.status_code if e.response is not None else 0
@@ -3657,24 +4895,39 @@ def yandex_qwen_completion(
     json_object: bool = False,
     model: str | None = None,
     operation: str = "unknown",
+    used_model_out: list | None = None,
+    allow_fallback: bool = True,
 ) -> str:
     """Вызов Qwen3 235B FP8 через новый OpenAI-совместимый эндпоинт Yandex AI
     Studio (/v1/chat/completions).
 
     Используется для редактуры, проверки глоссария и RAG-верстки (раньше эти
     этапы шли через Gemini). При 429/503 автоматически пробует
-    YANDEX_EDIT_FALLBACK_MODEL, аналогично прежней логике gemini_text_completion.
+    YANDEX_EDIT_FALLBACK_MODEL (YandexGPT Pro), аналогично прежней логике
+    gemini_text_completion.
+
+    allow_fallback=False отключает переход на YANDEX_EDIT_FALLBACK_MODEL:
+    используется только Qwen3, а при его ошибке/429/503 исключение уходит
+    вызывающему коду как есть. Нужен для style_edit — правки YandexGPT Pro
+    там оказались ненадёжными (лишние/неверные склонения), а Qwen3 справляется
+    штатно; лучше пропустить редактуру, чем получить кривую правку.
 
     operation — метка для централизованного usage-лога (см. log_usage), например
     "glossary_edit", "style_edit", "duplicate_check", "rag_layout_check" — по
     ней потом можно посчитать расход в Google-таблице по видам операций.
+
+    used_model_out — необязательный список-"приёмник": если передан, при
+    успешном ответе в него добавляется имя модели, которая реально ответила
+    (primary или YANDEX_EDIT_FALLBACK_MODEL, если сработал фоллбэк на 429/503).
+    Нужен вызывающему коду, чтобы записать точную модель в лог перевода
+    (см. _trace_note() в edit_gemini/edit_style_gemini/qwen_layout_text).
     """
     if not YANDEX_API_KEY or not YANDEX_FOLDER_ID:
         raise RuntimeError("YANDEX_API_KEY/YANDEX_FOLDER_ID не заданы")
 
     primary_model = (model or YANDEX_QWEN_MODEL).strip()
     models_to_try = [primary_model]
-    if YANDEX_EDIT_FALLBACK_MODEL and YANDEX_EDIT_FALLBACK_MODEL != primary_model:
+    if allow_fallback and YANDEX_EDIT_FALLBACK_MODEL and YANDEX_EDIT_FALLBACK_MODEL != primary_model:
         models_to_try.append(YANDEX_EDIT_FALLBACK_MODEL)
 
     openai_messages = _to_openai_messages(messages)
@@ -3682,7 +4935,7 @@ def yandex_qwen_completion(
     last_exc: Exception | None = None
     for attempt_model in models_to_try:
         body = {
-            "model": f"gpt://{YANDEX_FOLDER_ID}/{attempt_model}",
+            "model": _yandex_model_uri(attempt_model),
             "stream": False,
             "temperature": temperature,
             "max_tokens": max_tokens,
@@ -3690,7 +4943,7 @@ def yandex_qwen_completion(
         }
         if json_object:
             body["response_format"] = {"type": "json_object"}
-        if _is_qwen_model(attempt_model) and YANDEX_QWEN_REASONING_EFFORT:
+        if _supports_reasoning_effort(attempt_model) and YANDEX_QWEN_REASONING_EFFORT:
             body["reasoning_effort"] = YANDEX_QWEN_REASONING_EFFORT
         try:
             r = requests.post(
@@ -3723,6 +4976,8 @@ def yandex_qwen_completion(
             result = content.strip()
             if attempt_model != primary_model:
                 print(f"  Qwen3 (Yandex) fallback: использована модель {attempt_model}")
+            if used_model_out is not None:
+                used_model_out.append(attempt_model)
             return result
         except requests.HTTPError as e:
             status = e.response.status_code if e.response is not None else 0
@@ -3808,6 +5063,227 @@ def apply_case_insensitive_literal(text: str, bad: str, good: str) -> str:
     return pattern.sub(good, text)
 
 
+# ────────────────────────────────────────────────────────────
+# Падежно-согласованная замена фамилий из GLOSSARY (safety-net после
+# перевода). apply_case_insensitive_literal() выше — ЖЁСТКАЯ замена: всегда
+# ставит "good" ровно в том виде, в каком он записан в glossary.py, то есть
+# в именительном падеже, даже если в предложении фамилия должна стоять в
+# другом падеже ("пас Ламин Ямаль на..." вместо "пас Ламина Ямаля на...").
+# apply_case_aware_glossary_replacements() ниже определяет падеж уже
+# ВСТРЕТИВШЕЙСЯ (неправильной) словоформы в тексте через pymorphy3 и ставит
+# "good" в тот же падеж.
+# ────────────────────────────────────────────────────────────
+
+_MORPH_ANALYZER = None
+_MORPH_ANALYZER_INIT_TRIED = False
+
+
+def _morph_analyzer():
+    """Ленивая инициализация pymorphy3.MorphAnalyzer().
+
+    Ленивая и с кэшированием результата (в т.ч. неудачи), потому что
+    построение анализатора не бесплатно, а модуль может быть не установлен
+    в окружении — в этом случае весь падежный safety-net просто тихо
+    откатывается на прежнее поведение (именительный падеж), не роняя бот.
+    """
+    global _MORPH_ANALYZER, _MORPH_ANALYZER_INIT_TRIED
+    if _MORPH_ANALYZER_INIT_TRIED:
+        return _MORPH_ANALYZER
+    _MORPH_ANALYZER_INIT_TRIED = True
+    try:
+        import pymorphy3
+        _MORPH_ANALYZER = pymorphy3.MorphAnalyzer()
+    except Exception as e:
+        print(
+            f"  pymorphy3 недоступен ({e}) — падежное согласование glossary-замен "
+            f"отключено, apply_literal_glossary_replacements будет ставить "
+            f"именительный падеж (как раньше). Установите пакет: "
+            f"pip install pymorphy3 pymorphy3-dicts-ru"
+        )
+        _MORPH_ANALYZER = None
+    return _MORPH_ANALYZER
+
+
+def _detect_russian_case(word: str) -> str | None:
+    """Определяет падеж (грамему pymorphy: nomn/gent/datv/accs/ablt/loct) для
+    русского слова. Для незнакомых слов (транслитерированные фамилии почти
+    всегда такие) pymorphy использует эвристику по окончанию — как раз то,
+    что нужно для "Йылдыза"/"Ямалю"/"Гюлером" и т.п. Возвращает None, если
+    анализатор недоступен или падеж не определился."""
+    morph = _morph_analyzer()
+    if not morph or not word:
+        return None
+    try:
+        for parsed in morph.parse(word):
+            if parsed.tag.case:
+                return parsed.tag.case
+    except Exception:
+        pass
+    return None
+
+
+
+# Окончания для склонения мужской фамилии по падежам (падеж — как в
+# pymorphy: gent/datv/accs/ablt/loct; nomn/None обрабатывается отдельно —
+# возвращается исходное слово без изменений).
+#
+# accs (винительный) для одушевлённых существительных мужского рода
+# совпадает с gent (родительным) — обычное правило русской грамматики
+# ("пас на Йылдыза", а не "на Йылдыз"), поэтому ниже он не выделен отдельно.
+_MASCULINE_SURNAME_ENDINGS = {
+    "consonant": {"gent": "а", "datv": "у", "ablt": "ом", "loct": "е"},
+    # После шипящих/ц под ударением по правилам должно быть "ом", без
+    # ударения — "ем"; транслитерированные фамилии почти всегда безударны
+    # на этом слоге, поэтому берём "ем" как более частый в спортивных
+    # текстах вариант (Спалетти → Спалетти, но, напр., "Родригесем"-типа).
+    "consonant_soft": {"gent": "а", "datv": "у", "ablt": "ем", "loct": "е"},
+    # Мягкий знак/й — 2-е склонение мужского рода ("Ямаль" → "Ямаля").
+    "soft_sign_or_y": {"gent": "я", "datv": "ю", "ablt": "ем", "loct": "е"},
+    # Безударное "а" после велярных/шипящих (к,г,х,ж,ш,ч,щ) — genitive на "и"
+    # ("Кака" → "Каки"), иначе на "ы" ("Мора" → "Моры").
+    "a_after_velar": {"gent": "и", "datv": "е", "ablt": "ой", "loct": "е"},
+    "a_plain": {"gent": "ы", "datv": "е", "ablt": "ой", "loct": "е"},
+    "ya": {"gent": "и", "datv": "е", "ablt": "ей", "loct": "е"},
+}
+_HISSING_OR_SIBILANT = set("жшчщц")
+_VELAR_CONSONANTS = set("кгх")
+# Фамилии на эти гласные в русском написании НЕ склоняются вообще
+# ("Это'о", "Мбаппе", "Это", "Кариу" и т.п.).
+_INDECLINABLE_ENDINGS = set("оеиуыэ")
+
+
+def _decline_masculine_surname_ru(nominative_word: str, case: str | None) -> str:
+    """Ставит мужскую фамилию (именительный падеж) в падеж `case` по
+    таблице окончаний выше — детерминированно, без словаря.
+
+    Почему не pymorphy3.inflect() для этого шага: на реальных примерах он
+    периодически путает род ("Ямаль" совпадает в словаре OpenCorpora с
+    женским именем и склоняется как "Ямали" вместо "Ямаля") — а фамилии в
+    этом глоссарии почти всегда мужские (футболисты/тренеры), так что
+    жёсткая мужская парадигма надёжнее словарной. pymorphy3 по-прежнему
+    используется отдельно для определения ФАКТИЧЕСКОГО падежа уже
+    встретившейся в тексте (неправильной) словоформы — там коллизия рода не
+    мешает (падеж определяется корректно даже если род угадан неверно).
+
+    Возвращает слово без изменений, если падеж не задан/уже именительный,
+    слово оканчивается на несклоняемую гласную, либо слишком короткое,
+    чтобы надёжно определить тип склонения — то есть не хуже прежнего
+    поведения (всегда именительный)."""
+    word = nominative_word or ""
+    if not case or case == "nomn" or not word or len(word) < 2:
+        return word
+
+    lower = word.lower()
+    last = lower[-1]
+    stem = word
+
+    if last in _INDECLINABLE_ENDINGS:
+        return word
+    if last in ("ь", "й"):
+        stem = word[:-1]
+        table = _MASCULINE_SURNAME_ENDINGS["soft_sign_or_y"]
+    elif last == "а":
+        stem = word[:-1]
+        prev = lower[-2] if len(lower) >= 2 else ""
+        table = _MASCULINE_SURNAME_ENDINGS[
+            "a_after_velar" if prev in _VELAR_CONSONANTS else "a_plain"
+        ]
+    elif last == "я":
+        stem = word[:-1]
+        table = _MASCULINE_SURNAME_ENDINGS["ya"]
+    else:
+        # Твёрдый согласный на конце.
+        table = _MASCULINE_SURNAME_ENDINGS[
+            "consonant_soft" if last in _HISSING_OR_SIBILANT else "consonant"
+        ]
+
+    # accs (винительный, одушевлённый мужской род) = gent, см. комментарий
+    # у _MASCULINE_SURNAME_ENDINGS.
+    lookup_case = "gent" if case == "accs" else case
+    ending = table.get(lookup_case)
+    if ending is None:
+        # Падеж вне таблицы (например voct/ins с нестандартной грамемой) —
+        # не рискуем угадывать, возвращаем именительный.
+        return word
+    return stem + ending
+
+
+def apply_case_aware_glossary_replacements(text: str) -> str:
+    """Заменяет фамилии из GLOSSARY (bad → good) с сохранением падежа, в
+    котором фамилия фактически стоит в уже переведённом (но неверном) тексте
+    — используется вместо жёсткой именительной подстановки внутри
+    apply_literal_glossary_replacements().
+
+    Как это работает для каждой записи GLOSSARY (bad, good):
+    1. glossary_bad_regex(bad) ищет "bad" в тексте, уже допуская типичные
+       падежные окончания у последнего слова (та же функция используется в
+       matching_glossary_entries() для AI-этапа глоссария) — так матчится не
+       только именительный, но и, например, "Миретти" в "Миретти перенесёт".
+    2. Для последнего слова фактического совпадения через pymorphy3
+       определяется падеж встретившейся словоформы (_detect_russian_case) —
+       это работает надёжно даже для незнакомых транслитерированных фамилий
+       (pymorphy использует суффиксальную эвристику для OOV-слов).
+    3. Последнее слово "good" ставится в тот же падеж через
+       _decline_masculine_surname_ru() — детерминированную таблицу окончаний
+       мужской фамилии (а не через pymorphy3.inflect(): на практике он путает
+       род словарных омонимов — например, "Ямаль" совпадает в словаре с
+       женским именем, и pymorphy склоняет его как "Ямали" вместо "Ямаля").
+       Остальные слова "good" (например, имя перед фамилией) подставляются
+       как есть.
+
+    Ограничение: если ошибочная словоформа в тексте выглядит несклоняемой
+    (например, переводчик уже поставил фамилию в форме на -и/-о/-е — типа
+    "Миретти" — в любом падеже), pymorphy не может восстановить исходный
+    синтаксический падеж по одной лишь форме слова без разбора всего
+    предложения — в этом случае используется именительный падеж "good", как
+    и раньше. Если падеж определить/применить не удалось вообще — тот же
+    фолбэк, то есть в худшем случае результат не хуже прежнего
+    apply_case_insensitive_literal().
+
+    Отдельно: некоторые записи GLOSSARY — это уже готовая падежная пара, а
+    не именительный падеж (флаг entry["already_inflected"] = True, см.
+    docstring GLOSSARY в glossary.py — например "Ламина Ямала" → "Ламина
+    Ямаля", обе формы родительный). Для них "good" подставляется как есть,
+    БЕЗ повторного склонения последнего слова — иначе получилось бы двойное
+    склонение уже готовой формы (например "Ямаля" → "Ямали").
+    """
+    fixed = text or ""
+    if not fixed:
+        return fixed
+    for entry in sorted(GLOSSARY, key=lambda e: len(e.get("bad", "")), reverse=True):
+        bad = str(entry.get("bad", "")).strip()
+        good = str(entry.get("good", "")).strip()
+        if not bad or not good or bad == good:
+            continue
+        pattern = glossary_bad_regex(bad)
+        if not pattern:
+            continue
+        good_words = good.split()
+        if not good_words:
+            continue
+        already_inflected = bool(entry.get("already_inflected"))
+
+        def _replace(
+            match: re.Match,
+            _good=good,
+            _good_words=good_words,
+            _already_inflected=already_inflected,
+        ) -> str:
+            if _already_inflected:
+                # "good" — уже готовая падежная форма (не именительный),
+                # склонять повторно нельзя — см. docstring выше.
+                return _good
+            matched = match.group(0)
+            matched_words = matched.split()
+            last_matched = matched_words[-1] if matched_words else matched
+            detected_case = _detect_russian_case(last_matched)
+            new_last = _decline_masculine_surname_ru(_good_words[-1], detected_case)
+            return " ".join(_good_words[:-1] + [new_last])
+
+        fixed = pattern.sub(_replace, fixed)
+    return fixed
+
+
 LOCAL_NAME_REPLACEMENTS = (
     ("Kendry Páez", "Кендри Паэс"),
     ("Kendry Paez", "Кендри Паэс"),
@@ -3829,14 +5305,14 @@ def normalize_known_player_names(text: str) -> str:
 
 
 def apply_literal_glossary_replacements(text: str) -> str:
-    fixed = text or ""
-    for entry in sorted(GLOSSARY, key=lambda e: len(e.get("bad", "")), reverse=True):
-        fixed = apply_case_insensitive_literal(
-            fixed,
-            str(entry.get("bad", "")),
-            str(entry.get("good", "")),
-        )
-    return fixed
+    if not GLOSSARY_LITERAL_REPLACEMENTS_ENABLED:
+        # См. комментарий у флага GLOSSARY_LITERAL_REPLACEMENTS_ENABLED.
+        return text
+    # Падежно-согласованная замена (см. apply_case_aware_glossary_replacements
+    # выше) — вместо прежней жёсткой именительной подстановки через
+    # apply_case_insensitive_literal(), которая ломала грамматику
+    # ("пас Ламин Ямаль на..." вместо "пас Ламина Ямаля на...").
+    return apply_case_aware_glossary_replacements(text or "")
 
 
 def capitalize_first_word(value: str) -> str:
@@ -3980,8 +5456,51 @@ def proper_name_phrases(text: str) -> set[str]:
     return phrases
 
 
+def name_phrase_is_declension(phrase: str, original_phrases: set[str]) -> bool:
+    """Проверяет, является ли phrase просто падежным вариантом одной из
+    original_phrases, а не новым/незнакомым именем.
+
+    Тот же баг, что чинили в glossary_name_mentions() (см. её docstring):
+    сравнение по целой строке ломается на склонении ("Арда Гюлер" →
+    "Ардой Гюлером" воспринимается как новое имя, которого не было в
+    оригинале). Здесь то же решение — сравниваем по словам, слово к слову,
+    с учётом падежных вариантов через cyrillic_token_variants(). Порядок
+    слов и их количество должны совпадать (иначе это не то же имя, а,
+    например, перестановка "Гюлер Арда" или отдельное упоминание фамилии),
+    так что ложное совпадение с другим именем по-прежнему отклоняется.
+    """
+    phrase_words = phrase.split()
+    for orig in original_phrases:
+        orig_words = orig.split()
+        if len(orig_words) != len(phrase_words):
+            continue
+        if all(
+            pw == ow or pw in cyrillic_token_variants(ow)
+            for pw, ow in zip(phrase_words, orig_words)
+        ):
+            return True
+    return False
+
+
 def glossary_name_mentions(text: str) -> set[str]:
-    normalized = normalize_news_for_similarity(text)
+    """Возвращает набор имён из GLOSSARY, упомянутых в тексте.
+
+    ВАЖНО: сравнение падеже-нечувствительное. Раньше здесь была проверка
+    "good_norm in normalized" — точное вхождение подстроки в именительном
+    падеже. Из-за неё style_edit_preserved() отклонял ЛЮБОЕ верное склонение
+    двусловного имени (например "Дин Хаусен" → "Дина Хаусена"), потому что
+    после склонения точная подстрока "дин хаусен" пропадала из текста, хотя
+    имя никуда не делось — просто изменился падеж. edit_style_gemini() при
+    этом сам же в промпте требует склонять имена — то есть один и тот же
+    пайплайн одной рукой просил склонение, а другой рукой его отклонял.
+
+    Исправление: считаем имя упомянутым, если КАЖДОЕ его слово встречается
+    в тексте хотя бы в одном падежном варианте (через cyrillic_token_variants,
+    как уже делает glossary_allowed_good_tokens() для похожей задачи). Это
+    по-прежнему ловит подмену на другое имя (тогда пересечения токенов не
+    будет), но перестаёт ложно ловить обычное склонение.
+    """
+    text_tokens = news_tokens(text)
     mentions = set()
     for entry in GLOSSARY:
         good = str(entry.get("good", ""))
@@ -3992,9 +5511,15 @@ def glossary_name_mentions(text: str) -> set[str]:
         )
         if not looks_like_name:
             continue
-        good_norm = normalize_news_for_similarity(good)
-        if good_norm and good_norm in normalized:
-            mentions.add(good_norm)
+        good_words = news_tokens(good)
+        if not good_words:
+            continue
+        all_words_present = all(
+            text_tokens & cyrillic_token_variants(word)
+            for word in good_words
+        )
+        if all_words_present:
+            mentions.add(normalize_news_for_similarity(good))
     return mentions
 
 
@@ -4069,10 +5594,16 @@ def edit_gemini(text: str) -> str:
 
     text = apply_literal_glossary_replacements(normalize_known_player_names(text))
     entries = matching_glossary_entries(text)
-    if not entries or not YANDEX_API_KEY or not YANDEX_FOLDER_ID:
+    if not entries or not GLOSSARY_AI_EDIT_ENABLED or not YANDEX_API_KEY or not YANDEX_FOLDER_ID:
+        # Модель не вызывалась (выключена GLOSSARY_AI_EDIT_ENABLED'ом, либо
+        # нет подходящих словарных пар, либо нет ключа), но детерминированные
+        # литеральные замены выше уже могли что-то поправить — фиксируем
+        # итог как glossary_text.
+        _trace_note("glossary_text", text)
         return text
 
     glossary_block = glossary_entries_for_prompt(entries)
+    used_model: list[str] = []
     prompt = (
         "Ты НЕ редактор и НЕ переводчик. Ты только проверяешь глоссарий.\n"
         "Нельзя возвращать готовый пост, переписывать текст, добавлять факты, вопросы, "
@@ -4089,17 +5620,26 @@ def edit_gemini(text: str) -> str:
         f"{text}"
     )
     try:
-        content = yandex_qwen_completion(
-            messages=[{"role": "user", "text": prompt}],
-            max_tokens=700,
-            timeout=STYLE_EDIT_TIMEOUT,
-            temperature=0,
-            json_object=True,
-            model=GLOSSARY_EDIT_MODEL,
-            operation="glossary_edit",
+        content = gemini_free_text(
+            prompt, 700, STYLE_EDIT_TIMEOUT, "glossary_edit",
+            json_mode=True, used_model_out=used_model,
         )
+        if content is None:
+            content = yandex_qwen_completion(
+                messages=[{"role": "user", "text": prompt}],
+                max_tokens=700,
+                timeout=STYLE_EDIT_TIMEOUT,
+                temperature=0,
+                json_object=True,
+                model=GLOSSARY_EDIT_MODEL,
+                operation="glossary_edit",
+                used_model_out=used_model,
+            )
+        model_label = used_model[0] if used_model else (GLOSSARY_EDIT_MODEL or "Qwen3")
         ops = parse_replacement_ops(content)
         if not ops:
+            _trace_note("glossary_model", f"{model_label} (правок не потребовалось)")
+            _trace_note("glossary_text", text)
             return text
 
         candidate = text
@@ -4115,6 +5655,8 @@ def edit_gemini(text: str) -> str:
                 applied.append((old, new))
 
         if applied:
+            _trace_note("glossary_model", f"{model_label} (правки применены)")
+            _trace_note("glossary_text", candidate)
             return candidate
 
         print("  Qwen3 глоссарий отклонён: нет безопасных точечных замен")
@@ -4124,9 +5666,13 @@ def edit_gemini(text: str) -> str:
             original=text,
             candidate=replacement_ops_preview(ops),
         )
+        _trace_note("glossary_model", f"{model_label} (правки отклонены валидатором)")
+        _trace_note("glossary_text", text)
         return text
     except Exception as e:
         print(f"  Qwen3 глоссарий ошибка: {e}")
+        _trace_note("glossary_model", "ошибка вызова модели")
+        _trace_note("glossary_text", text)
         return text
 
 
@@ -4158,7 +5704,11 @@ def style_edit_preserved(original: str, candidate: str) -> bool:
 
     original_names = proper_name_phrases(original_plain)
     candidate_names = proper_name_phrases(candidate_plain)
-    if candidate_names - original_names:
+    truly_new_names = {
+        name for name in candidate_names - original_names
+        if not name_phrase_is_declension(name, original_names)
+    }
+    if truly_new_names:
         return False
 
     original_glossary_names = glossary_name_mentions(original_plain)
@@ -4185,8 +5735,11 @@ def edit_style_gemini(text: str) -> str:
     """Литературная редактура русского текста без новых смыслов.
 
     Как и глоссарий, принимает только список локальных replacements. Модель не
-    получает права вернуть новый пост целиком. Выполняется через Qwen3 235B
-    (Yandex), раньше — через Gemini.
+    получает права вернуть новый пост целиком. Выполняется строго через Qwen3
+    235B (Yandex Cloud), раньше — через Gemini. Фоллбэк на YandexGPT Pro
+    (YANDEX_EDIT_FALLBACK_MODEL) для этого этапа отключён (allow_fallback=False)
+    — он делал некорректные/лишние правки склонений; при сбое Qwen3 правка
+    просто пропускается (см. except ниже), а не подменяется YandexGPT.
     """
     if (
         not text
@@ -4196,8 +5749,12 @@ def edit_style_gemini(text: str) -> str:
         or not STYLE_EDIT_MODEL
         or len(text) > STYLE_EDIT_MAX_CHARS
     ):
+        # Этап пропущен целиком (выключен, нет ключа или текст слишком длинный) —
+        # style_text равен входному тексту, чтобы цепочка не рвалась в логе.
+        _trace_note("style_text", text)
         return text
 
+    used_model: list[str] = []
     prompt = (
         "Ты аккуратный русскоязычный редактор футбольного Telegram-канала.\n"
         "Нужно отредактировать текст, чтобы он звучал естественно по-русски, но НЕЛЬЗЯ менять смысл.\n\n"
@@ -4231,17 +5788,32 @@ def edit_style_gemini(text: str) -> str:
         f"{text}"
     )
     try:
-        content = yandex_qwen_completion(
-            messages=[{"role": "user", "text": prompt}],
-            max_tokens=900,
-            timeout=STYLE_EDIT_TIMEOUT,
-            temperature=0,
-            json_object=True,
-            model=STYLE_EDIT_MODEL,
-            operation="style_edit",
+        content = gemini_free_text(
+            prompt, 900, STYLE_EDIT_TIMEOUT, "style_edit",
+            json_mode=True, used_model_out=used_model,
         )
+        if content is None:
+            content = yandex_qwen_completion(
+                messages=[{"role": "user", "text": prompt}],
+                max_tokens=900,
+                timeout=STYLE_EDIT_TIMEOUT,
+                temperature=0,
+                json_object=True,
+                model=STYLE_EDIT_MODEL,
+                operation="style_edit",
+                used_model_out=used_model,
+                allow_fallback=False,
+            )
+        model_label = used_model[0] if used_model else (STYLE_EDIT_MODEL or "Qwen3")
+        # Сырой ответ модели — до parse_replacement_ops/валидации. Логируем
+        # сразу, независимо от того, что случится с ops дальше (пусто,
+        # применены, отклонены) — для датасета дообучения нужен именно этот
+        # необработанный JSON как "response".
+        _trace_note("raw_style_response", content)
         ops = parse_replacement_ops(content)
         if not ops:
+            _trace_note("style_model", f"{model_label} (правок не потребовалось)")
+            _trace_note("style_text", text)
             return text
 
         candidate = text
@@ -4270,6 +5842,8 @@ def edit_style_gemini(text: str) -> str:
 
         if applied and candidate != text:
             print("  Qwen3 редактура текста поправлена")
+            _trace_note("style_model", f"{model_label} (правки применены)")
+            _trace_note("style_text", candidate)
             return candidate
 
         if ops:
@@ -4280,9 +5854,13 @@ def edit_style_gemini(text: str) -> str:
                 original=text,
                 candidate=replacement_ops_preview(ops),
             )
+            _trace_note("style_model", f"{model_label} (правки отклонены валидатором)")
+        _trace_note("style_text", text)
         return text
     except Exception as e:
         print(f"  Qwen3 редактура текста ошибка: {e}")
+        _trace_note("style_model", "ошибка вызова модели")
+        _trace_note("style_text", text)
         return text
 
 
@@ -4406,7 +5984,28 @@ def normalize_sentence_capitalization(text: str) -> str:
         return match.group(1) + match.group(2).upper()
 
     text = CAPS_WORD_RE.sub(normalize_caps_word, text)
-    text = re.sub(r"(^|[\n\r]+|(?<=[.!?…])\s+)([a-zа-яё])", capitalize_start, text)
+
+    # Заглавляем начало нового предложения после ".", "!", "?", "…" внутри строки.
+    text = re.sub(r"((?<=[.!?…])\s+)([a-zа-яё])", capitalize_start, text)
+
+    # Начало строки заглавляем только если это начало текста или предыдущая
+    # непустая строка была РЕАЛЬНО завершена (см. _line_ends_sentence: . ! ? …,
+    # необязательно с закрывающей кавычкой/скобкой после). Двоеточие или
+    # закрывающая ёлочка сами по себе концом предложения не считаются —
+    # иначе перенос строки посреди фразы (например, AI-верстка воткнула \n
+    # внутри «...в Лиге чемпионов.» или «Место встречи: Лига чемпионов.»)
+    # даст ложную заглавную букву на новой строке.
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
+    prev_nonempty = ""
+    for i, line in enumerate(lines):
+        if not line.strip():
+            continue
+        if not prev_nonempty or _line_ends_sentence(prev_nonempty):
+            lines[i] = re.sub(r"^(\s*)([a-zа-яё])", capitalize_start, line)
+        prev_nonempty = lines[i].strip()
+    text = "\n".join(lines)
+
     text = re.sub(r"([«“\"(]\s*)([a-zа-яё])", capitalize_start, text)
     return text
 
@@ -4461,7 +6060,133 @@ def content_preserved(original: str, candidate: str) -> bool:
     return original_overlap >= 0.72 and candidate_overlap >= 0.86
 
 
+def guillemets_preserved(original: str, candidate: str) -> bool:
+    """AI-верстка иногда «съедает» кавычки-ёлочки при перефразировании
+    (например «Реал Мадрид» → Реал Мадрид). Кавычки — не декоративный
+    элемент, а часть смысла (цитата/название), поэтому их количество не
+    должно уменьшаться."""
+    for ch in "«»":
+        if (original or "").count(ch) > (candidate or "").count(ch):
+            return False
+    return True
+
+
+def _line_break_word_pairs(text: str) -> set[tuple[str, str]]:
+    """Пары соседних слов (без переноса строки между ними) — используется
+    как «разрешённый список» мест, где в тексте нет разрыва."""
+    pairs = set()
+    for line in text.splitlines():
+        words = text_words(line)
+        for a, b in zip(words, words[1:]):
+            pairs.add((a.casefold(), b.casefold()))
+    return pairs
+
+
+def _line_ends_sentence(line: str) -> bool:
+    """Строка реально завершена, если последний значимый символ — . ! ? …
+    (закрывающие кавычки/скобки после точки не мешают). Двоеточие, тире
+    и закрывающая ёлочка САМИ ПО СЕБЕ концом предложения не считаются —
+    именно на этой ошибке ловились «Шахтёра»/в Лиге» и «встречи:/Лига»."""
+    stripped = (line or "").rstrip().rstrip("»\"'”)]")
+    return bool(stripped) and stripped[-1] in ".!?…"
+
+
+def no_new_midsentence_linebreaks(original: str, candidate: str) -> bool:
+    """Отклоняет кандидата, если AI-верстка вставила перенос строки внутри
+    предложения, которое в оригинале шло одной строкой (см. кейс
+    «...в Лиге чемпионов.» -> «...\\nВ Лиге чемпионов.» — после переноса
+    normalize_sentence_capitalization ещё и заглавит «в» -> «В»; или
+    «Место встречи: Лига чемпионов.» -> «Место встречи:\\nЛига чемпионов.»).
+    Перенос считается подозрительным, если строка перед ним не завершена
+    (см. _line_ends_sentence) И пара слов «последнее слово / первое слово
+    следующей строки» в оригинале шла подряд без переноса — то есть AI
+    разорвала то, что раньше было единым куском текста."""
+    original_plain = plain_layout_text(original)
+    candidate_plain = plain_layout_text(candidate)
+    allowed_pairs = _line_break_word_pairs(original_plain)
+
+    lines = candidate_plain.splitlines()
+    for i in range(len(lines) - 1):
+        line = lines[i]
+        if not line.strip() or _line_ends_sentence(line):
+            continue
+        # Убираем висящую пунктуацию (»"'):]), чтобы найти реально
+        # последнее слово строки, а не упереться в закрывающий символ.
+        stripped = line.rstrip().rstrip("»\"'”):]")
+        last_word_match = re.search(r"[A-Za-zА-Яа-яЁёÀ-ÿ'-]+$", stripped)
+        if not last_word_match:
+            continue
+        last_word = last_word_match.group(0).casefold()
+
+        next_line = lines[i + 1].lstrip() if i + 1 < len(lines) else ""
+        if not next_line or next_line.startswith(("#", "@")):
+            continue
+        first_word_match = re.match(r"[A-Za-zА-Яа-яЁёÀ-ÿ'-]+", next_line)
+        if not first_word_match:
+            continue
+        first_word = first_word_match.group(0).casefold()
+
+        if (last_word, first_word) in allowed_pairs:
+            # В оригинале эти два слова шли подряд без переноса —
+            # значит AI-верстка сама вставила разрыв посреди фразы.
+            return False
+    return True
+
+
+def list_heading_blank_line_preserved(original: str, candidate: str) -> bool:
+    """
+    Если в оригинале перед списком (•, ✅, 1) и т.п.) стоит заголовок,
+    заканчивающийся на ":", и между заголовком и списком есть пустая строка-
+    разделитель абзаца — эта пустая строка должна остаться и в кандидате.
+
+    Зачем это нужно: RAG/AI-редактор вёрстки иногда «схлопывает» такой
+    абзацный отступ, склеивая заголовок статистики со списком показателей в
+    один сплошной блок без визуального разделения. Пример инцидента:
+    "📊 Статистика Арды в Ла Лиге за «Реал» на данный момент:" + список
+    показателей — после правки пустая строка между заголовком и первым
+    пунктом списка пропадала, хотя ни один из явных guillemets/blockquote/
+    speaker-heading чек-пунктов выше это не ловил (заголовок не был обёрнут
+    в <b>, а looks_like_speaker_heading для статистики не срабатывает).
+
+    В отличие от блока про спикерские заголовки выше (ограничен <b>...</b>:
+    и looks_like_speaker_heading), здесь достаточно, что строка оканчивается
+    на ":" и содержит хоть одну букву — заголовок раздела необязательно
+    выделен жирным.
+    """
+    orig_lines = (original or "").split("\n")
+    for i in range(len(orig_lines) - 2):
+        heading = orig_lines[i].strip()
+        blank = orig_lines[i + 1].strip()
+        nxt = orig_lines[i + 2].strip()
+        if not heading or blank or not nxt:
+            continue
+        plain_heading = plain_layout_text(heading)
+        if not plain_heading.endswith(":"):
+            continue
+        if not re.search(r"[A-Za-zА-Яа-яЁё]", plain_heading):
+            continue
+        if not LIST_LINE_START_RE.match(nxt):
+            continue
+
+        idx = (candidate or "").find(heading)
+        if idx == -1:
+            # Заголовок переформатирован (например, обёрнут в <b>) — это не
+            # то, что мы здесь защищаем, пропускаем без отклонения правки.
+            continue
+        after = candidate[idx + len(heading):]
+        if not re.match(r"\s*\n\s*\n", after):
+            return False
+    return True
+
+
 def protected_formatting_preserved(original: str, candidate: str) -> bool:
+    if not guillemets_preserved(original, candidate):
+        return False
+    if not no_new_midsentence_linebreaks(original, candidate):
+        return False
+    if not list_heading_blank_line_preserved(original, candidate):
+        return False
+
     original_blockquotes = len(re.findall(r"<blockquote\b", original or "", flags=re.I))
     candidate_blockquotes = len(re.findall(r"<blockquote\b", candidate or "", flags=re.I))
     if candidate_blockquotes < original_blockquotes:
@@ -4801,7 +6526,7 @@ def gemini_layout_text(prompt: str) -> str:
     return "\n".join(part.get("text", "") for part in parts).strip()
 
 
-def qwen_layout_text(prompt: str) -> str:
+def qwen_layout_text(prompt: str, used_model_out: list | None = None) -> str:
     """Основной вызов финальной проверки верстки — Qwen3 235B (Yandex)."""
     return yandex_qwen_completion(
         messages=[{"role": "user", "text": prompt}],
@@ -4811,7 +6536,15 @@ def qwen_layout_text(prompt: str) -> str:
         json_object=False,
         model=LAYOUT_AI_QWEN_MODEL,
         operation="layout_ai_final",
+        used_model_out=used_model_out,
     )
+
+
+# Какая модель реально отработала в последнем успешном вызове ai_layout_text()
+# — Qwen3 (с конкретным именем модели), Gemini или OpenRouter. Используется
+# только для лога перевода (см. _trace_append("layout_model", ...) в
+# ai_check_telegram_layout()), не влияет на логику проверки верстки.
+_last_ai_layout_model: str = ""
 
 
 def ai_layout_text(prompt: str) -> str:
@@ -4822,25 +6555,38 @@ def ai_layout_text(prompt: str) -> str:
     или упала с ошибкой. DeepL сюда не входит — он умеет только переводить,
     а не проверять/чинить вёрстку.
     """
+    global _last_ai_layout_model
     last_exc: Exception | None = None
+
+    free_result = gemini_free_text(prompt, 1400, LAYOUT_AI_TIMEOUT, "layout")
+    if free_result is not None:
+        _last_ai_layout_model = f"Gemini Free ({GEMINI_FREE_MODEL})"
+        return free_result
 
     if YANDEX_API_KEY and YANDEX_FOLDER_ID and LAYOUT_AI_QWEN_MODEL:
         try:
-            return qwen_layout_text(prompt)
+            used_model: list[str] = []
+            result = qwen_layout_text(prompt, used_model_out=used_model)
+            _last_ai_layout_model = used_model[0] if used_model else (LAYOUT_AI_QWEN_MODEL or "Qwen3")
+            return result
         except Exception as e:
             print(f"  Qwen3 (Yandex) проверка верстки недоступна: {e} — пробуем Gemini")
             last_exc = e
 
     if GEMINI_API_KEY and LAYOUT_AI_MODEL:
         try:
-            return gemini_layout_text(prompt)
+            result = gemini_layout_text(prompt)
+            _last_ai_layout_model = f"Gemini ({LAYOUT_AI_MODEL})"
+            return result
         except Exception as e:
             print(f"  Gemini проверка верстки недоступна: {e} — пробуем OpenRouter")
             last_exc = e
 
     if OPENROUTER_KEY:
         try:
-            return openrouter_text_completion(prompt, max_tokens=1400, timeout=LAYOUT_AI_TIMEOUT)
+            result = openrouter_text_completion(prompt, max_tokens=1400, timeout=LAYOUT_AI_TIMEOUT)
+            _last_ai_layout_model = "OpenRouter"
+            return result
         except Exception as e:
             print(f"  OpenRouter проверка верстки недоступна: {e}")
             last_exc = e
@@ -4861,12 +6607,17 @@ def ai_check_telegram_layout(full_text: str) -> str:
     rag_changed = rag_candidate != pre_rag_text
     if rag_changed:
         locally_repaired = normalize_posting_text(rag_candidate)
+        # Записываем в лог перевода, какая модель поправила вёрстку через RAG.
+        _trace_append("layout_model", f"RAG-верстка: {_last_rag_layout_model or FORMAT_RAG_MODEL} (правки применены)")
 
-    qwen_available = bool(YANDEX_API_KEY and YANDEX_FOLDER_ID and LAYOUT_AI_QWEN_MODEL)
-    gemini_available = bool(GEMINI_API_KEY and LAYOUT_AI_MODEL)
-    openrouter_available = bool(OPENROUTER_KEY)
+    qwen_available = LAYOUT_AI_ENABLED and bool(YANDEX_API_KEY and YANDEX_FOLDER_ID and LAYOUT_AI_QWEN_MODEL)
+    gemini_available = LAYOUT_AI_ENABLED and bool(GEMINI_API_KEY and LAYOUT_AI_MODEL)
+    openrouter_available = LAYOUT_AI_ENABLED and bool(OPENROUTER_KEY)
     if not qwen_available and not gemini_available and not openrouter_available:
-        print("  AI-проверка верстки пропущена: ни Qwen3, ни Gemini, ни OpenRouter не настроены")
+        if not LAYOUT_AI_ENABLED:
+            print("  AI-проверка верстки пропущена: LAYOUT_AI_ENABLED=0 (дообученная модель верстает сама)")
+        else:
+            print("  AI-проверка верстки пропущена: ни Qwen3, ни Gemini, ни OpenRouter не настроены")
         return safe_html_layout_fixes(locally_repaired)
     if len(locally_repaired) > LAYOUT_AI_MAX_CHARS:
         print("  AI-проверка верстки пропущена: текст слишком длинный")
@@ -4982,6 +6733,7 @@ def ai_check_telegram_layout(full_text: str) -> str:
             # locally_repaired — текст до AI-проверки (bad), candidate — после (good).
             # Тег определяем автоматически по структуре текста.
             _save_layout_candidate(bad=locally_repaired, good=candidate, source="qwen")
+            _trace_append("layout_model", f"AI-верстка: {_last_ai_layout_model or 'Qwen3'} (правки применены)")
         else:
             print("  AI-верстка проверена")
         return safe_html_layout_fixes(candidate)
@@ -4996,20 +6748,141 @@ def ai_check_telegram_layout(full_text: str) -> str:
         return safe_html_layout_fixes(locally_repaired)
 
 
+# Какая модель реально отработала в последнем успешном вызове
+# rag_check_telegram_layout() — только для лога перевода (см.
+# _trace_append("layout_model", ...) в ai_check_telegram_layout()).
+_last_rag_layout_model: str = ""
+
+
+def _layout_check_yandex_single_model(
+    prompt: str, model_to_use: str, model_label: str, errors: list | None
+) -> dict | None:
+    """Один вызов Yandex Foundation Models конкретной моделью на JSON-проверку
+    вёрстки (см. rag_check_telegram_layout()).
+
+    Аналог _translate_yandex_single_model(), но результат — не текст
+    перевода, а разобранный JSON {ok, issues, fixed_text} (через
+    parse_checker_json). allow_fallback=False: наша цепочка steps ниже уже
+    сама решает, какую модель пробовать следующей, поэтому внутренний
+    HTTP-фоллбэк yandex_qwen_completion() на 429/503 здесь не нужен — он бы
+    незаметно подменил модель в рамках одного шага цепочки.
+    """
+    try:
+        content = yandex_qwen_completion(
+            messages=[{"role": "user", "text": prompt}],
+            max_tokens=1400,
+            timeout=LAYOUT_AI_TIMEOUT,
+            temperature=0,
+            json_object=True,
+            model=model_to_use,
+            operation="rag_layout_check",
+            allow_fallback=False,
+        )
+        result = parse_checker_json(content)
+        if not result:
+            raise ValueError(f"{model_label} вернул невалидный JSON")
+        return result
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "?"
+        body_snippet = _http_error_body_snippet(e)
+        reason = f"HTTP {status}" + (f" | тело: {body_snippet}" if body_snippet else "")
+        print(
+            f"  {model_label} (Yandex) верстка HTTP {status}: {e}"
+            + (f" | тело: {body_snippet}" if body_snippet else "")
+        )
+        if errors is not None:
+            errors.append(f"Yandex ({model_label}): {reason}")
+        return None
+    except Exception as e:
+        print(f"  {model_label} (Yandex) верстка ошибка: {e}")
+        if errors is not None:
+            errors.append(f"Yandex ({model_label}): {e}")
+        return None
+
+
+def _layout_check_yandex_step(model_to_use: str, model_label: str):
+    """Возвращает функцию-шаг для rag_check_telegram_layout() — аналог
+    _translate_yandex_step(), но для JSON-проверки вёрстки, а не перевода.
+    Позволяет несколько раз подряд поставить в цепочку одну и ту же модель
+    под разными подписями в логе (см. steps в rag_check_telegram_layout()).
+    """
+
+    def _step(prompt: str, errors: list | None = None) -> dict | None:
+        if not YANDEX_API_KEY or not YANDEX_FOLDER_ID:
+            print(f"  {model_label} недоступна: YANDEX_API_KEY/YANDEX_FOLDER_ID не заданы")
+            if errors is not None:
+                errors.append(f"{model_label}: YANDEX_API_KEY/YANDEX_FOLDER_ID не заданы")
+            return None
+        return _layout_check_yandex_single_model(prompt, model_to_use, model_label, errors)
+
+    return _step
+
+
+def _layout_check_gemini_free_step(prompt: str, errors: list | None = None) -> dict | None:
+    """Первый шаг цепочки RAG-проверки вёрстки — бесплатный пул Gemini."""
+    text = gemini_free_text(prompt, 1400, LAYOUT_AI_TIMEOUT, "rag_layout", json_mode=True)
+    if text is None:
+        if errors is not None:
+            errors.append("Gemini Free: недоступен или лимиты исчерпаны")
+        return None
+    result = parse_checker_json(text)
+    if not result:
+        print("  Gemini Free: невалидный JSON проверки вёрстки — пробуем следующий сервис...")
+        if errors is not None:
+            errors.append("Gemini Free: невалидный JSON")
+        return None
+    return result
+
+
+def _layout_check_gemini_step(prompt: str, errors: list | None = None) -> dict | None:
+    """Шаг цепочки — Gemini (единственный не-Yandex провайдер в этой цепочке),
+    напрямую через rag_layout.call_gemini_layout_checker(), без промежуточного
+    Yandex-эндпоинта.
+    """
+    if not GEMINI_API_KEY:
+        print("  Gemini недоступна: GEMINI_API_KEY не задан")
+        if errors is not None:
+            errors.append("Gemini: GEMINI_API_KEY не задан")
+        return None
+    result = call_gemini_layout_checker(prompt)
+    if not result:
+        print("  Gemini: пустой/невалидный ответ — пробуем следующий сервис...")
+        if errors is not None:
+            errors.append("Gemini: пустой/невалидный ответ")
+        return None
+    return result
+
+
+# rag_check_telegram_layout() — только для лога перевода (см.
+# _trace_append("layout_model", ...) в ai_check_telegram_layout()).
+
+
 def rag_check_telegram_layout(text: str) -> tuple[str, str | None]:
     """Возвращает (текст, причина_отклонения).
 
     причина_отклонения = None, если правка прошла (или менять было нечего) —
     иначе один из reason_key ниже (например "protected_formatting_lost"),
     чтобы вызывающий код мог решить, стоит ли пробовать вторую AI-проверку.
+
+    Цепочка фоллбэка — по аналогии с translate_with_fallback():
+    1) дообученная YandexGPT Lite (YANDEX_FINE_TUNED_TRANSLATION_MODEL), попытка 1
+    2) та же модель, попытка 2 (если (1) упала с ошибкой/невалидным JSON)
+    3) та же модель, попытка 3 (если (2) упала)
+    4) Qwen3 235B (если (3) упала)
+    5) Gemini (если (4) упала)
+    6) дообученная модель ещё раз, финальный резерв (если (5) упала)
+
+    Раньше здесь был единственный вызов через FORMAT_RAG_MODEL (по умолчанию
+    дешёвая "yandexgpt-lite/latest", НЕ дообученная модель и НЕ Qwen3) — это
+    занижало качество проверки вёрстки по сравнению с переводом, который уже
+    использует дообученную модель как основную. Теперь дообученная модель
+    пробуется первой и несколько раз подряд, как и в переводе.
     """
+    global _last_rag_layout_model
     if not FORMAT_RAG_ENABLED:
         return text, None
     if FORMAT_RAG_ONLY_WHEN_NEEDED and not _layout_needs_ai_review(text):
         print("  RAG-проверка верстки пропущена: локальная верстка уже чистая")
-        return text, None
-    if not YANDEX_API_KEY or not YANDEX_FOLDER_ID:
-        print("  RAG-проверка верстки пропущена: YANDEX_API_KEY/YANDEX_FOLDER_ID не заданы")
         return text, None
 
     examples = load_examples()
@@ -5020,30 +6893,32 @@ def rag_check_telegram_layout(text: str) -> tuple[str, str | None]:
     selected = select_similar_examples(text, examples)
     prompt = build_layout_prompt(text, selected)
 
-    # Вызов через Qwen3 235B (Yandex Foundation Models) с принудительным JSON-ответом.
-    # При 429/503 yandex_qwen_completion сам пробует YANDEX_EDIT_FALLBACK_MODEL.
-    try:
-        content = yandex_qwen_completion(
-            messages=[{"role": "user", "text": prompt}],
-            max_tokens=1400,
-            timeout=LAYOUT_AI_TIMEOUT,
-            temperature=0,
-            json_object=True,
-            model=FORMAT_RAG_MODEL,
-            operation="rag_layout_check",
-        )
-        result = parse_checker_json(content)
-    except requests.HTTPError as e:
-        status = e.response.status_code if e.response is not None else "?"
-        body_snippet = _http_error_body_snippet(e)
-        print(
-            f"  RAG-проверка верстки недоступна: HTTP {status} от Qwen3 (Yandex)"
-            + (f" | тело: {body_snippet}" if body_snippet else "")
-        )
-        return text, None
-    except Exception as e:
-        print(f"  RAG-проверка верстки недоступна: {e}")
-        return text, None
+    steps = [
+        ("Gemini Free (пул ключей)", _layout_check_gemini_free_step),
+        ("Fine-tuned YandexGPT Lite 1", _layout_check_yandex_step(
+            YANDEX_FINE_TUNED_TRANSLATION_MODEL, "Fine-tuned YandexGPT Lite 1")),
+        ("Fine-tuned YandexGPT Lite 2", _layout_check_yandex_step(
+            YANDEX_FINE_TUNED_TRANSLATION_MODEL, "Fine-tuned YandexGPT Lite 2")),
+        ("Fine-tuned YandexGPT Lite 3", _layout_check_yandex_step(
+            YANDEX_FINE_TUNED_TRANSLATION_MODEL, "Fine-tuned YandexGPT Lite 3")),
+        ("Qwen3 235B", _layout_check_yandex_step(
+            YANDEX_QWEN_MODEL, "Qwen3 235B")),
+        ("Gemini", _layout_check_gemini_step),
+        ("Fine-tuned YandexGPT Lite (финальная попытка)", _layout_check_yandex_step(
+            YANDEX_FINE_TUNED_TRANSLATION_MODEL, "Fine-tuned YandexGPT Lite (финальная попытка)")),
+    ]
+
+    errors: list[str] = []
+    result: dict | None = None
+    used_label = ""
+    for name, fn in steps:
+        result = fn(prompt, errors=errors)
+        if result:
+            used_label = name
+            break
+        print(f"  {name}: верстка не удалась — пробуем следующий сервис...")
+
+    _last_rag_layout_model = used_label
 
     if not result:
         print("  RAG-проверка верстки недоступна: неверный ответ модели")
@@ -5500,346 +7375,6 @@ def _vk_upload_doc(path: Path) -> str | None:
         return None
 
 
-def _vk_web_cookie_same_site(value) -> str:
-    raw = str(value or "").strip().lower().replace("-", "_")
-    if raw in {"strict"}:
-        return "Strict"
-    if raw in {"none", "no_restriction", "no_restrictions"}:
-        return "None"
-    return "Lax"
-
-
-def _vk_web_cookie_expires(cookie: dict):
-    for key in ("expires", "expirationDate", "expiration_date"):
-        value = cookie.get(key)
-        if value in (None, ""):
-            continue
-        try:
-            return float(value)
-        except Exception:
-            continue
-    return -1
-
-
-_VK_WEB_ALLOWED_COOKIE_DOMAINS = ("vk.com", "vk.ru")
-
-
-def _vk_web_cookies_to_storage_state(data):
-    if isinstance(data, dict) and isinstance(data.get("cookies"), list):
-        if isinstance(data.get("origins"), list):
-            return data
-        raw_cookies = data["cookies"]
-    elif isinstance(data, list):
-        raw_cookies = data
-    else:
-        print(
-            "  VK web: VK_WEB_COOKIES_JSON/_B64 распознан как JSON, но это не список "
-            "cookie-объектов и не Playwright storage_state (dict с 'cookies'+'origins')."
-        )
-        return None
-
-    total = len(raw_cookies)
-    skipped_no_name_or_domain = 0
-    skipped_domain = 0
-    cookies = []
-    for raw in raw_cookies:
-        if not isinstance(raw, dict):
-            continue
-        name = str(raw.get("name") or "").strip()
-        value = str(raw.get("value") or "")
-        domain = str(raw.get("domain") or raw.get("host") or "").strip()
-        if not name or not domain:
-            skipped_no_name_or_domain += 1
-            continue
-        if not any(allowed in domain.lower() for allowed in _VK_WEB_ALLOWED_COOKIE_DOMAINS):
-            skipped_domain += 1
-            continue
-        cookie = {
-            "name": name,
-            "value": value,
-            "domain": domain,
-            "path": str(raw.get("path") or "/"),
-            "expires": _vk_web_cookie_expires(raw),
-            "httpOnly": bool(raw.get("httpOnly") or raw.get("http_only")),
-            "secure": bool(raw.get("secure", True)),
-            "sameSite": _vk_web_cookie_same_site(raw.get("sameSite") or raw.get("same_site")),
-        }
-        cookies.append(cookie)
-
-    if not cookies:
-        print(
-            f"  VK web: из {total} cookie-записей не удалось собрать ни одной валидной "
-            f"(без имени/домена: {skipped_no_name_or_domain}, домен не vk.com/vk.ru: {skipped_domain})"
-        )
-        return None
-    return {"cookies": cookies, "origins": []}
-
-
-def _vk_web_load_json_env(name: str, value: str):
-    if not value:
-        return None
-    try:
-        return json.loads(value)
-    except Exception as e:
-        print(f"  VK web: не удалось прочитать {name}: {e}")
-        return None
-
-
-def _vk_web_load_b64_json_env(name: str, value: str):
-    if not value:
-        return None
-    try:
-        raw = base64.b64decode(value).decode("utf-8")
-        return json.loads(raw)
-    except Exception as e:
-        print(f"  VK web: не удалось прочитать {name}: {e}")
-        return None
-
-
-def _vk_web_storage_state():
-    """Return Playwright storage_state from env/file/cookies, without using VK API."""
-    if VK_WEB_STORAGE_STATE_B64:
-        state = _vk_web_load_b64_json_env("VK_WEB_STORAGE_STATE_B64", VK_WEB_STORAGE_STATE_B64)
-        if state:
-            return state
-
-    if VK_WEB_STORAGE_STATE_JSON:
-        state = _vk_web_load_json_env("VK_WEB_STORAGE_STATE_JSON", VK_WEB_STORAGE_STATE_JSON)
-        if state:
-            return state
-
-    if VK_WEB_COOKIES_B64:
-        cookies = _vk_web_load_b64_json_env("VK_WEB_COOKIES_B64", VK_WEB_COOKIES_B64)
-        state = _vk_web_cookies_to_storage_state(cookies)
-        if state:
-            return state
-        return None
-
-    if VK_WEB_COOKIES_JSON:
-        cookies = _vk_web_load_json_env("VK_WEB_COOKIES_JSON", VK_WEB_COOKIES_JSON)
-        state = _vk_web_cookies_to_storage_state(cookies)
-        if state:
-            return state
-        return None
-
-    if VK_WEB_STORAGE_STATE_FILE and Path(VK_WEB_STORAGE_STATE_FILE).exists():
-        return VK_WEB_STORAGE_STATE_FILE
-
-    return None
-
-
-def _vk_web_first_visible(page, selectors: list[str], timeout_ms: int = 1500):
-    for selector in selectors:
-        try:
-            locator = page.locator(selector).first
-            locator.wait_for(state="visible", timeout=timeout_ms)
-            return locator
-        except Exception:
-            continue
-    return None
-
-
-def _vk_web_open_composer(page) -> bool:
-    composer_triggers = [
-        'text="Что у вас нового?"',
-        'text="Напишите что-нибудь"',
-        'text="Создать запись"',
-        'text="Предложить новость"',
-        '[aria-label*="запись" i]',
-        '[aria-label*="новость" i]',
-        '[role="button"]:has-text("Запись")',
-        '[role="button"]:has-text("Новость")',
-    ]
-    trigger = _vk_web_first_visible(page, composer_triggers, timeout_ms=2500)
-    if trigger:
-        try:
-            trigger.click(timeout=5000)
-            page.wait_for_timeout(1000)
-        except Exception:
-            pass
-    return True
-
-
-def _vk_web_fill_text(page, text: str) -> bool:
-    editors = [
-        '[contenteditable="true"][role="textbox"]',
-        '[role="textbox"][contenteditable="true"]',
-        'div[contenteditable="true"]',
-        'textarea',
-    ]
-    editor = _vk_web_first_visible(page, editors, timeout_ms=5000)
-    if not editor:
-        print("  VK web: поле текста поста не найдено")
-        return False
-
-    try:
-        editor.click(timeout=5000)
-        page.keyboard.press("Control+A")
-        page.keyboard.insert_text(text)
-        return True
-    except Exception as e:
-        print(f"  VK web: не удалось вставить текст: {e}")
-        return False
-
-
-def _vk_web_attach_files(page, files: list[str]) -> bool:
-    if not files:
-        return True
-
-    attach_buttons = [
-        '[aria-label*="фото" i]',
-        '[aria-label*="видео" i]',
-        '[aria-label*="прикреп" i]',
-        '[role="button"]:has-text("Фото")',
-        '[role="button"]:has-text("Видео")',
-        '[role="button"]:has-text("Прикрепить")',
-        'text="Фото"',
-        'text="Видео"',
-    ]
-
-    try:
-        inputs = page.locator('input[type="file"]')
-        if inputs.count() == 0:
-            button = _vk_web_first_visible(page, attach_buttons, timeout_ms=2000)
-            if button:
-                button.click(timeout=5000)
-                page.wait_for_timeout(1000)
-            inputs = page.locator('input[type="file"]')
-
-        if inputs.count() == 0:
-            print("  VK web: input для загрузки файлов не найден")
-            return False
-
-        inputs.last.set_input_files(files, timeout=30000)
-        page.wait_for_timeout(max(1, VK_WEB_SETTLE_SECONDS) * 1000)
-        return True
-    except Exception as e:
-        print(f"  VK web: не удалось прикрепить медиа: {e}")
-        return False
-
-
-def _vk_web_click_publish(page) -> bool:
-    publish_buttons = [
-        'button:has-text("Опубликовать")',
-        '[role="button"]:has-text("Опубликовать")',
-        'button:has-text("Отправить")',
-        '[role="button"]:has-text("Отправить")',
-        'button:has-text("Предложить")',
-        '[role="button"]:has-text("Предложить")',
-        'button:has-text("Сохранить")',
-        '[role="button"]:has-text("Сохранить")',
-    ]
-    button = _vk_web_first_visible(page, publish_buttons, timeout_ms=5000)
-    if not button:
-        print("  VK web: кнопка публикации не найдена")
-        return False
-
-    try:
-        button.click(timeout=10000)
-        page.wait_for_timeout(max(1, VK_WEB_SETTLE_SECONDS) * 1000)
-        return True
-    except Exception as e:
-        print(f"  VK web: не удалось нажать кнопку публикации: {e}")
-        return False
-
-
-def post_to_vk_web(full_text: str, downloaded: list | None = None) -> bool:
-    """Publish to VK through the normal website with Playwright, not VK API."""
-    if not VK_WEB_TARGET_URL:
-        print("  VK web пропущен: не задан VK_WEB_TARGET_URL")
-        return False
-
-    storage_state = _vk_web_storage_state()
-    if not storage_state:
-        print(
-            "  VK web пропущен: нет авторизованной сессии. "
-            "Задайте VK_WEB_STORAGE_STATE_B64, VK_WEB_STORAGE_STATE_JSON "
-            "VK_WEB_COOKIES_B64, VK_WEB_COOKIES_JSON "
-            "или файл VK_WEB_STORAGE_STATE_FILE."
-        )
-        return False
-
-    if isinstance(storage_state, dict):
-        _loaded_cookies = storage_state.get("cookies") or []
-        _cookie_names = {str(c.get("name") or "") for c in _loaded_cookies if isinstance(c, dict)}
-        _cookie_domains = sorted({str(c.get("domain") or "") for c in _loaded_cookies if isinstance(c, dict)})
-        _session_like = {n for n in _cookie_names if any(k in n.lower() for k in ("sid", "lhk", "nsid"))}
-        print(
-            f"  VK web: загружено {len(_loaded_cookies)} cookie, домены: {_cookie_domains}, "
-            f"похожие на сессионные: {sorted(_session_like) or 'НЕ НАЙДЕНЫ'}"
-        )
-        if not _session_like:
-            print(
-                "  VK web: внимание — среди куки нет ничего похожего на remixsid/remixlhk/remixnsid, "
-                "скорее всего сессия для VK анонимна, отсюда и редиректы"
-            )
-
-    text = plain_text_for_crosspost(full_text)
-    if not text:
-        return False
-
-    media_files = []
-    for item in downloaded or []:
-        path = item.get("path")
-        if path and Path(path).exists():
-            media_files.append(str(Path(path).resolve()))
-
-    try:
-        from playwright.sync_api import sync_playwright
-    except Exception as e:
-        print(f"  VK web: Playwright не установлен: {e}")
-        return False
-
-    timeout_ms = max(15, VK_WEB_TIMEOUT_SECONDS) * 1000
-
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=VK_WEB_HEADLESS,
-                slow_mo=VK_WEB_SLOW_MO_MS,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
-            context = browser.new_context(
-                storage_state=storage_state,
-                locale="ru-RU",
-                timezone_id="Europe/Samara",
-                viewport={"width": 1365, "height": 900},
-            )
-            page = context.new_page()
-            page.set_default_timeout(timeout_ms)
-            page.goto(VK_WEB_TARGET_URL, wait_until="domcontentloaded", timeout=timeout_ms)
-            page.wait_for_timeout(2000)
-
-            if "login" in page.url.lower() or "act=login" in page.url.lower():
-                print("  VK web: сессия не авторизована, VK открыл страницу входа")
-                browser.close()
-                return False
-
-            _vk_web_open_composer(page)
-            if not _vk_web_fill_text(page, text):
-                page.screenshot(path="vk_web_error.png", full_page=True)
-                browser.close()
-                return False
-
-            if media_files and not _vk_web_attach_files(page, media_files):
-                page.screenshot(path="vk_web_error.png", full_page=True)
-                browser.close()
-                return False
-
-            ok = _vk_web_click_publish(page)
-            if not ok:
-                page.screenshot(path="vk_web_error.png", full_page=True)
-                browser.close()
-                return False
-
-            print(f"  VK web опубликовано через браузер: {VK_WEB_TARGET_URL}")
-            browser.close()
-            return True
-    except Exception as e:
-        print(f"  VK web ошибка браузера: {e}")
-        return False
-
-
 def post_to_vk(full_text: str, downloaded: list | None = None) -> bool:
     """Публикует пост в VK.
 
@@ -6113,16 +7648,11 @@ def crosspost_after_telegram(full_text: str, downloaded: list | None = None):
     downloaded — список dict с ключами 'path' и 'type', уже скачанных медиафайлов.
     Передаётся в post_to_vk/post_to_odnoklassniki для прикрепления фото/видео к посту.
     """
-    vk_mode = "browser" if VK_CROSSPOST_MODE == "web" else VK_CROSSPOST_MODE
-    vk_api_enabled = vk_mode == "api" and bool(VK_ACCESS_TOKEN and VK_OWNER_ID)
-    vk_web_enabled = vk_mode == "browser" and bool(VK_WEB_TARGET_URL)
-    vk_enabled = vk_api_enabled or vk_web_enabled
+    vk_enabled = bool(VK_ACCESS_TOKEN and VK_OWNER_ID)
     max_enabled = bool(MAX_TOKEN and (MAX_CHAT_ID or MAX_USER_ID))
     ok_enabled = bool(OK_APP_KEY and OK_APP_SECRET and OK_ACCESS_TOKEN and OK_GROUP_ID)
 
     if not vk_enabled and not max_enabled and not ok_enabled:
-        if vk_mode not in {"api", "browser", "off", ""}:
-            print(f"  VK пропущен: неизвестный VK_CROSSPOST_MODE={VK_CROSSPOST_MODE!r}")
         return
 
     crosspost_text = plain_text_for_crosspost(full_text)
@@ -6139,10 +7669,7 @@ def crosspost_after_telegram(full_text: str, downloaded: list | None = None):
         if VK_CROSSPOST_DELAY_SECONDS:
             print(f"  Задержка перед ВК: {VK_CROSSPOST_DELAY_SECONDS} сек...")
             time.sleep(VK_CROSSPOST_DELAY_SECONDS)
-        if vk_web_enabled:
-            post_to_vk_web(crosspost_text, downloaded=downloaded)
-        else:
-            post_to_vk(crosspost_text, downloaded=downloaded)
+        post_to_vk(crosspost_text, downloaded=downloaded)
     if max_enabled:
         post_to_max(crosspost_text)
     if ok_enabled:
@@ -6266,6 +7793,42 @@ VIDEO_SIZE_LIMIT = 40 * 1024 * 1024  # 40 MB — жёсткий лимит Teleg
 # проходит по лимиту в 40 МБ.
 VIDEO_COMPRESS_TARGET_MB = int((os.environ.get("VIDEO_COMPRESS_TARGET_MB") or "12").strip())
 VIDEO_COMPRESS_THRESHOLD = VIDEO_COMPRESS_TARGET_MB * 1024 * 1024
+
+# Двухпроходный scale-фильтр для сжатия видео.
+#
+# Раньше был один проход: scale='trunc(min(1280,iw)/2)*2':'trunc(min(720,ih)/2)*2':
+# force_original_aspect_ratio=decrease — ширина/высота округлялись до чётных
+# ДО применения force_original_aspect_ratio=decrease. Но этот параметр сам
+# пересчитывает итоговые размеры под реальное соотношение сторон исходника
+# и может получить нечётное число уже ПОСЛЕ округления (например, если
+# aspect ratio не даёт ровного деления) — libx264 требует чётные width/height
+# и падает с ошибкой "... width or height." при таком нечётном результате.
+# Решение — второй scale-проход: сначала обычное вписывание в рамку с
+# сохранением пропорций, затем отдельный проход, который принудительно
+# округляет УЖЕ ПОЛУЧЕННЫЕ (гарантированно целые) размеры кадра до чётных —
+# trunc(iw/2)*2 здесь применяется к результату первого прохода, а не к
+# исходнику, поэтому гарантированно даёт чётное число.
+VIDEO_SCALE_FILTER = (
+    "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease,"
+    "scale='trunc(iw/2)*2':'trunc(ih/2)*2'"
+)
+
+
+def _log_ffmpeg_error(cmd: list, result) -> None:
+    """Подробно логирует неудачный запуск ffmpeg: команду и хвост stderr.
+    Раньше показывался только последний 300-байтовый обрубок stderr
+    (например, "код 187: , width or height." без сути ошибки) — этого не
+    хватало, чтобы понять причину сбоя не открывая раннер вручную.
+    """
+    stderr_text = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+    # ffmpeg обычно пишет самую полезную строку (что именно не понравилось
+    # фильтру/кодеку) в последних строках stderr — берём с запасом.
+    tail_lines = stderr_text.splitlines()[-15:]
+    tail = "\n".join(tail_lines)
+    printable_cmd = " ".join(str(c) for c in cmd)
+    print(f"  ffmpeg ошибка (код {result.returncode})")
+    print(f"    команда: {printable_cmd}")
+    print(f"    stderr:\n{tail}")
 
 
 def _faststart_remux(path: Path) -> Path:
@@ -6436,7 +7999,7 @@ def compress_video(path: Path) -> Path:
                 "-preset", "veryfast",
                 "-c:a", "aac", "-b:a", "96k",
                 "-movflags", "+faststart",
-                "-vf", "scale='trunc(min(1280,iw)/2)*2':'trunc(min(720,ih)/2)*2':force_original_aspect_ratio=decrease",
+                "-vf", VIDEO_SCALE_FILTER,
                 str(out_path),
             ]
         else:
@@ -6445,7 +8008,7 @@ def compress_video(path: Path) -> Path:
                 "-c:v", "libx264", "-crf", "28", "-preset", "veryfast",
                 "-c:a", "aac", "-b:a", "96k",
                 "-movflags", "+faststart",
-                "-vf", "scale='trunc(min(1280,iw)/2)*2':'trunc(min(720,ih)/2)*2':force_original_aspect_ratio=decrease",
+                "-vf", VIDEO_SCALE_FILTER,
                 str(out_path),
             ]
         result = subprocess.run(cmd, capture_output=True, timeout=300)
@@ -6464,8 +8027,7 @@ def compress_video(path: Path) -> Path:
                 out_path.unlink(missing_ok=True)
                 return _faststart_remux(path)
         else:
-            stderr_tail = (result.stderr or b"")[-300:].decode("utf-8", errors="replace")
-            print(f"  ffmpeg ошибка (код {result.returncode}): {stderr_tail}")
+            _log_ffmpeg_error(cmd, result)
             out_path.unlink(missing_ok=True)
             return path if size > VIDEO_SIZE_LIMIT else _faststart_remux(path)
     except Exception as e:
@@ -6807,6 +8369,9 @@ def send_to_telegram(
     """
     if not media_items:
         print("  Медиа нет — пост не отправляем")
+        # Пост не публикуется, но перевод/редактура уже отработали — фиксируем
+        # строку лога (без вёрстки, до которой дело не дошло).
+        _trace_finalize_and_log(full_text)
         return None
 
     downloaded = []
@@ -6819,6 +8384,7 @@ def send_to_telegram(
     if not downloaded:
         print("  Все медиа недоступны — пост не отправляем")
         shutil.rmtree(MEDIA_DIR, ignore_errors=True)
+        _trace_finalize_and_log(full_text)
         return None
 
     # Сжимаем видео больше 40 MB
@@ -6839,6 +8405,7 @@ def send_to_telegram(
     if not downloaded:
         print("  Все медиа недоступны после фильтрации — пост не отправляем")
         shutil.rmtree(MEDIA_DIR, ignore_errors=True)
+        _trace_finalize_and_log(full_text)
         return None
 
     # Метаданные (duration/width/height) + превью-кадр для видео — без них
@@ -6854,6 +8421,24 @@ def send_to_telegram(
     # написание имени (например, «Ламине» вместо «Ламин»), потому что ai_check_telegram_layout
     # вызывается ПОСЛЕ edit_openrouter и глоссарь там не применяется.
     final_text = apply_literal_glossary_replacements(normalize_known_player_names(final_text))
+    # Ещё одна детерминированная защита: чинит флаги-эмодзи, разорванные
+    # пробелом, который мог вставить любой из AI-этапов выше (см.
+    # fix_broken_flag_emoji). Идёт после normalize_known_player_names, а не
+    # до, потому что тот шаг сам может задеть пробелы вокруг вставленных имён.
+    final_text = fix_broken_flag_emoji(final_text)
+
+    # Финальный барьер: если служебный маркер (@@AH0@@/@@DNT0@@) каким-то
+    # образом дожил до этой точки (см. assert_no_mask_leftovers) — публиковать
+    # такой пост нельзя, подписчики увидят техтекст вместо хэндла/токена.
+    if _has_mask_leftovers(final_text):
+        assert_no_mask_leftovers(final_text, stage="send_to_telegram")
+        shutil.rmtree(MEDIA_DIR, ignore_errors=True)
+        _trace_clear()
+        return None
+
+    # Весь пайплайн (перевод → глоссарий → стиль → вёрстка) отработал —
+    # закрываем трейс и отправляем одну строку лога перевода со всеми этапами.
+    _trace_finalize_and_log(final_text)
 
     prefix = (content_prefix or "").strip()
     if prefix:
@@ -7221,6 +8806,9 @@ REPOST_TEXT_RE = re.compile(
     # текст вида "AccountName RT @OtherUser: ...", и с якорем ^ такие
     # репосты проскакивали мимо фильтра и уходили в перевод как есть.
     r"\b(?:RT|QT)\s+@\w{1,15}\s*:|"
+    # "RT by -Username:" / "RT by Username:" — формат, который отдаёт Scweet
+    # (имя аккаунта без "@", иногда с ведущим дефисом вместо него).
+    r"\bRT\s+by\s+[@-]?\w[\w-]{0,29}\s*:|"
     r"^\s*(?:ретвит|репост|цитата)\b|"
     r"^\s*(?:retweeted|reposted|quoted)\b|"
     r"\b(?:retweeted|reposted)\s+by\b|\bquoted?\s+tweet\b|\bquoting\s+@|"
@@ -7242,6 +8830,9 @@ REPOST_TEXT_RE = re.compile(
 REPOST_PREFIX_RE = re.compile(
     r"^\s*(?:ретвит|репост)\s+от\s+@\w{1,15}\s*:\s*|"
     r"^\s*(?:RT|QT)\s+(?:от\s+)?@\w{1,15}\s*:\s*|"
+    # "RT by/от -Username:" / "RT by/от Username:" — формат Scweet, где имя
+    # аккаунта идёт без "@" (иногда с ведущим дефисом вместо него).
+    r"^\s*RT\s+(?:by|от)\s+[@-]?\w[\w-]{0,29}\s*:\s*|"
     r"^\s*repost(?:ed)?\s+(?:from\s+)?@\w{1,15}\s*:\s*|"
     r"^\s*quot(?:e|ed)\s+tweet\s*(?:[-:–—]\s*)?(?:@\w{1,15}\s*:\s*)?|"
     r"^\s*quoting\s+@\w{1,15}\s*:\s*",
@@ -7314,6 +8905,488 @@ def scweet_repost_reference_reason(tw: dict, raw: str, post_id: str) -> str:
     return ""
 
 
+_SCWEET_LOGGING_CONFIGURED = False
+
+
+def _ensure_scweet_logging_configured() -> None:
+    """Включает подробное внутреннее логирование библиотеки Scweet.
+
+    Почему это нужно:
+      Внутри Scweet (в частности в api_engine.py) на каждый неудавшийся
+      HTTP-запрос к X — например, не удалось узнать ID пользователя по его
+      имени (@username), или сам запрос ленты профиля вернул не 200 —
+      вызывается logger.warning(...) с ТОЧНЫМ кодом ответа и причиной.
+      Но по умолчанию у логгера "Scweet" нет ни одного обработчика
+      (handler), поэтому все эти сообщения создаются и тут же
+      теряются — они никогда не попадают ни в консоль, ни в лог
+      GitHub Actions. Наш собственный print() в bot.py этого не видит,
+      потому что print() и logging — это два разных, не связанных друг
+      с другом канала вывода.
+
+      Без этой настройки, когда get_profile_tweets() (наш запасной путь
+      для Шага 3) молча возвращает 0 твитов, мы не можем понять,
+      случилось ли это из-за той же самой поломки на стороне X
+      (устаревший query_id), из-за проблем с самим аккаунтом, или из-за
+      чего-то ещё — сообщение об этом просто никуда не пишется.
+
+      force=True обязателен: сама библиотека Scweet при импорте вешает
+      на свой логгер "заглушку" (NullHandler) — это стандартная практика
+      Python-библиотек, чтобы не ругаться "нет обработчика логов". Но
+      из-за этого configure_logging() без force=True видит, что
+      обработчик "уже есть" (хотя это просто заглушка, которая тихо
+      выбрасывает все сообщения), и не подключает настоящий вывод в
+      консоль. Проверено вручную: без force=True сообщения не
+      появляются вообще, с force=True — появляются.
+
+    Вызывается один раз за весь прогон процесса (флаг
+    _SCWEET_LOGGING_CONFIGURED), чтобы не переустанавливать
+    обработчик логов при каждом вызове fetch_scweet_tweets().
+    profile="detailed" дополнительно включает построчные логи
+    HTTP-запросов (show_api_http=True) — то, что нам и нужно для
+    диагностики конкретно этой поломки.
+    """
+    global _SCWEET_LOGGING_CONFIGURED
+    if _SCWEET_LOGGING_CONFIGURED:
+        return
+    _SCWEET_LOGGING_CONFIGURED = True  # ставим сразу, чтобы не пытаться повторно при ошибке
+    try:
+        from Scweet.logging_config import configure_logging
+        configure_logging(level="INFO", profile="detailed", show_api_http=True, force=True)
+    except Exception as e:
+        print(f"  Не удалось включить подробное логирование Scweet (не критично): {e}")
+
+
+def patch_scweet_search_to_post() -> bool:
+    """Monkey-patch: перевести запрос SearchTimeline у Scweet 5.3 с GET на POST.
+
+    Почему это нужно (2026-09):
+      X начал отвечать 404 на GET-запросы к GraphQL-эндпоинту SearchTimeline.
+      Это не разовая поломка одного query_id, а смена метода на стороне X —
+      независимо подтверждено в двух других похожих библиотеках, которые
+      специально чинили ровно эту же поломку тем же способом (переход на
+      POST с тем же телом запроса вместо GET с query-параметрами):
+        - the-convocation/twitter-scraper, PR #191 (апрель 2026)
+        - twikit, issue #412 (на который прямо ссылается PR выше)
+      Scweet 5.3 (Scweet.api_engine.ApiEngine._graphql_get) отправляет ВСЕ
+      GraphQL-запросы через GET и альтернативы не предусматривает.
+
+    Почему патчим точечно, а не весь _graphql_get:
+      Судя по вашему логу, сломан конкретно SearchTimeline (его использует
+      s.search() — то есть Шаг 1 и основной путь Шага 3). Другие GraphQL-
+      эндпоинты Scweet (UserByScreenName, UserTweets — на нём построен
+      запасной путь get_profile_tweets() для Шага 3, Followers и т.д.) в
+      логе ошибок 404 не показывают, так что оставляем их на GET как есть:
+      меньше риск что-то дополнительно сломать точечным вмешательством.
+      Определяем "это SearchTimeline или нет" по URL эндпоинта — в Scweet
+      он всегда имеет вид .../graphql/{query_id}/SearchTimeline.
+
+    Тело POST-запроса:
+      Scweet у GET-варианта кодирует variables/features/fieldToggles как
+      JSON-строки в query-параметрах. Для POST раскодируем их обратно в
+      обычные Python-объекты и отправляем как JSON-тело (`session.post(url,
+      json=body, ...)`) — именно так это сделали обе библиотеки-аналоги.
+
+    Идемпотентно (safe для повторного вызова) и не бросает исключений наружу:
+      если что-то в самой Scweet изменится и патч не наложится штатно —
+      просто возвращает False, а Scweet продолжает работать как раньше
+      (то есть с той же поломкой, но без дополнительного падения бота).
+    """
+    try:
+        from Scweet import api_engine as _scweet_api_engine
+    except Exception as e:
+        print(f"  [Scweet POST-patch] не удалось импортировать api_engine: {e}")
+        return False
+
+    engine_cls = getattr(_scweet_api_engine, "ApiEngine", None)
+    if engine_cls is None or not hasattr(engine_cls, "_graphql_get"):
+        print("  [Scweet POST-patch] ApiEngine._graphql_get не найден — патч пропущен (изменилась версия Scweet?)")
+        return False
+
+    if getattr(engine_cls, "_search_post_patch_applied", False):
+        return True  # уже пропатчено в этом процессе
+
+    original_graphql_get = engine_cls._graphql_get
+
+    async def _graphql_get_patched(self, *, url, params, timeout_s, session=None, account_context=None):
+        # Не SearchTimeline — работаем как раньше (GET, без изменений).
+        if "/SearchTimeline" not in url:
+            return await original_graphql_get(
+                self, url=url, params=params, timeout_s=timeout_s,
+                session=session, account_context=account_context,
+            )
+
+        import inspect as _inspect
+
+        # GET кодирует variables/features/fieldToggles JSON-строками в
+        # query-параметрах — для POST раскодируем обратно в объекты.
+        body: dict = {}
+        for key in ("variables", "features", "fieldToggles"):
+            raw = params.get(key)
+            if raw is None:
+                continue
+            try:
+                body[key] = json.loads(raw) if isinstance(raw, str) else raw
+            except Exception:
+                body[key] = raw
+
+        active_session = session or self.session_factory()
+        owns_session = session is None
+        account_label = self._account_label(account_context)
+        try:
+            request_headers = {"Content-Type": "application/json"}
+            tx_id = await self._build_transaction_id(method="POST", url=url)
+            if tx_id:
+                request_headers["X-Client-Transaction-Id"] = tx_id
+
+            getter = getattr(active_session, "post")
+            post_kwargs = dict(
+                json=body, timeout=timeout_s, allow_redirects=True,
+                headers=request_headers,
+            )
+
+            if self.http_mode == _scweet_api_engine.HTTP_MODE_SYNC:
+                result = await self._call_in_thread(getter, url, **post_kwargs)
+            elif _inspect.iscoroutinefunction(getter):
+                result = getter(url, **post_kwargs)
+            else:
+                result = await self._call_in_thread(getter, url, **post_kwargs)
+            response = await result if _inspect.isawaitable(result) else result
+
+            status = int(getattr(response, "status_code", 0) or 0)
+            headers = dict(getattr(response, "headers", {}) or {})
+            text_snippet = str(getattr(response, "text", "") or "")[:200]
+
+            if status != 200:
+                print(
+                    f"  [Scweet POST-patch] SearchTimeline status={status} "
+                    f"account={account_label} snippet={text_snippet[:160]}"
+                )
+                return None, status, headers, text_snippet
+
+            try:
+                payload = response.json()
+                if _inspect.isawaitable(payload):
+                    payload = await payload
+            except Exception:
+                return None, _scweet_api_engine.JSON_DECODE_STATUS, headers, text_snippet
+
+            if isinstance(payload, dict) and payload.get("errors"):
+                mapped = self._map_graphql_errors_to_status(payload.get("errors"))
+                if mapped is not None:
+                    return None, mapped, headers, text_snippet
+
+            return payload, status, headers, text_snippet
+        except Exception as exc:
+            print(f"  [Scweet POST-patch] SearchTimeline POST error: {exc}")
+            return None, _scweet_api_engine.NETWORK_ERROR_STATUS, {}, str(exc)[:200]
+        finally:
+            if owns_session:
+                await self._close_session(active_session)
+
+    engine_cls._graphql_get = _graphql_get_patched
+    engine_cls._search_post_patch_applied = True
+    print("  [Scweet POST-patch] SearchTimeline переключён на POST (GET на этот эндпоинт X отвечает 404)")
+    return True
+
+
+def _build_twitter_fallback_query(keywords: list, account_filters: list) -> str:
+    """Общий конструктор поискового запроса для twscrape/twifork.
+
+    Обе библиотеки, в отличие от Scweet, не имеют отдельного структурного
+    параметра "from_users" — фильтр по аккаунтам нужно вписать прямо в
+    текст запроса как "(from:acc1 OR from:acc2)", в точности как это уже
+    делает fetch_scweet_tweets() в своей ветке TypeError-фолбэка.
+    """
+    keyword_query = build_scweet_keyword_query(keywords)
+    parts = [keyword_query] if keyword_query else []
+    if account_filters:
+        parts.append("(" + " OR ".join(f"from:{a}" for a in account_filters) + ")")
+    if keyword_query:
+        parts.append("filter:media")
+    parts.extend(["-filter:retweets", "-filter:replies"])
+    now = datetime.now(timezone.utc)
+    since = (now - timedelta(hours=48)).strftime("%Y-%m-%d")
+    until = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+    parts.append(f"since:{since}")
+    parts.append(f"until:{until}")
+    return " ".join(p for p in parts if p).strip()
+
+
+def fetch_twscrape_tweets(
+    keywords: list,
+    from_accounts: list | None = None,
+    limit: int = 50,
+) -> dict:
+    """Получает твиты через twscrape (тот же X GraphQL API, но с пулом
+    аккаунтов и более активной поддержкой под изменения X 2026 года).
+
+    Тот же контракт возврата, что и у fetch_scweet_tweets() — это делает
+    функцию взаимозаменяемым звеном в fetch_tweets_with_fallback().
+    Использует ТЕ ЖЕ секреты, что и Scweet (SCWEET_AUTH_TOKEN/SCWEET_CT0) —
+    отдельно заводить ничего под twscrape не нужно, обе библиотеки просто
+    принимают одну и ту же пару auth_token/ct0 как cookies.
+
+    Требует пакет twscrape (pip install twscrape). Если не установлен —
+    честно возвращает status="not_installed", ничего не падает.
+    """
+    def _result(tweets=None, raw_count=0, status="ok"):
+        return {"tweets": tweets or [], "raw_count": raw_count, "status": status}
+
+    if not SCWEET_AUTH_TOKEN or not SCWEET_CT0:
+        return _result(status="no_token")
+
+    try:
+        from twscrape import API, NoAccountError
+    except ImportError:
+        return _result(status="not_installed")
+
+    account_filters = [
+        account
+        for account in (normalize_twitter_account(a) for a in (from_accounts or []))
+        if account
+    ]
+    keyword_query = build_scweet_keyword_query(keywords)
+    if not keyword_query and not account_filters:
+        return _result()
+
+    search_query = _build_twitter_fallback_query(keywords, account_filters)
+    print(f"  twscrape query: {search_query[:160]}")
+
+    import asyncio
+    import os
+    import tempfile
+
+    # ВАЖНО: ":memory:" тут не работает — twscrape открывает новое
+    # sqlite-соединение на каждый запрос, а in-memory база живёт только
+    # в рамках одного соединения, так что второй запрос видит пустую БД
+    # ("no such table: accounts"). Поэтому используем реальный временный
+    # файл и удаляем его сами после прогона — GitHub Actions runner всё
+    # равно одноразовый, но так не остаётся мусора, если раннер вдруг
+    # переиспользуется (self-hosted).
+    fd, db_path = tempfile.mkstemp(suffix=".db", prefix="twscrape_")
+    os.close(fd)
+    os.remove(db_path)  # пусть twscrape создаст файл сам — так надёжнее миграций
+
+    async def _run():
+        # raise_when_no_account=True — при заблокированном/занятом
+        # единственном аккаунте в пуле твscrape по умолчанию тихо ЖДЁТ
+        # освобождения (могут быть те самые 15 минут locka из лога), и
+        # наш общий 90-секундный таймаут просто обрывает это ожидание
+        # впустую. С этим флагом пул сразу поднимает NoAccountError —
+        # и цепочка переходит к twifork/Scweet за секунды, а не за 90с.
+        api = API(db_path, raise_when_no_account=True)
+        cookies = f"auth_token={SCWEET_AUTH_TOKEN}; ct0={SCWEET_CT0}"
+        await api.pool.add_account_cookies("bot_account", cookies)
+        items = []
+        async for tw in api.search(search_query, limit=limit):
+            items.append(tw)
+        return items
+
+    try:
+        tweets_raw = asyncio.run(asyncio.wait_for(_run(), timeout=90))
+    except asyncio.TimeoutError:
+        print("  twscrape завис после 90с — прерываем")
+        return _result(status="timeout")
+    except NoAccountError as e:
+        print(f"  twscrape: аккаунт заблокирован/занят (лок), ждать не будем: {e}")
+        return _result(status="search_error")
+    except Exception as e:
+        print(f"  twscrape search error: {e}")
+        return _result(status="search_error")
+    finally:
+        try:
+            os.remove(db_path)
+        except FileNotFoundError:
+            pass
+
+    results = []
+    for tw in tweets_raw:
+        if getattr(tw, "retweetedTweet", None) is not None:
+            continue  # чистый ретвит — пропускаем, как и для Scweet
+
+        post_id = str(getattr(tw, "id_str", "") or getattr(tw, "id", "") or "")
+        post_url = str(getattr(tw, "url", "") or "")
+        user_obj = getattr(tw, "user", None)
+        author = normalize_twitter_account(getattr(user_obj, "username", "") or "") or "twitter"
+        raw = str(getattr(tw, "rawContent", "") or "").strip()
+        date_obj = getattr(tw, "date", None)
+        pub_date = date_obj.isoformat() if date_obj else ""
+
+        media_items: list = []
+        media_obj = getattr(tw, "media", None)
+        for photo in getattr(media_obj, "photos", None) or []:
+            add_media_item(media_items, getattr(photo, "url", ""), "photo")
+        for video in getattr(media_obj, "videos", None) or []:
+            variants = [v for v in (getattr(video, "variants", None) or []) if "video" in str(getattr(v, "contentType", "")).lower()]
+            if variants:
+                best = max(variants, key=lambda v: getattr(v, "bitrate", 0) or 0)
+                add_media_item(media_items, getattr(best, "url", ""), "video")
+        for gif in getattr(media_obj, "animated", None) or []:
+            add_media_item(media_items, getattr(gif, "videoUrl", ""), "video")
+
+        if not media_items:
+            continue
+
+        results.append({
+            "post_id": post_id,
+            "post_url": post_url,
+            "author": author,
+            "raw": raw,
+            "pub_date": pub_date,
+            "media_items": media_items[:10],
+        })
+
+    print(f"  twscrape: получено {len(tweets_raw)} твитов, с медиа: {len(results)}")
+    results = sort_twitter_items_newest_first(results)
+    return _result(tweets=results, raw_count=len(tweets_raw), status="ok")
+
+
+def fetch_twifork_tweets(
+    keywords: list,
+    from_accounts: list | None = None,
+    limit: int = 50,
+) -> dict:
+    """Получает твиты через maintained-форк twikit (unclecode/twikit) с
+    патчами под изменения X 2026 года. Тот же контракт возврата и те же
+    секреты (SCWEET_AUTH_TOKEN/SCWEET_CT0), что и у остальных звеньев цепочки.
+
+    Требует pip install git+https://github.com/unclecode/twikit.git —
+    ставится и импортируется как обычный `twikit`. ВАЖНО: если в
+    requirements.txt случайно останутся ОБЕ записи — и обычный `twikit`
+    (сломан под изменения X 2026 года), и форк — pip поставит то, что
+    указано последним в файле, и непонятно будет, какая версия реально
+    используется. Держите только одну из двух строк.
+    """
+    def _result(tweets=None, raw_count=0, status="ok"):
+        return {"tweets": tweets or [], "raw_count": raw_count, "status": status}
+
+    if not SCWEET_AUTH_TOKEN or not SCWEET_CT0:
+        return _result(status="no_token")
+
+    try:
+        from twikit import Client
+    except ImportError:
+        return _result(status="not_installed")
+
+    account_filters = [
+        account
+        for account in (normalize_twitter_account(a) for a in (from_accounts or []))
+        if account
+    ]
+    keyword_query = build_scweet_keyword_query(keywords)
+    if not keyword_query and not account_filters:
+        return _result()
+
+    search_query = _build_twitter_fallback_query(keywords, account_filters)
+    print(f"  twifork query: {search_query[:160]}")
+
+    import asyncio
+
+    async def _run():
+        client = Client("en-US")
+        client.set_cookies({"auth_token": SCWEET_AUTH_TOKEN, "ct0": SCWEET_CT0})
+        collected = []
+        page = await client.search_tweet(search_query, "Latest", count=min(limit, 40))
+        collected.extend(page or [])
+        while len(collected) < limit:
+            try:
+                page = await page.next()
+            except Exception:
+                break
+            if not page:
+                break
+            collected.extend(page)
+        return collected[:limit]
+
+    try:
+        tweets_raw = asyncio.run(asyncio.wait_for(_run(), timeout=90))
+    except asyncio.TimeoutError:
+        print("  twifork завис после 90с — прерываем")
+        return _result(status="timeout")
+    except Exception as e:
+        print(f"  twifork search error: {e}")
+        return _result(status="search_error")
+
+    results = []
+    for tw in tweets_raw:
+        if getattr(tw, "retweeted_tweet", None) is not None:
+            continue  # чистый ретвит — пропускаем
+
+        post_id = str(getattr(tw, "id", "") or "")
+        user_obj = getattr(tw, "user", None)
+        author = normalize_twitter_account(getattr(user_obj, "screen_name", "") or "") or "twitter"
+        post_url = f"https://x.com/{author}/status/{post_id}" if post_id else ""
+        raw = str(getattr(tw, "full_text", "") or getattr(tw, "text", "") or "").strip()
+        # created_at у twikit обычно в классическом формате X
+        # ("Wed Oct 10 20:19:24 +0000 2018") — parse_datetime_utc должен
+        # его понимать так же, как понимает даты от Scweet/twscrape.
+        pub_date = str(getattr(tw, "created_at", "") or "")
+
+        media_items: list = []
+        for media in (getattr(tw, "media", None) or []):
+            mtype = getattr(media, "type", "")
+            if mtype == "photo":
+                add_media_item(media_items, getattr(media, "media_url", ""), "photo")
+            elif mtype in ("video", "animated_gif"):
+                streams = getattr(media, "streams", None) or []
+                if streams:
+                    best = max(streams, key=lambda s: getattr(s, "bitrate", 0) or 0)
+                    add_media_item(media_items, getattr(best, "url", ""), "video")
+
+        if not media_items:
+            continue
+
+        results.append({
+            "post_id": post_id,
+            "post_url": post_url,
+            "author": author,
+            "raw": raw,
+            "pub_date": pub_date,
+            "media_items": media_items[:10],
+        })
+
+    print(f"  twifork: получено {len(tweets_raw)} твитов, с медиа: {len(results)}")
+    results = sort_twitter_items_newest_first(results)
+    return _result(tweets=results, raw_count=len(tweets_raw), status="ok")
+
+
+def fetch_tweets_with_fallback(
+    keywords: list,
+    from_accounts: list | None = None,
+    limit: int = 50,
+) -> dict:
+    """Цепочка запасных путей: twscrape -> twifork -> Scweet.
+
+    Все три звена читают ОДНИ И ТЕ ЖЕ секреты (SCWEET_AUTH_TOKEN/SCWEET_CT0) —
+    это просто auth_token+ct0 одного X-аккаунта, который любая из трёх
+    библиотек умеет принять напрямую как cookies. Заводить отдельные
+    секреты под twscrape/twifork не нужно.
+
+    Переход на следующее звено происходит ТОЛЬКО когда предыдущее вернуло
+    status != "ok" (реальный сбой: не установлено, упало по таймауту,
+    ошибка запроса). Если библиотека честно отработала и просто не нашла
+    новых твитов (status="ok", tweets=[]) — это не сбой, а нормальный
+    результат ("сейчас писать нечего"), переключения на следующее звено
+    в этом случае НЕ происходит — иначе на каждый пустой прогон мы бы
+    без нужды дёргали все три библиотеки подряд.
+    """
+    result = None
+    for label, fetch_fn in (
+        ("twscrape", fetch_twscrape_tweets),
+        ("twifork", fetch_twifork_tweets),
+        ("Scweet", fetch_scweet_tweets),
+    ):
+        result = fetch_fn(keywords, from_accounts, limit)
+        if result["status"] == "ok":
+            if label != "twscrape":
+                print(f"  [fallback chain] сработало звено: {label}")
+            return result
+        print(f"  [fallback chain] {label}: status={result['status']} — пробуем следующее звено")
+    # Все три звена дали сбой — возвращаем последний статус как есть;
+    # вызывающий код (алерты, Nitter-фолбэк) уже умеет его обрабатывать.
+    return result
+
+
 def fetch_scweet_tweets(
     keywords: list,
     from_accounts: list | None = None,
@@ -7339,8 +9412,17 @@ def fetch_scweet_tweets(
         print("  Scweet не установлен: pip install scweet")
         return _result(status="not_installed")
 
+    _ensure_scweet_logging_configured()
+    patch_scweet_search_to_post()
+
     try:
-        kwargs = {"auth_token": SCWEET_AUTH_TOKEN}
+        if SCWEET_CT0:
+            # Отдаём auth_token+ct0 напрямую — Scweet не пытается сам
+            # добывать ct0 через headless-браузер (nodriver), которого у
+            # нас нет установлено. Это самый надёжный путь.
+            kwargs = {"cookies": {"auth_token": SCWEET_AUTH_TOKEN, "ct0": SCWEET_CT0}}
+        else:
+            kwargs = {"auth_token": SCWEET_AUTH_TOKEN}
         if SCWEET_PROXY:
             kwargs["proxy"] = SCWEET_PROXY
         if SCWEET_MANIFEST_SCRAPE_ON_INIT:
@@ -7429,7 +9511,49 @@ def fetch_scweet_tweets(
             return _result(status="timeout")
     except Exception as e:
         print(f"  Scweet search error: {e}")
-        return _result(status="search_error")
+        tweets = None
+
+        # ─────────────────────────────────────────────────────────────
+        # ЗАПАСНОЙ ПУТЬ: get_profile_tweets() вместо search()
+        # ─────────────────────────────────────────────────────────────
+        # Когда и почему это включается:
+        #   Срабатывает ТОЛЬКО когда keyword_query пуст, а account_filters
+        #   не пуст. Это ровно случай Шага 3 ("дай мне все посты вот этих
+        #   аккаунтов, без фильтра по словам") — Шаг 1 ищет по ключевым
+        #   словам, там get_profile_tweets() не подходит в принципе: у него
+        #   нет параметра для поиска по тексту, только "дай ленту вот этих
+        #   юзеров".
+        #
+        # Зачем вообще это может помочь, если и search(), и get_profile_tweets()
+        # относятся к одной и той же библиотеке Scweet:
+        #   search() и get_profile_tweets() под капотом дёргают РАЗНЫЕ
+        #   GraphQL-эндпоинты X (Twitter). У X внутренние адреса/идентификаторы
+        #   этих эндпоинтов (query_id) периодически меняются, и старая версия
+        #   библиотеки Scweet может продолжать стучаться по устаревшему адресу
+        #   для ОДНОГО из них (получая 404 "не найдено"), а второй при этом
+        #   работает нормально. Так что это не гарантированное решение, а
+        #   попытка "а вдруг именно этот путь ещё жив" — ценой всего одного
+        #   дополнительного сетевого запроса.
+        if account_filters and not keyword_query:
+            print(
+                "  Пробуем запасной путь get_profile_tweets() — он использует "
+                "другой GraphQL-запрос к X, чем search(), и может обойти "
+                "поломку, из-за которой упал обычный поиск"
+            )
+            try:
+                tweets = _run_with_timeout(
+                    s.get_profile_tweets,
+                    account_filters,
+                    limit=limit,
+                )
+            except Exception as e2:
+                print(f"  get_profile_tweets() тоже не сработал: {e2}")
+                tweets = None
+            if tweets is None:
+                print("  get_profile_tweets() не дал результата (ошибка или зависание)")
+
+        if tweets is None:
+            return _result(status="search_error")
 
     results = []
     items = scweet_result_items(tweets)
@@ -7650,9 +9774,10 @@ def step1_twitter_keywords(published: set) -> set:
         return published
 
     new_count = 0
+    failed_attempts = load_failed_attempts()
     source_label = ",".join(STEP1_ACCOUNTS) if STEP1_ACCOUNTS else "global_search"
 
-    tweets_result = fetch_scweet_tweets(
+    tweets_result = fetch_tweets_with_fallback(
         keywords=STEP1_KEYWORDS,
         from_accounts=STEP1_ACCOUNTS or None,
         limit=STEP1_LIMIT,
@@ -7683,6 +9808,18 @@ def step1_twitter_keywords(published: set) -> set:
         raw         = clean_text(tw["raw"])
         media_items = tw["media_items"]
 
+        # send_to_telegram() всё равно не отправит пост без media_items (см.
+        # "Медиа нет — пост не отправляем" в send_to_telegram) — канал ведёт
+        # только фото/видео-посты, текстовые твиты без вложений никогда не
+        # публикуются. Раньше этот твит доходил до перевода/дедупа по
+        # смыслу (is_semantic_duplicate дёргает AI) и только потом тихо
+        # отбрасывался в самом низу пайплайна — деньги на перевод были
+        # потрачены впустую, а пост так и не появлялся в канале. Отсекаем
+        # сразу, как в step2/step4.
+        if not media_items:
+            print(f"  Медиа нет (текстовый твит) — пропуск: {post_id[:80]}")
+            continue
+
         dup = find_duplicate(published, post_id=post_id, url=post_url)
         if dup:
             print(f"  Дубль ({dup[:80]}) — пропуск")
@@ -7693,6 +9830,10 @@ def step1_twitter_keywords(published: set) -> set:
             continue
 
         if not raw:
+            continue
+
+        if is_live_match_report_text(raw):
+            print(f"  Репортаж о ходе матча (минута/гол/перерыв/счёт) — пропуск: {post_id[:80]}")
             continue
 
         dup = find_duplicate(published, post_id=post_id, url=post_url, text=raw, source=source_label, media_items=media_items)
@@ -7723,6 +9864,8 @@ def step1_twitter_keywords(published: set) -> set:
                     edited = cleaned
                 elif not media_items:
                     print(f"  Ретвит/репост без содержательного текста и медиа — пропуск: {post_id[:80]}")
+                    # Пост не публикуется, но перевод уже отработал — фиксируем строку лога.
+                    _trace_finalize_and_log(edited)
                     mark_published(published, post_id=post_id, url=post_url, text=raw, source=source_label, media_items=media_items)
                     save_published(published)
                     continue
@@ -7731,9 +9874,19 @@ def step1_twitter_keywords(published: set) -> set:
 
         print(f"  Публикуем ({len(media_items)} медиа): {post_id[:80]}")
         ok = send_to_telegram(media_items, edited)
-        if ok:
-            mark_published(published, post_id=post_id, url=post_url, text=raw, source=source_label, media_items=media_items)
-            save_published(published)
+        published_now = register_publish_result(
+            ok,
+            published=published,
+            attempts=failed_attempts,
+            post_id=post_id,
+            url=post_url,
+            text=raw,
+            source=source_label,
+            media_items=media_items,
+        )
+        save_published(published)
+        save_failed_attempts(failed_attempts)
+        if published_now:
             record_source_news(raw, step=1, source=source_label, post_id=post_id, url=post_url)
             new_count += 1
 
@@ -7753,6 +9906,7 @@ def step2_instagram(published: set) -> set:
     posts = fetch_instagram_posts()
     print(f"  Получено Apify posts: {len(posts)}")
     new_count = 0
+    failed_attempts = load_failed_attempts()
 
     if not posts:
         print("  Новых постов нет")
@@ -7794,6 +9948,10 @@ def step2_instagram(published: set) -> set:
 
         raw_caption = clean_text(instagram_caption_from_apify_post(post))
 
+        if raw_caption and is_live_match_report_text(raw_caption):
+            print(f"  Репортаж о ходе матча (минута/гол/перерыв/счёт) — пропуск: {post_id}")
+            continue
+
         dup = find_duplicate(
             published,
             post_id=post_id,
@@ -7830,17 +9988,20 @@ def step2_instagram(published: set) -> set:
             edited,
             content_prefix=INSTAGRAM_PREFIX,
         )
-        if ok:
-            mark_published(
-                published,
-                post_id=post_id,
-                url=post_url,
-                text=raw_caption,
-                source=source_label,
-                media_items=media_items,
-                extra_keys=ig_keys,
-            )
-            save_published(published)
+        published_now = register_publish_result(
+            ok,
+            published=published,
+            attempts=failed_attempts,
+            post_id=post_id,
+            url=post_url,
+            text=raw_caption,
+            source=source_label,
+            media_items=media_items,
+            extra_keys=ig_keys,
+        )
+        save_published(published)
+        save_failed_attempts(failed_attempts)
+        if published_now:
             record_source_news(raw_caption, step=2, source=source_label, post_id=post_id, url=post_url)
             new_count += 1
 
@@ -7856,11 +10017,12 @@ def step3_twitter_accounts(published: set) -> set:
         return published
 
     new_count = 0
+    failed_attempts = load_failed_attempts()
 
     scan_limit = max(STEP3_LIMIT, STEP3_SCAN_LIMIT)
 
     # Забираем свежие посты сразу по всем аккаунтам одним запросом
-    scweet_result = fetch_scweet_tweets(
+    scweet_result = fetch_tweets_with_fallback(
         keywords=[],           # без фильтра по словам — все посты аккаунтов
         from_accounts=STEP3_ACCOUNTS,
         limit=scan_limit,
@@ -7893,23 +10055,44 @@ def step3_twitter_accounts(published: set) -> set:
             skip_reason = f"старый ({pub_date[:16]})"
         elif not raw and not media_items:
             skip_reason = "ни текста, ни медиа — публиковать нечего"
+        elif not media_items:
+            # send_to_telegram() всё равно не отправит пост без media_items —
+            # канал публикует только фото/видео. Раньше текстовые твиты без
+            # вложений доходили до is_semantic_duplicate (AI-вызов) и
+            # translate_with_fallback и только потом тихо отбрасывались в
+            # send_to_telegram — токены на перевод тратились впустую, а пост
+            # так и не появлялся в канале. Отсекаем сразу.
+            skip_reason = "медиа нет (текстовый твит) — публиковать не будем"
+        elif raw and is_live_match_report_text(raw):
+            skip_reason = "репортаж о ходе матча (минута/гол/перерыв/счёт)"
         else:
-            dup = find_duplicate(published, post_id=post_id, url=post_url, text=raw, source=f"@{source}", media_items=media_items)
-            if dup:
-                skip_reason = f"дубль ({dup[:80]})"
-            elif raw and is_semantic_duplicate(raw, source=f"@{source}", post_id=post_id, url=post_url):
-                skip_reason = "смысловой дубль"
-            elif not media_items_reachable(media_items):
-                skip_reason = "медиа недоступны ещё до перевода"
+            repost_reason = scweet_repost_reference_reason(tw, raw, post_id)
+            if repost_reason:
+                skip_reason = f"репост/ссылка на другой пост ({repost_reason})"
             else:
-                media_only_text = bool(raw) and has_no_translatable_text(raw)
-                if media_only_text:
-                    print(f"  Текст без содержания для перевода (эмодзи/пусто) — публикуем как есть: {post_id[:80]}")
-                    translated = raw
+                dup = find_duplicate(published, post_id=post_id, url=post_url, text=raw, source=f"@{source}", media_items=media_items)
+                if dup:
+                    skip_reason = f"дубль ({dup[:80]})"
+                elif raw and is_semantic_duplicate(
+                    raw,
+                    source=f"@{source}",
+                    post_id=post_id,
+                    url=post_url,
+                    use_ai_check=False,       # Шаг 3: узкоспециализированный аккаунт — AI-проверку по смыслу отключаем
+                    local_threshold_override=0.93,  # ловим только почти дословные повторы
+                ):
+                    skip_reason = "смысловой дубль"
+                elif not media_items_reachable(media_items):
+                    skip_reason = "медиа недоступны ещё до перевода"
                 else:
-                    translated = translate_with_fallback(raw) if raw else ""
-                    if raw and translated is None:
-                        skip_reason = "ошибка перевода (все сервисы отказали)"
+                    media_only_text = bool(raw) and has_no_translatable_text(raw)
+                    if media_only_text:
+                        print(f"  Текст без содержания для перевода (эмодзи/пусто) — публикуем как есть: {post_id[:80]}")
+                        translated = raw
+                    else:
+                        translated = translate_with_fallback(raw) if raw else ""
+                        if raw and translated is None:
+                            skip_reason = "ошибка перевода (все сервисы отказали)"
 
         if skip_reason:
             print(f"  Пропуск ({skip_reason}): {post_id[:80]}")
@@ -7925,6 +10108,8 @@ def step3_twitter_accounts(published: set) -> set:
                     edited = cleaned
                 elif not media_items:
                     print(f"  Ретвит/репост без содержательного текста и медиа — пропуск: {post_id[:80]}")
+                    # Пост не публикуется, но перевод уже отработал — фиксируем строку лога.
+                    _trace_finalize_and_log(edited)
                     mark_published(published, post_id=post_id, url=post_url, text=raw, source=f"@{source}", media_items=media_items)
                     save_published(published)
                     continue
@@ -7933,15 +10118,21 @@ def step3_twitter_accounts(published: set) -> set:
 
         print(f"  Публикуем ({len(media_items)} медиа): {post_id[:80]}")
         ok = send_to_telegram(media_items, edited)
-        if ok:
-            mark_published(published, post_id=post_id, url=post_url, text=raw, source=f"@{source}", media_items=media_items)
-            save_published(published)
+        published_now = register_publish_result(
+            ok,
+            published=published,
+            attempts=failed_attempts,
+            post_id=post_id,
+            url=post_url,
+            text=raw,
+            source=f"@{source}",
+            media_items=media_items,
+        )
+        save_published(published)
+        save_failed_attempts(failed_attempts)
+        if published_now:
             record_source_news(raw, step=3, source=f"@{source}", post_id=post_id, url=post_url)
             new_count += 1
-        elif ok is None:
-            print(f"  Медиа недоступны — пост не опубликован: {post_id[:80]}")
-        else:
-            print(f"  Ошибка отправки в Telegram — пост не опубликован: {post_id[:80]}")
 
     print(f"\n  Итого опубликовано: {new_count}")
     return published
@@ -8195,6 +10386,7 @@ def step4_instagram_hashtags(published: set) -> set:
     print(f"  Поиск в аккаунтах: {', '.join(sorted(STEP4_ALLOWED_ACCOUNTS))}")
 
     new_count = 0
+    failed_attempts = load_failed_attempts()
     for hashtag in STEP4_HASHTAGS:
         print(f"\n  searchTag: @{hashtag}")
         posts = fetch_hashtag_posts(hashtag)
@@ -8246,6 +10438,11 @@ def step4_instagram_hashtags(published: set) -> set:
                 continue
 
             raw_caption = clean_text(instagram_caption_from_apify_post(post))
+
+            if raw_caption and is_live_match_report_text(raw_caption):
+                print(f"  Репортаж о ходе матча (минута/гол/перерыв/счёт) — пропуск: {post_id[:80]}")
+                continue
+
             dup = find_duplicate(
                 published,
                 post_id=post_id,
@@ -8278,17 +10475,20 @@ def step4_instagram_hashtags(published: set) -> set:
 
             print(f"  Публикуем ({len(media_items)} медиа): {post_id[:80]}")
             ok = send_to_telegram(media_items, full_text)
-            if ok:
-                mark_published(
-                    published,
-                    post_id=post_id,
-                    url=post_url,
-                    text=raw_caption,
-                    source=source_label,
-                    media_items=media_items,
-                    extra_keys=ig_keys,
-                )
-                save_published(published)
+            published_now = register_publish_result(
+                ok,
+                published=published,
+                attempts=failed_attempts,
+                post_id=post_id,
+                url=post_url,
+                text=raw_caption,
+                source=source_label,
+                media_items=media_items,
+                extra_keys=ig_keys,
+            )
+            save_published(published)
+            save_failed_attempts(failed_attempts)
+            if published_now:
                 record_source_news(raw_caption, step=4, source=source_label, post_id=post_id, url=post_url)
                 new_count += 1
 
